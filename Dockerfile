@@ -29,7 +29,7 @@ RUN --mount=type=cache,target=/root/.npm \
   npm install -g \
     "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     "@openai/codex@${CODEX_VERSION}" \
-    "@mariozechner/pi-coding-agent@${PI_VERSION}"
+    "@mariozechner/pi-coding-agent@${PI_VERSION}" \
   && corepack enable --install-directory /usr/local/share/npm-global/bin \
   && corepack prepare pnpm@latest --activate
 
@@ -40,6 +40,7 @@ ENV TZ="${TZ}"
 
 ARG CLAUDE_CODE_VERSION=latest
 ARG CODEX_VERSION=latest
+ARG PI_VERSION=latest
 
 # Install common dev tools.
 # Note: we intentionally do NOT install iptables/ipset or ship a firewall script.
@@ -53,6 +54,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     zsh \
     unzip \
     openssh-client \
+    git \
     gh \
     jq \
     vim \

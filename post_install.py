@@ -11,6 +11,8 @@ from pathlib import Path
 TMUX_CONFIG = """\
 set -g default-terminal "tmux-256color"
 set -g focus-events on
+set -g extended-keys on
+set -g extended-keys-format csi-u
 set -sg escape-time 10
 set -g mouse on
 set -g history-limit 200000
