@@ -24,3 +24,4 @@ the built in terminal would login inside the container.
 
 - **overwrites `.devcontainer/`** on every run
 - auth, history, and jj user config persist across rebuilds via docker volumes
+- host SSH agent forwarding is supported inside the container
