@@ -240,6 +240,7 @@ def main() -> None:
     ensure_dir_ownership(Path.home() / ".claude")
     ensure_dir_ownership(Path.home() / ".codex")
     ensure_dir_ownership(Path.home() / ".config" / "gh")
+    ensure_dir_ownership(Path.home() / ".config" / "jj")
     ensure_zsh_history()
     ensure_global_gitignore(workspace)
     ensure_codex_config()
