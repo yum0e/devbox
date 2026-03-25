@@ -151,6 +151,43 @@ def ensure_pi_config() -> None:
     log(f"wrote default pi settings to {pi_config}")
 
 
+def ensure_ssh_config() -> None:
+    ssh_dir = Path.home() / ".ssh"
+    ssh_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        ssh_dir.chmod(0o700)
+    except OSError as exc:
+        log(f"unable to set permissions on {ssh_dir}: {exc}")
+
+    ssh_auth_sock = os.environ.get("SSH_AUTH_SOCK", "/run/host-services/ssh-auth.sock")
+    ssh_config = ssh_dir / "config"
+    content = (
+        "# default ssh config for the devcontainer\n"
+        "Host *\n"
+        f"  IdentityAgent {ssh_auth_sock}\n"
+    )
+
+    if ssh_config.exists():
+        existing = ssh_config.read_text(encoding="utf-8")
+        if existing.lstrip().startswith("# default ssh config for the devcontainer"):
+            if existing != content:
+                ssh_config.write_text(content, encoding="utf-8")
+                log(f"updated default ssh config at {ssh_config}")
+            else:
+                log(f"skipping ssh config (already up to date at {ssh_config})")
+        else:
+            log(f"skipping ssh config (custom config exists at {ssh_config})")
+    else:
+        ssh_config.write_text(content, encoding="utf-8")
+        log(f"wrote default ssh config to {ssh_config}")
+
+    try:
+        ssh_config.chmod(0o600)
+    except OSError as exc:
+        log(f"unable to set permissions on {ssh_config}: {exc}")
+
+
 def ensure_jj_config() -> None:
     jj_config = Path(
         os.environ.get(
@@ -300,11 +337,13 @@ def main() -> None:
     ensure_dir_ownership(Path.home() / ".pi")
     ensure_dir_ownership(Path.home() / ".config" / "gh")
     ensure_dir_ownership(Path.home() / ".config" / "jj")
+    ensure_dir_ownership(Path.home() / ".ssh")
     ensure_zsh_history()
     ensure_global_gitignore(workspace)
     ensure_codex_config()
     ensure_claude_config()
     ensure_pi_config()
+    ensure_ssh_config()
     ensure_jj_config()
     ensure_zsh_config()
     check_jj_available()

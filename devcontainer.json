@@ -45,6 +45,7 @@
     "source=pi-config,target=/home/node/.pi,type=volume",
     "source=gh-config,target=/home/node/.config/gh,type=volume",
     "source=jj-config,target=/home/node/.config/jj,type=volume",
+    "source=ssh-config,target=/home/node/.ssh,type=volume",
     "source=/run/host-services/ssh-auth.sock,target=/run/host-services/ssh-auth.sock,type=bind"
   ],
   "containerEnv": {
