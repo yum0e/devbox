@@ -23,4 +23,4 @@ the built in terminal would login inside the container.
 ## notes
 
 - **overwrites `.devcontainer/`** on every run
-- auth and history persist across rebuilds via docker volumes
+- auth, history, and jj user config persist across rebuilds via docker volumes
