@@ -48,6 +48,7 @@ ARG JJ_VERSION=latest
 # Note: we intentionally do NOT install iptables/ipset or ship a firewall script.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
   apt-get update && apt-get install -y --no-install-recommends \
+    bubblewrap \
     ca-certificates \
     curl \
     less \

@@ -136,6 +136,64 @@ def ensure_claude_config() -> None:
     log(f"wrote default claude settings to {claude_config}")
 
 
+def ensure_pi_config() -> None:
+    pi_agent_dir = Path(
+        os.environ.get("PI_CODING_AGENT_DIR", str(Path.home() / ".pi" / "agent"))
+    )
+    pi_agent_dir.mkdir(parents=True, exist_ok=True)
+    pi_config = pi_agent_dir / "settings.json"
+    if pi_config.exists():
+        log(f"skipping pi settings (already exists at {pi_config})")
+        return
+
+    data = {"shellPath": "/usr/bin/zsh"}
+    pi_config.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    log(f"wrote default pi settings to {pi_config}")
+
+
+def ensure_jj_config() -> None:
+    jj_config = Path(
+        os.environ.get(
+            "JJ_CONFIG",
+            str(
+                Path(
+                    os.environ.get(
+                        "XDG_CONFIG_HOME",
+                        str(Path.home() / ".config"),
+                    )
+                )
+                / "jj"
+                / "config.toml"
+            ),
+        )
+    ).expanduser()
+    jj_config.parent.mkdir(parents=True, exist_ok=True)
+    if not jj_config.exists():
+        jj_config.write_text("# jj user config\n", encoding="utf-8")
+        log(f"wrote default jj config to {jj_config}")
+    else:
+        log(f"skipping jj config (already exists at {jj_config})")
+
+    legacy_jj_config = Path.home() / ".jjconfig.toml"
+    if legacy_jj_config.is_symlink():
+        if legacy_jj_config.resolve() == jj_config.resolve():
+            return
+        legacy_jj_config.unlink()
+        legacy_jj_config.symlink_to(jj_config)
+        log(f"updated jj legacy config symlink at {legacy_jj_config}")
+        return
+
+    if legacy_jj_config.exists():
+        log(
+            f"leaving existing legacy jj config at {legacy_jj_config}; "
+            f"canonical config path is {jj_config}"
+        )
+        return
+
+    legacy_jj_config.symlink_to(jj_config)
+    log(f"linked legacy jj config path to {jj_config}")
+
+
 def ensure_zsh_config() -> None:
     zsh_config_dir = (
         Path(
@@ -246,6 +304,8 @@ def main() -> None:
     ensure_global_gitignore(workspace)
     ensure_codex_config()
     ensure_claude_config()
+    ensure_pi_config()
+    ensure_jj_config()
     ensure_zsh_config()
     check_jj_available()
     log("configured defaults for container use")

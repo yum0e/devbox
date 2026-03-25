@@ -7,6 +7,7 @@
       "TZ": "${localEnv:TZ:UTC}",
       "CLAUDE_CODE_VERSION": "latest",
       "CODEX_VERSION": "latest",
+      "PI_VERSION": "latest",
       "JJ_VERSION": "latest"
     }
   },
@@ -50,6 +51,8 @@
     "NODE_OPTIONS": "--max-old-space-size=4096",
     "CLAUDE_CONFIG_DIR": "/home/node/.claude",
     "CODEX_HOME": "/home/node/.codex",
+    "PI_CODING_AGENT_DIR": "/home/node/.pi/agent",
+    "JJ_CONFIG": "/home/node/.config/jj/config.toml",
     "SSH_AUTH_SOCK": "/run/host-services/ssh-auth.sock"
   },
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=delegated",
