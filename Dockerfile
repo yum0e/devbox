@@ -5,6 +5,7 @@
 # - Passwordless sudo for the non-root user
 # - NO firewall / network restrictions (internet enabled)
 # - tmux installed
+# - jj (Jujutsu) installed
 
 ARG NODE_IMAGE=node:22-bookworm-slim
 FROM ${NODE_IMAGE} AS node
@@ -41,6 +42,7 @@ ENV TZ="${TZ}"
 ARG CLAUDE_CODE_VERSION=latest
 ARG CODEX_VERSION=latest
 ARG PI_VERSION=latest
+ARG JJ_VERSION=latest
 
 # Install common dev tools.
 # Note: we intentionally do NOT install iptables/ipset or ship a firewall script.
@@ -71,6 +73,30 @@ RUN if command -v fdfind >/dev/null 2>&1 && [ ! -e /usr/local/bin/fd ]; then \
 # Bring in node + npm from the official node image (fast, no apt deps).
 COPY --from=node /usr/local/ /usr/local/
 RUN node -v && npm -v
+
+# Install jj (Jujutsu).
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) jj_target="x86_64-unknown-linux-musl" ;; \
+      arm64) jj_target="aarch64-unknown-linux-musl" ;; \
+      *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
+    esac; \
+    if [ "$JJ_VERSION" = "latest" ]; then \
+      jj_tag="$(curl -fsSL https://api.github.com/repos/jj-vcs/jj/releases/latest | jq -r '.tag_name')"; \
+    else \
+      jj_tag="v${JJ_VERSION#v}"; \
+    fi; \
+    jj_asset="jj-${jj_tag}-${jj_target}.tar.gz"; \
+    curl -fsSL -o /tmp/jj.tar.gz "https://github.com/jj-vcs/jj/releases/download/${jj_tag}/${jj_asset}"; \
+    mkdir -p /tmp/jj-extract /usr/local/bin; \
+    tar -xzf /tmp/jj.tar.gz -C /tmp/jj-extract; \
+    jj_bin="$(find /tmp/jj-extract -type f -name jj | head -n 1)"; \
+    test -n "$jj_bin"; \
+    install -m 0755 "$jj_bin" /usr/local/bin/jj; \
+    rm -rf /tmp/jj.tar.gz /tmp/jj-extract; \
+    /usr/local/bin/jj --version
+
 
 # Ensure git worktrees use relative paths by default.
 RUN git config --system worktree.useRelativePaths true \

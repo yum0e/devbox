@@ -6,7 +6,8 @@
     "args": {
       "TZ": "${localEnv:TZ:UTC}",
       "CLAUDE_CODE_VERSION": "latest",
-      "CODEX_VERSION": "latest"
+      "CODEX_VERSION": "latest",
+      "JJ_VERSION": "latest"
     }
   },
   "customizations": {

@@ -215,6 +215,21 @@ def install_tmux_config() -> None:
     log(f"installed tmux config to {tmux_dest}")
 
 
+def check_jj_available() -> None:
+    jj_path = shutil.which("jj")
+    if not jj_path:
+        log("warning: jj not found on PATH")
+        return
+
+    result = subprocess.run([jj_path, "--version"], check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        error = result.stderr.strip() or result.stdout.strip() or "unknown error"
+        log(f"warning: jj found at {jj_path} but failed: {error}")
+        return
+
+    log(f"jj available: {result.stdout.strip()}")
+
+
 def main() -> None:
     workspace = resolve_workspace()
     if not is_git_repo(workspace):
@@ -230,6 +245,7 @@ def main() -> None:
     ensure_codex_config()
     ensure_claude_config()
     ensure_zsh_config()
+    check_jj_available()
     log("configured defaults for container use")
 
 
