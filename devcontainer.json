@@ -11,6 +11,7 @@
       "JJ_VERSION": "latest"
     }
   },
+  "overrideCommand": false,
   "customizations": {
     "vscode": {
       "extensions": [
@@ -54,7 +55,7 @@
     "CODEX_HOME": "/home/node/.codex",
     "PI_CODING_AGENT_DIR": "/home/node/.pi/agent",
     "JJ_CONFIG": "/home/node/.config/jj/config.toml",
-    "SSH_AUTH_SOCK": "/run/host-services/ssh-auth.sock"
+    "SSH_AUTH_SOCK": "/tmp/ssh-agent-node.sock"
   },
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=delegated",
   "workspaceFolder": "/workspace"

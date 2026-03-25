@@ -66,6 +66,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     ripgrep \
     zoxide \
     fd-find \
+    # socat is used for ssh agent forwarding
+    socat \
   && rm -rf /var/lib/apt/lists/*
 RUN if command -v fdfind >/dev/null 2>&1 && [ ! -e /usr/local/bin/fd ]; then \
     ln -s /usr/bin/fdfind /usr/local/bin/fd; \
@@ -157,9 +159,6 @@ ENV NPM_CONFIG_FUND=false \
     NPM_CONFIG_UPDATE_NOTIFIER=false \
     NPM_CONFIG_PROGRESS=false
 
-# Switch to non-root for normal dev.
-USER node
-
 # Runtime npm cache should be writable by node.
 ENV NPM_CONFIG_CACHE=/home/node/.npm
 
@@ -177,6 +176,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 ENV PATH="/home/node/.local/bin:${PATH}"
 
 # Preinstall managed Python for uv.
+USER node
 RUN uv python install 3.14
 
 # Passwordless sudo for the non-root user (for unattended / automation workflows).
@@ -184,4 +184,7 @@ USER root
 RUN echo "node ALL=(root) NOPASSWD: ALL" > /etc/sudoers.d/yolo \
   && chmod 0440 /etc/sudoers.d/yolo
 
-USER node
+COPY entrypoint.sh /usr/local/bin/devcontainer-entrypoint
+RUN chmod 0755 /usr/local/bin/devcontainer-entrypoint
+
+ENTRYPOINT ["/usr/local/bin/devcontainer-entrypoint"]
