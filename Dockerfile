@@ -173,15 +173,20 @@ ENV VISUAL=vim
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
 # Ensure uv + Foundry are on PATH for the node user.
-ENV PATH="/home/node/.foundry/bin:/home/node/.local/bin:${PATH}"
+ENV FOUNDRY_DIR=/home/node/.foundry
+ENV PATH="${FOUNDRY_DIR}/bin:/home/node/.local/bin:/usr/local/share/npm-global/bin:${PATH}"
 
 # Preinstall managed Python for uv.
 USER node
 RUN uv python install 3.14
 
 # Install Foundry (forge, cast, anvil, chisel).
-RUN curl -fsSL https://foundry.paradigm.xyz | bash \
-  && /home/node/.foundry/bin/foundryup
+RUN bash -lc ' \
+  set -euxo pipefail; \
+  curl -fsSL https://foundry.paradigm.xyz | bash; \
+  test -x "$FOUNDRY_DIR/bin/foundryup"; \
+  "$FOUNDRY_DIR/bin/foundryup" \
+'
 
 # Passwordless sudo for the non-root user (for unattended / automation workflows).
 USER root
