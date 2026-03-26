@@ -2,6 +2,8 @@
 
 a devcontainer for running claude code and codex in yolo mode.
 
+includes `uv` and Foundry (`forge`, `cast`, `anvil`, `chisel`) preinstalled.
+
 based on anthropic's claude code devcontainer and [banteg's setup](https://github.com/banteg/agents).
 
 ## requirements
