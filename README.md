@@ -13,7 +13,7 @@ based on anthropic's claude code devcontainer and [banteg's setup](https://githu
 
 ## quickstart
 
-install `./devcontainer/install.sh self-install`
+install `./install.sh self-install`
 
 run `devc <repo>` or `devc .` inside project folder.
 
@@ -27,3 +27,4 @@ the built in terminal would login inside the container.
 - **overwrites `.devcontainer/`** on every run
 - auth, history, and jj user config persist across rebuilds via docker volumes
 - host SSH agent forwarding is supported inside the container
+
