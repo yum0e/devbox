@@ -26,5 +26,6 @@ the built in terminal would login inside the container.
 
 - **overwrites `.devcontainer/`** on every run
 - auth, history, and jj user config persist across rebuilds via docker volumes
+- PostgreSQL tools are preinstalled (start the service manually when needed)
 - host SSH agent forwarding is supported inside the container
 

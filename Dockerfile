@@ -66,6 +66,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     ripgrep \
     zoxide \
     fd-find \
+    # PostgreSQL server + CLI tools
+    postgresql \
     # socat is used for ssh agent forwarding
     socat \
   && rm -rf /var/lib/apt/lists/*
