@@ -2,7 +2,7 @@
 
 a devcontainer for running claude code and codex in yolo mode.
 
-includes `uv` and Foundry (`forge`, `cast`, `anvil`, `chisel`) preinstalled.
+includes `uv`, Foundry (`forge`, `cast`, `anvil`, `chisel`), and `fnm` (Fast Node Manager) preinstalled.
 
 based on anthropic's claude code devcontainer and [banteg's setup](https://github.com/banteg/agents).
 
@@ -27,5 +27,7 @@ the built in terminal would login inside the container.
 - **overwrites `.devcontainer/`** on every run
 - auth, history, and jj user config persist across rebuilds via docker volumes
 - PostgreSQL tools are preinstalled (start the service manually when needed)
+- Node version switching is handled with `fnm` (`fnm install --lts`, `fnm use --lts`, `fnm default <version>`)
+- installed `fnm` Node versions persist across rebuilds via the `fnm-data` volume
 - host SSH agent forwarding is supported inside the container
 

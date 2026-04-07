@@ -8,7 +8,8 @@
       "CLAUDE_CODE_VERSION": "latest",
       "CODEX_VERSION": "latest",
       "PI_VERSION": "latest",
-      "JJ_VERSION": "latest"
+      "JJ_VERSION": "latest",
+      "FNM_VERSION": "latest"
     }
   },
   "overrideCommand": false,
@@ -41,6 +42,7 @@
   "postCreateCommand": "uv run --no-sync /workspace/.devcontainer/post_install.py",
   "mounts": [
     "source=commandhistory,target=/commandhistory,type=volume",
+    "source=fnm-data,target=/home/node/.local/share/fnm,type=volume",
     "source=claude-code-config,target=/home/node/.claude,type=volume",
     "source=codex-config,target=/home/node/.codex,type=volume",
     "source=pi-config,target=/home/node/.pi,type=volume",

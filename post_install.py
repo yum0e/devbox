@@ -337,6 +337,7 @@ def main() -> None:
     ensure_dir_ownership(Path.home() / ".pi")
     ensure_dir_ownership(Path.home() / ".config" / "gh")
     ensure_dir_ownership(Path.home() / ".config" / "jj")
+    ensure_dir_ownership(Path.home() / ".local" / "share" / "fnm")
     ensure_dir_ownership(Path.home() / ".ssh")
     ensure_zsh_history()
     ensure_global_gitignore(workspace)

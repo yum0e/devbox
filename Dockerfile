@@ -6,6 +6,7 @@
 # - NO firewall / network restrictions (internet enabled)
 # - tmux installed
 # - jj (Jujutsu) installed
+# - fnm (Fast Node Manager) installed
 
 ARG NODE_IMAGE=node:22-bookworm-slim
 FROM ${NODE_IMAGE} AS node
@@ -43,6 +44,7 @@ ARG CLAUDE_CODE_VERSION=latest
 ARG CODEX_VERSION=latest
 ARG PI_VERSION=latest
 ARG JJ_VERSION=latest
+ARG FNM_VERSION=latest
 
 # Install common dev tools.
 # Note: we intentionally do NOT install iptables/ipset or ship a firewall script.
@@ -103,6 +105,25 @@ RUN set -eux; \
     rm -rf /tmp/jj.tar.gz /tmp/jj-extract; \
     /usr/local/bin/jj --version
 
+# Install fnm (Fast Node Manager).
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) fnm_asset="fnm-linux.zip" ;; \
+      arm64) fnm_asset="fnm-arm64.zip" ;; \
+      *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
+    esac; \
+    if [ "$FNM_VERSION" = "latest" ]; then \
+      fnm_tag="$(curl -fsSL https://api.github.com/repos/Schniz/fnm/releases/latest | jq -r '.tag_name')"; \
+    else \
+      fnm_tag="v${FNM_VERSION#v}"; \
+    fi; \
+    curl -fsSL -o /tmp/fnm.zip "https://github.com/Schniz/fnm/releases/download/${fnm_tag}/${fnm_asset}"; \
+    mkdir -p /tmp/fnm-extract /usr/local/bin; \
+    unzip -q /tmp/fnm.zip -d /tmp/fnm-extract; \
+    install -m 0755 /tmp/fnm-extract/fnm /usr/local/bin/fnm; \
+    rm -rf /tmp/fnm.zip /tmp/fnm-extract; \
+    /usr/local/bin/fnm --version
 
 # Ensure git worktrees use relative paths by default.
 RUN git config --system worktree.useRelativePaths true \
@@ -141,16 +162,20 @@ fi
 EOF
 
 RUN echo '. /etc/profile.d/00-commandhistory.sh' >> /etc/bash.bashrc \
+  && echo 'export FNM_DIR="${FNM_DIR:-$HOME/.local/share/fnm}"' >> /etc/bash.bashrc \
+  && echo 'command -v fnm >/dev/null 2>&1 && eval "$(fnm env --use-on-cd --shell bash)"' >> /etc/bash.bashrc \
   && touch /etc/zsh/zshrc \
-  && echo 'source /etc/profile.d/00-commandhistory.sh' >> /etc/zsh/zshrc
+  && echo 'source /etc/profile.d/00-commandhistory.sh' >> /etc/zsh/zshrc \
+  && echo 'export FNM_DIR="${FNM_DIR:-$HOME/.local/share/fnm}"' >> /etc/zsh/zshrc \
+  && echo 'command -v fnm >/dev/null 2>&1 && eval "$(fnm env --use-on-cd --shell zsh)"' >> /etc/zsh/zshrc
 
 # Helpful marker for shell prompts / scripts.
 ENV DEVCONTAINER=true
 
 # Create workspace + agent config dirs and set permissions.
-RUN mkdir -p /workspace /home/node/.claude /home/node/.codex /home/node/.pi /home/node/.npm /home/node/.config/zsh \
+RUN mkdir -p /workspace /home/node/.claude /home/node/.codex /home/node/.pi /home/node/.npm /home/node/.config/zsh /home/node/.local/share/fnm \
   && touch /home/node/.zshrc \
-  && chown -R node:node /workspace /home/node/.claude /home/node/.codex /home/node/.pi /home/node/.npm /home/node/.config /home/node/.zshrc
+  && chown -R node:node /workspace /home/node/.claude /home/node/.codex /home/node/.pi /home/node/.npm /home/node/.config /home/node/.local /home/node/.zshrc
 
 WORKDIR /workspace
 
