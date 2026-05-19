@@ -82,6 +82,9 @@ RUN if command -v fdfind >/dev/null 2>&1 && [ ! -e /usr/local/bin/fd ]; then \
     ln -s /usr/bin/fdfind /usr/local/bin/fd; \
   fi
 
+# Enable line numbers by default in Vim.
+RUN printf '%s\n' 'set number' >/etc/vim/vimrc.local
+
 # Bring in node + npm from the official node image (fast, no apt deps).
 COPY --from=node /usr/local/ /usr/local/
 RUN node -v && npm -v
