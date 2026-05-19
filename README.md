@@ -2,7 +2,7 @@
 
 a devcontainer for running claude code and codex in yolo mode.
 
-includes `uv`, Foundry (`forge`, `cast`, `anvil`, `chisel`), and `fnm` (Fast Node Manager) preinstalled.
+includes `uv`, Foundry (`forge`, `cast`, `anvil`, `chisel`), `fnm` (Fast Node Manager), and `hunk` preinstalled.
 
 based on anthropic's claude code devcontainer and [banteg's setup](https://github.com/banteg/agents).
 
