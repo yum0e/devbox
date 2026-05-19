@@ -8,6 +8,7 @@
       "CLAUDE_CODE_VERSION": "latest",
       "CODEX_VERSION": "latest",
       "PI_VERSION": "latest",
+      "HUNK_VERSION": "latest",
       "JJ_VERSION": "latest",
       "FNM_VERSION": "latest"
     }
