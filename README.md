@@ -9,7 +9,16 @@ based on anthropic's claude code devcontainer and [banteg's setup](https://githu
 ## requirements
 
 - docker (or [orbstack](https://orbstack.dev/))
+- Docker BuildKit/Buildx, required because the Dockerfile uses BuildKit-only syntax like `RUN --mount=type=cache,...`
 - devcontainer cli (`npm install -g @devcontainers/cli`)
+
+verify Buildx is available with:
+
+```sh
+docker buildx version
+```
+
+`devc` sets `DOCKER_BUILDKIT=1` by default for devcontainer builds and exits with a clear message if `docker` or `docker buildx` is unavailable.
 
 ## quickstart
 

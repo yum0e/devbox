@@ -23,6 +23,11 @@ USAGE
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 TEMPLATE_FILES=(Dockerfile devcontainer.json post_install.py entrypoint.sh)
 
+# Dockerfile uses BuildKit-only syntax such as:
+#   RUN --mount=type=cache,...
+# so devcontainer builds need BuildKit/Buildx.
+export DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-1}"
+
 die() {
   echo "error: $*" >&2
   exit 1
@@ -95,6 +100,31 @@ require_devcontainer_cli() {
   fi
 }
 
+require_docker_buildx() {
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "error: docker is not installed or not in PATH" >&2
+    exit 1
+  fi
+
+  if ! docker buildx version >/dev/null 2>&1; then
+    cat >&2 <<'EOF'
+error: docker buildx is not available
+
+This devbox template requires Docker BuildKit/Buildx because the Dockerfile
+uses BuildKit-only syntax such as:
+
+  RUN --mount=type=cache,...
+
+Please install or enable Docker Buildx for your Docker installation, then retry.
+
+Verify with:
+
+  docker buildx version
+EOF
+    exit 1
+  fi
+}
+
 self_install() {
   local bin_dir="$HOME/.local/bin"
   local share_dir="$HOME/.local/share/devc/template"
@@ -163,12 +193,14 @@ case "$cmd" in
   rebuild)
     copy_template "$REPO_PATH" "$TEMPLATE_DIR"
     require_devcontainer_cli
+    require_docker_buildx
     devcontainer up --workspace-folder "$REPO_PATH" --remove-existing-container
     devcontainer exec --workspace-folder "$REPO_PATH" tmux new -As agent
     ;;
   up)
     copy_template "$REPO_PATH" "$TEMPLATE_DIR"
     require_devcontainer_cli
+    require_docker_buildx
     devcontainer up --workspace-folder "$REPO_PATH"
     devcontainer exec --workspace-folder "$REPO_PATH" tmux new -As agent
     ;;
