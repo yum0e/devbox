@@ -7,6 +7,7 @@
 # - Passwordless sudo for the non-root user
 # - NO firewall / network restrictions (internet enabled)
 # - tmux installed
+# - Herdr installed as an opt-in multiplexer pilot
 # - jj (Jujutsu) installed
 # - fnm (Fast Node Manager) installed
 
@@ -51,6 +52,7 @@ ARG HUNK_VERSION=latest
 ARG PRIME_AGENT_CHANNEL=stable
 ARG JJ_VERSION=latest
 ARG FNM_VERSION=latest
+ARG HERDR_VERSION=0.8.0
 
 # Install common dev tools.
 # Note: we intentionally do NOT install iptables/ipset or ship a firewall script.
@@ -133,6 +135,28 @@ RUN set -eux; \
     install -m 0755 /tmp/fnm-extract/fnm /usr/local/bin/fnm; \
     rm -rf /tmp/fnm.zip /tmp/fnm-extract; \
     /usr/local/bin/fnm --version
+
+# Install the pinned Herdr multiplexer pilot. Checksums must be updated with the version.
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) \
+        herdr_asset="herdr-linux-x86_64"; \
+        herdr_sha256="b872ea7e40fa2cb17e857ac9b62b1bf26db7b403c622f5d2f3f5b35f6e9acd28" \
+        ;; \
+      arm64) \
+        herdr_asset="herdr-linux-aarch64"; \
+        herdr_sha256="f647ac66468d9efbc642fe534fb284468f0aea60641606fc008dfc0d82a3ca87" \
+        ;; \
+      *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
+    esac; \
+    herdr_tag="v${HERDR_VERSION#v}"; \
+    curl -fsSL -o /tmp/herdr \
+      "https://github.com/herdrdev/herdr/releases/download/${herdr_tag}/${herdr_asset}"; \
+    echo "${herdr_sha256}  /tmp/herdr" | sha256sum -c -; \
+    install -m 0755 /tmp/herdr /usr/local/bin/herdr; \
+    rm -f /tmp/herdr; \
+    /usr/local/bin/herdr --version
 
 # Ensure git worktrees use relative paths by default.
 RUN git config --system worktree.useRelativePaths true \

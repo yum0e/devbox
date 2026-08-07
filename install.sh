@@ -6,13 +6,15 @@ usage() {
 devcontainer helper for this template.
 
 usage:
-  devc <repo>            install template, devcontainer up, then tmux
+  devc <repo>            install template, devcontainer up, then attach
   devc install <repo>    install template only
-  devc rebuild <repo>    clear build cache, then up + tmux
+  devc rebuild <repo>    clear build cache, then up + attach
   devc exec <repo> -- <cmd>
   devc self-install      install devc + template into ~/.local
 
 notes:
+  - tmux is the default multiplexer
+  - set DEVC_MULTIPLEXER=herdr to opt into the Herdr pilot
   - install and default run overwrite .devcontainer in the target repo
   - rebuild keeps named volumes (history, auth) intact
   - if devcontainer cli is missing, we suggest how to install it
@@ -125,6 +127,29 @@ EOF
   fi
 }
 
+validate_multiplexer() {
+  case "${DEVC_MULTIPLEXER:-tmux}" in
+    tmux|herdr)
+      ;;
+    *)
+      die "unsupported multiplexer: ${DEVC_MULTIPLEXER} (expected tmux or herdr)"
+      ;;
+  esac
+}
+
+attach_multiplexer() {
+  local repo_path="$1"
+
+  case "${DEVC_MULTIPLEXER:-tmux}" in
+    tmux)
+      devcontainer exec --workspace-folder "$repo_path" tmux new -As agent
+      ;;
+    herdr)
+      devcontainer exec --workspace-folder "$repo_path" herdr
+      ;;
+  esac
+}
+
 self_install() {
   local bin_dir="$HOME/.local/bin"
   local share_dir="$HOME/.local/share/devc/template"
@@ -191,18 +216,20 @@ case "$cmd" in
     exit 0
     ;;
   rebuild)
+    validate_multiplexer
     copy_template "$REPO_PATH" "$TEMPLATE_DIR"
     require_devcontainer_cli
     require_docker_buildx
     devcontainer up --workspace-folder "$REPO_PATH" --remove-existing-container
-    devcontainer exec --workspace-folder "$REPO_PATH" tmux new -As agent
+    attach_multiplexer "$REPO_PATH"
     ;;
   up)
+    validate_multiplexer
     copy_template "$REPO_PATH" "$TEMPLATE_DIR"
     require_devcontainer_cli
     require_docker_buildx
     devcontainer up --workspace-folder "$REPO_PATH"
-    devcontainer exec --workspace-folder "$REPO_PATH" tmux new -As agent
+    attach_multiplexer "$REPO_PATH"
     ;;
   exec)
     copy_template "$REPO_PATH" "$TEMPLATE_DIR"
