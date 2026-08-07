@@ -182,9 +182,9 @@ RUN echo '. /etc/profile.d/00-commandhistory.sh' >> /etc/bash.bashrc \
 ENV DEVCONTAINER=true
 
 # Create workspace + agent config dirs and set permissions.
-RUN mkdir -p /workspace /home/node/.claude /home/node/.codex /home/node/.pi /home/node/.prime /home/node/.npm /home/node/.config/zsh /home/node/.local/share/fnm \
+RUN mkdir -p /workspace /home/node/.agents /home/node/.claude /home/node/.codex /home/node/.pi /home/node/.prime /home/node/.npm /home/node/.config/zsh /home/node/.local/share/fnm \
   && touch /home/node/.zshrc \
-  && chown -R node:node /workspace /home/node/.claude /home/node/.codex /home/node/.pi /home/node/.prime /home/node/.npm /home/node/.config /home/node/.local /home/node/.zshrc
+  && chown -R node:node /workspace /home/node/.agents /home/node/.claude /home/node/.codex /home/node/.pi /home/node/.prime /home/node/.npm /home/node/.config /home/node/.local /home/node/.zshrc
 
 WORKDIR /workspace
 

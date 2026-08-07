@@ -34,7 +34,8 @@ the built in terminal would login inside the container.
 ## notes
 
 - **overwrites `.devcontainer/`** on every run
-- auth, history, Prime Agent sessions and runtime, and jj user config persist across rebuilds via docker volumes
+- auth, history, Prime Agent sessions and runtime, and jj user config persist across rebuilds via Docker volumes
+- `~/.agents` uses the shared `agents-repository` Docker volume, so a repository installed in one devbox is available in every devbox on the same Docker host
 - Prime Agent is installed from its stable release channel by default; set `PRIME_AGENT_CHANNEL` to `beta` in `devcontainer.json` to use the beta channel
 - PostgreSQL tools are preinstalled (start the service manually when needed)
 - Node version switching is handled with `fnm` (`fnm install --lts`, `fnm use --lts`, `fnm default <version>`)

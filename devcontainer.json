@@ -49,6 +49,7 @@
     "source=codex-config,target=/home/node/.codex,type=volume",
     "source=pi-config,target=/home/node/.pi,type=volume",
     "source=prime-agent-config,target=/home/node/.prime,type=volume",
+    "source=agents-repository,target=/home/node/.agents,type=volume",
     "source=gh-config,target=/home/node/.config/gh,type=volume",
     "source=jj-config,target=/home/node/.config/jj,type=volume",
     "source=ssh-config,target=/home/node/.ssh,type=volume",
