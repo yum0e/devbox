@@ -13,8 +13,8 @@ usage:
   devc self-install      install devc + template into ~/.local
 
 notes:
-  - tmux is the default multiplexer
-  - set DEVC_MULTIPLEXER=herdr to opt into the Herdr pilot
+  - Herdr is the default multiplexer
+  - set DEVC_MULTIPLEXER=tmux to use tmux instead
   - install and default run overwrite .devcontainer in the target repo
   - rebuild keeps named volumes (history, auth) intact
   - if devcontainer cli is missing, we suggest how to install it
@@ -128,7 +128,7 @@ EOF
 }
 
 validate_multiplexer() {
-  case "${DEVC_MULTIPLEXER:-tmux}" in
+  case "${DEVC_MULTIPLEXER:-herdr}" in
     tmux|herdr)
       ;;
     *)
@@ -140,7 +140,7 @@ validate_multiplexer() {
 attach_multiplexer() {
   local repo_path="$1"
 
-  case "${DEVC_MULTIPLEXER:-tmux}" in
+  case "${DEVC_MULTIPLEXER:-herdr}" in
     tmux)
       devcontainer exec --workspace-folder "$repo_path" tmux new -As agent
       ;;

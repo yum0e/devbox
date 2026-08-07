@@ -7,7 +7,7 @@
 # - Passwordless sudo for the non-root user
 # - NO firewall / network restrictions (internet enabled)
 # - tmux installed
-# - Herdr installed as an opt-in multiplexer pilot
+# - Herdr installed as the default multiplexer
 # - jj (Jujutsu) installed
 # - fnm (Fast Node Manager) installed
 
@@ -136,7 +136,7 @@ RUN set -eux; \
     rm -rf /tmp/fnm.zip /tmp/fnm-extract; \
     /usr/local/bin/fnm --version
 
-# Install the pinned Herdr multiplexer pilot. Checksums must be updated with the version.
+# Install the pinned Herdr multiplexer. Checksums must be updated with the version.
 RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \
     case "$arch" in \

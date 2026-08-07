@@ -2,7 +2,7 @@
 
 a devcontainer for running Claude Code, Codex, Pi, and Prime Agent in yolo mode.
 
-includes `uv`, Foundry (`forge`, `cast`, `anvil`, `chisel`), `fnm` (Fast Node Manager), `hunk`, and the opt-in Herdr multiplexer preinstalled.
+includes `uv`, Foundry (`forge`, `cast`, `anvil`, `chisel`), `fnm` (Fast Node Manager), `hunk`, and the Herdr multiplexer preinstalled.
 
 based on anthropic's claude code devcontainer and [banteg's setup](https://github.com/banteg/agents).
 
@@ -26,15 +26,15 @@ install `./install.sh self-install`
 
 run `devc <repo>` or `devc .` inside project folder.
 
-you're now in tmux with Claude Code, Codex, Pi, and Prime Agent ready to go, with permissions preconfigured.
+you're now in Herdr with Claude Code, Codex, Pi, and Prime Agent ready to go, with permissions preconfigured.
 
-To try the pinned Herdr pilot instead of tmux:
+To use tmux instead:
 
 ```sh
-DEVC_MULTIPLEXER=herdr devc <repo>
+DEVC_MULTIPLEXER=tmux devc <repo>
 ```
 
-Herdr runs inside the devcontainer. Detaching or closing the terminal leaves its panes running while the container remains alive. A rebuild removes those live processes and the pilot's container-local Herdr state. Run agents directly in Herdr panes; nesting tmux inside Herdr prevents agent detection.
+Herdr runs inside the devcontainer. Detaching or closing the terminal leaves its panes running while the container remains alive. A rebuild removes those live processes and Herdr's container-local state. Run agents directly in Herdr panes; nesting tmux inside Herdr prevents agent detection.
 
 to use with vscode, run `devc install <repo>` and choose "reopen in container" in the editor.
 the built in terminal would login inside the container.
@@ -45,7 +45,7 @@ the built in terminal would login inside the container.
 - auth, history, Prime Agent sessions and runtime, and jj user config persist across rebuilds via Docker volumes
 - `~/.agents` uses the shared `agents-repository` Docker volume, so a repository installed in one devbox is available in every devbox on the same Docker host
 - Prime Agent is installed from its stable release channel by default; set `PRIME_AGENT_CHANNEL` to `beta` in `devcontainer.json` to use the beta channel
-- Herdr is pinned to `v0.8.0` for the pilot; tmux remains installed and is the default
+- Herdr is pinned to `v0.8.0` and is the default multiplexer; tmux remains installed as an option
 - PostgreSQL tools are preinstalled (start the service manually when needed)
 - Node version switching is handled with `fnm` (`fnm install --lts`, `fnm use --lts`, `fnm default <version>`)
 - installed `fnm` Node versions persist across rebuilds via the `fnm-data` volume

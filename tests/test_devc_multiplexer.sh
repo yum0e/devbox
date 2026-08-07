@@ -53,12 +53,12 @@ mapfile -t unset_result < <(run_devc unset-default __unset__ "")
 unset_repo="${unset_result[0]}"
 unset_log="${unset_result[1]}"
 grep -Fqx -- "up --workspace-folder $unset_repo" "$unset_log"
-grep -Fqx -- "exec --workspace-folder $unset_repo tmux new -As agent" "$unset_log"
+grep -Fqx -- "exec --workspace-folder $unset_repo herdr" "$unset_log"
 
 mapfile -t empty_result < <(run_devc empty-default "" "")
 empty_repo="${empty_result[0]}"
 empty_log="${empty_result[1]}"
-grep -Fqx -- "exec --workspace-folder $empty_repo tmux new -As agent" "$empty_log"
+grep -Fqx -- "exec --workspace-folder $empty_repo herdr" "$empty_log"
 
 mapfile -t herdr_result < <(run_devc herdr-up herdr "")
 herdr_repo="${herdr_result[0]}"
@@ -69,7 +69,13 @@ grep -Fq '"HERDR_VERSION": "0.8.0"' "$herdr_repo/.devcontainer/devcontainer.json
 grep -Fq '/usr/local/bin/herdr --version' "$herdr_repo/.devcontainer/Dockerfile"
 ! grep -Fq 'target=/home/node/.config/herdr' "$herdr_repo/.devcontainer/devcontainer.json"
 
-mapfile -t rebuild_result < <(run_devc herdr-rebuild herdr rebuild)
+mapfile -t tmux_result < <(run_devc tmux-up tmux "")
+tmux_repo="${tmux_result[0]}"
+tmux_log="${tmux_result[1]}"
+grep -Fqx -- "up --workspace-folder $tmux_repo" "$tmux_log"
+grep -Fqx -- "exec --workspace-folder $tmux_repo tmux new -As agent" "$tmux_log"
+
+mapfile -t rebuild_result < <(run_devc herdr-rebuild __unset__ rebuild)
 rebuild_repo="${rebuild_result[0]}"
 rebuild_log="${rebuild_result[1]}"
 grep -Fqx -- "up --workspace-folder $rebuild_repo --remove-existing-container" "$rebuild_log"
