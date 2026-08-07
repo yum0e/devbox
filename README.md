@@ -1,6 +1,6 @@
 # autonomous coding sandbox
 
-a devcontainer for running claude code and codex in yolo mode.
+a devcontainer for running Claude Code, Codex, Pi, and Prime Agent in yolo mode.
 
 includes `uv`, Foundry (`forge`, `cast`, `anvil`, `chisel`), `fnm` (Fast Node Manager), and `hunk` preinstalled.
 
@@ -26,7 +26,7 @@ install `./install.sh self-install`
 
 run `devc <repo>` or `devc .` inside project folder.
 
-you're now in tmux with claude and codex ready to go, with permissions preconfigured.
+you're now in tmux with Claude Code, Codex, Pi, and Prime Agent ready to go, with permissions preconfigured.
 
 to use with vscode, run `devc install <repo>` and choose "reopen in container" in the editor.
 the built in terminal would login inside the container.
@@ -34,7 +34,8 @@ the built in terminal would login inside the container.
 ## notes
 
 - **overwrites `.devcontainer/`** on every run
-- auth, history, and jj user config persist across rebuilds via docker volumes
+- auth, history, Prime Agent sessions and runtime, and jj user config persist across rebuilds via docker volumes
+- Prime Agent is installed from its stable release channel by default; set `PRIME_AGENT_CHANNEL` to `beta` in `devcontainer.json` to use the beta channel
 - PostgreSQL tools are preinstalled (start the service manually when needed)
 - Node version switching is handled with `fnm` (`fnm install --lts`, `fnm use --lts`, `fnm default <version>`)
 - installed `fnm` Node versions persist across rebuilds via the `fnm-data` volume

@@ -335,6 +335,7 @@ def main() -> None:
     ensure_dir_ownership(Path.home() / ".claude")
     ensure_dir_ownership(Path.home() / ".codex")
     ensure_dir_ownership(Path.home() / ".pi")
+    ensure_dir_ownership(Path.home() / ".prime")
     ensure_dir_ownership(Path.home() / ".config" / "gh")
     ensure_dir_ownership(Path.home() / ".config" / "jj")
     ensure_dir_ownership(Path.home() / ".local" / "share" / "fnm")

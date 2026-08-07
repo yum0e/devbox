@@ -9,6 +9,7 @@
       "CODEX_VERSION": "latest",
       "PI_VERSION": "latest",
       "HUNK_VERSION": "latest",
+      "PRIME_AGENT_CHANNEL": "stable",
       "JJ_VERSION": "latest",
       "FNM_VERSION": "latest"
     }
@@ -47,6 +48,7 @@
     "source=claude-code-config,target=/home/node/.claude,type=volume",
     "source=codex-config,target=/home/node/.codex,type=volume",
     "source=pi-config,target=/home/node/.pi,type=volume",
+    "source=prime-agent-config,target=/home/node/.prime,type=volume",
     "source=gh-config,target=/home/node/.config/gh,type=volume",
     "source=jj-config,target=/home/node/.config/jj,type=volume",
     "source=ssh-config,target=/home/node/.ssh,type=volume",
@@ -57,6 +59,7 @@
     "CLAUDE_CONFIG_DIR": "/home/node/.claude",
     "CODEX_HOME": "/home/node/.codex",
     "PI_CODING_AGENT_DIR": "/home/node/.pi/agent",
+    "PRIME_AGENT_CODING_AGENT_DIR": "/home/node/.prime/agent",
     "JJ_CONFIG": "/home/node/.config/jj/config.toml",
     "SSH_AUTH_SOCK": "/tmp/ssh-agent-node.sock"
   },

@@ -2,6 +2,7 @@
 
 # Based on Anthropic's Claude Code devcontainer template, with:
 # - Codex CLI installed
+# - Prime Agent installed
 # - Hunk installed via npm
 # - Passwordless sudo for the non-root user
 # - NO firewall / network restrictions (internet enabled)
@@ -47,6 +48,7 @@ ARG CLAUDE_CODE_VERSION=latest
 ARG CODEX_VERSION=latest
 ARG PI_VERSION=latest
 ARG HUNK_VERSION=latest
+ARG PRIME_AGENT_CHANNEL=stable
 ARG JJ_VERSION=latest
 ARG FNM_VERSION=latest
 
@@ -180,9 +182,9 @@ RUN echo '. /etc/profile.d/00-commandhistory.sh' >> /etc/bash.bashrc \
 ENV DEVCONTAINER=true
 
 # Create workspace + agent config dirs and set permissions.
-RUN mkdir -p /workspace /home/node/.claude /home/node/.codex /home/node/.pi /home/node/.npm /home/node/.config/zsh /home/node/.local/share/fnm \
+RUN mkdir -p /workspace /home/node/.claude /home/node/.codex /home/node/.pi /home/node/.prime /home/node/.npm /home/node/.config/zsh /home/node/.local/share/fnm \
   && touch /home/node/.zshrc \
-  && chown -R node:node /workspace /home/node/.claude /home/node/.codex /home/node/.pi /home/node/.npm /home/node/.config /home/node/.local /home/node/.zshrc
+  && chown -R node:node /workspace /home/node/.claude /home/node/.codex /home/node/.pi /home/node/.prime /home/node/.npm /home/node/.config /home/node/.local /home/node/.zshrc
 
 WORKDIR /workspace
 
@@ -211,8 +213,18 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 ENV FOUNDRY_DIR=/home/node/.foundry
 ENV PATH="${FOUNDRY_DIR}/bin:/home/node/.local/bin:/usr/local/share/npm-global/bin:${PATH}"
 
-# Preinstall managed Python for uv.
 USER node
+
+# Install Prime Agent without creating its user-specific IPython runtime in the image.
+RUN curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh \
+      -o /tmp/prime-agent-install.sh \
+    && PRIME_AGENT_BOOTSTRAP_KERNEL_ON_INSTALL=0 \
+       PRIME_AGENT_INSTALLER_PLAIN=1 \
+       sh /tmp/prime-agent-install.sh "${PRIME_AGENT_CHANNEL}" \
+    && rm -f /tmp/prime-agent-install.sh \
+    && prime-agent --version
+
+# Preinstall managed Python for uv.
 RUN uv python install 3.14
 
 # Install Foundry (forge, cast, anvil, chisel).
