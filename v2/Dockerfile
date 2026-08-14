@@ -8,7 +8,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       bubblewrap build-essential ca-certificates curl fd-find gh git jq less \
       libatomic1 libnss-wrapper lsof ncurses-term netcat-openbsd \
-      openssh-client procps python3 python3-venv ripgrep socat sudo \
+      openssh-client passwd procps python3 python3-venv ripgrep socat sudo \
       unzip vim zoxide zsh \
  && install -d /usr/share/postgresql-common/pgdg \
  && curl --fail --show-error --silent \
