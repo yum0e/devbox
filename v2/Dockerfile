@@ -1,6 +1,6 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 ARG TACT_VERSION=0.5.3
-FROM ghcr.io/clabby/tact:${TACT_VERSION} AS tact
+FROM ghcr.io/clabby/tact:${TACT_VERSION}@sha256:ef44abc4d69b27f3c13526717ac0258e2bb88497611449d5b02e935630d074c5 AS tact
 FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 ARG HERDR_VERSION=0.8.0
 
@@ -11,8 +11,9 @@ RUN apt-get update \
       python3 python3-venv ripgrep vim zsh \
  && rm -rf /var/lib/apt/lists/*
 
-COPY --from=tact /tact /usr/local/bin/tact
-COPY --from=ghcr.io/astral-sh/uv:0.9.26 /uv /uvx /usr/local/bin/
+COPY --from=tact /tact /usr/local/libexec/devc2/tact-upstream
+COPY devbox/tact-wrapper.sh /usr/local/bin/tact
+COPY --from=ghcr.io/astral-sh/uv:0.9.26@sha256:9a23023be68b2ed09750ae636228e903a54a05ea56ed03a934d00fe9fbeded4b /uv /uvx /usr/local/bin/
 RUN npm install --global @openai/codex@0.147.0 \
  && npm cache clean --force
 
@@ -44,7 +45,7 @@ RUN set -eux; \
     herdr --version
 
 COPY devbox/entrypoint.sh /usr/local/bin/devc2-entrypoint
-RUN chmod 0755 /usr/local/bin/devc2-entrypoint \
+RUN chmod 0755 /usr/local/bin/devc2-entrypoint /usr/local/bin/tact /usr/local/libexec/devc2/tact-upstream \
  && groupadd --gid 1000 devbox \
  && useradd --uid 1000 --gid devbox --create-home --shell /bin/zsh devbox \
  && mkdir -p /workspace /home/devbox/.cache /home/devbox/.local/share/tact \
@@ -61,7 +62,7 @@ ENV HOME=/home/devbox \
     GH_TOKEN=devc2-github-placeholder-token \
     SSH_AUTH_SOCK=/run/devc2-ssh/agent.sock \
     TACT_PROXY_CA_FILE=/run/devc2-public/ca.crt \
-    PATH=/home/devbox/.local/bin:/usr/local/bin:/usr/bin:/bin
+    PATH=/usr/local/bin:/home/devbox/.local/bin:/usr/bin:/bin
 
 USER devbox
 WORKDIR /workspace

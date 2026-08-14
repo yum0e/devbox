@@ -21,7 +21,7 @@ command -v python3 >/dev/null 2>&1 || { echo "install.sh: Python 3 is required o
 bin_dir="${DEVC2_BIN_DIR:-$HOME/.local/bin}"
 share_dir="${DEVC2_SHARE_DIR:-$HOME/.local/share/devc2}"
 
-for required in Dockerfile compose.yaml devbox/entrypoint.sh launcher/devc2.py credential_proxy/ssh_agent_proxy.py; do
+for required in Dockerfile compose.yaml devbox/entrypoint.sh devbox/tact-wrapper.sh launcher/devc2.py credential_proxy/ssh_agent_proxy.py; do
   if [[ ! -f "$script_dir/$required" ]]; then
     echo "install.sh: missing v2 asset: $script_dir/$required" >&2
     exit 1
@@ -44,7 +44,7 @@ rm -rf -- "$staging/credential_proxy/tests"
 find "$staging" -type d -exec chmod 0755 {} +
 find "$staging" -type f -exec chmod 0644 {} +
 chmod 0755 "$staging/launcher/devc2.py" "$staging/devbox/entrypoint.sh" \
-  "$staging/credential_proxy/ssh_agent_proxy.py"
+  "$staging/devbox/tact-wrapper.sh" "$staging/credential_proxy/ssh_agent_proxy.py"
 
 backup="${share_dir}.old.$$"
 rm -rf -- "$backup"

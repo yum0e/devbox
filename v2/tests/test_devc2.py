@@ -10,6 +10,7 @@ class CliTests(unittest.TestCase):
     def test_cli(self):
         self.assertEqual(D.parse_cli(["repo"]),("start","repo",False))
         self.assertEqual(D.parse_cli(["doctor"]),("doctor",None,False))
+        self.assertEqual(D.parse_cli(["doctor","--runtime"]),("doctor-runtime",None,False))
         self.assertEqual(D.parse_cli(["auth"]),("auth",None,False))
         self.assertEqual(D.parse_cli(["reset","repo","--yes"]),("reset","repo",True))
         with self.assertRaises(RuntimeError): D.parse_cli(["a","b"])
@@ -72,6 +73,33 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("GH_TOKEN:", raw)
         self.assertNotIn("claude", raw.lower())
 
+    def test_tact_wrapper_restores_socket_and_forwards_arguments(self):
+        wrapper_source = (PATH.parents[1] / "devbox" / "tact-wrapper.sh").read_text()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            upstream = root / "upstream"
+            result = root / "result"
+            upstream.write_text(
+                "#!/bin/sh\n"
+                f"printf '%s\n' \"$SSH_AUTH_SOCK\" \"$@\" >{result}\n"
+                "exit 17\n"
+            )
+            upstream.chmod(0o755)
+            wrapper = root / "tact"
+            wrapper.write_text(wrapper_source.replace("/usr/local/libexec/devc2/tact-upstream", str(upstream)))
+            wrapper.chmod(0o755)
+            completed = subprocess.run([str(wrapper), "config", "show"], env={**os.environ, "SSH_AUTH_SOCK": "/wrong"})
+            self.assertEqual(completed.returncode, 17)
+            self.assertEqual(result.read_text().splitlines(), ["/run/devc2-ssh/agent.sock", "config", "show"])
+
+    def test_external_build_images_are_content_pinned(self):
+        dockerfile = (PATH.parents[1] / "Dockerfile").read_text()
+        proxy_dockerfile = (PATH.parents[1] / "credential_proxy" / "Dockerfile").read_text()
+        self.assertIn("docker/dockerfile:1.7@sha256:", dockerfile)
+        self.assertIn("ghcr.io/clabby/tact:${TACT_VERSION}@sha256:", dockerfile)
+        self.assertIn("ghcr.io/astral-sh/uv:0.9.26@sha256:", dockerfile)
+        self.assertIn("python:3.12-alpine@sha256:", proxy_dockerfile)
+
     def test_herdr_is_pinned_and_is_the_default_environment(self):
         dockerfile = (PATH.parents[1] / "Dockerfile").read_text()
         entrypoint = (PATH.parents[1] / "devbox" / "entrypoint.sh").read_text()
@@ -81,11 +109,46 @@ class CliTests(unittest.TestCase):
         self.assertTrue(entrypoint.rstrip().endswith('exec herdr "$@"'))
         self.assertNotIn('exec tact "$@"', entrypoint)
 
+    def test_runtime_doctor_is_disposable_and_exercises_live_boundaries(self):
+        source = PATH.read_text()
+        entrypoint = (PATH.parents[1] / "devbox" / "entrypoint.sh").read_text()
+        self.assertIn("TemporaryDirectory(prefix='devc2-doctor-repo-')", source)
+        self.assertIn("DEVC2_RUNTIME_DOCTOR=1", source)
+        self.assertIn("down_args.append('--volumes')", source)
+        self.assertIn("shutil.rmtree(lock_directory", source)
+        self.assertIn("runtime doctor teardown left resources", source)
+        self.assertIn("ssh-add -L", entrypoint)
+        self.assertIn("grep -c '^ssh-'", entrypoint)
+        self.assertIn("allowed_fingerprint", entrypoint)
+        self.assertIn("backend-api/codex/models?client_version=0.147.0", entrypoint)
+        self.assertIn("originator: codex_cli_rs", entrypoint)
+        self.assertIn("ChatGPT models request failed with HTTP", entrypoint)
+        self.assertIn('mv -f "$config_probe" "$TACT_CONFIG"', entrypoint)
+        self.assertIn("successfully authenticated", entrypoint)
+        self.assertIn('git -C "$runtime_repo" verify-commit HEAD', entrypoint)
+        self.assertIn("tact config show", entrypoint)
+        self.assertIn("herdr --version", entrypoint)
+        self.assertNotIn("set -x", entrypoint)
+
     def test_active_v1_is_refused(self):
         result = subprocess.CompletedProcess([], 0, "container-id\n", "")
         with mock.patch.object(D, "run", return_value=result):
             with self.assertRaisesRegex(RuntimeError, "v1 is already running"):
                 D.ensure_v1_not_running(Path("/tmp/repo"))
+
+    def test_runtime_doctor_uses_a_temporary_repo_and_checks_teardown(self):
+        seen=[]
+        def start(repo, runtime_doctor=False):
+            self.assertTrue(runtime_doctor)
+            self.assertTrue((repo / ".git").is_dir())
+            seen.append(repo)
+            return 0
+        empty=subprocess.CompletedProcess([],0,"","")
+        with mock.patch.object(D,"require_docker"), mock.patch.object(D,"read_codex",return_value=("a","b")), mock.patch.object(D,"validate_github_token",return_value="user"), mock.patch.object(D,"public_keys",return_value=["key"]), mock.patch.object(D,"start",side_effect=start), mock.patch.object(D,"run",return_value=empty) as run, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(D.doctor(runtime=True),0)
+        self.assertEqual(len(seen),1)
+        self.assertFalse(seen[0].exists())
+        self.assertEqual(run.call_count,3)
 
     def test_doctor_rejects_empty_agent(self):
         with mock.patch.object(D, "require_docker"), mock.patch.object(D, "read_codex", return_value=("a", "b")), mock.patch.object(D, "validate_github_token", return_value="user"), mock.patch.object(D, "public_keys", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
@@ -98,8 +161,12 @@ class CliTests(unittest.TestCase):
         self.assertIn("gpg.ssh.allowedSignersFile /run/devc2-public/allowed_signers", entrypoint)
         self.assertIn("namespaces=\"git\"", PATH.read_text())
         self.assertIn("filtered SSH agent did not become ready", entrypoint)
-        self.assertIn('$HOME/.zshenv', entrypoint)
-        self.assertIn('$HOME/.bashrc', entrypoint)
+        self.assertNotIn('$HOME/.zshenv', entrypoint)
+        self.assertNotIn('$HOME/.bashrc', entrypoint)
+        wrapper = (PATH.parents[1] / "devbox" / "tact-wrapper.sh").read_text()
+        self.assertIn("export SSH_AUTH_SOCK=/run/devc2-ssh/agent.sock", wrapper)
+        self.assertIn('exec /usr/local/libexec/devc2/tact-upstream "$@"', wrapper)
+        self.assertIn("/usr/local/bin:/home/devbox/.local/bin", (PATH.parents[1] / "Dockerfile").read_text())
         self.assertIn("selected 1Password key could not sign", entrypoint)
         self.assertIn("sanitized SSH proxy diagnostics", PATH.read_text())
         self.assertIn("sanitized startup diagnostics", PATH.read_text())

@@ -282,7 +282,7 @@ def ensure_v1_not_running(repo):
         raise RuntimeError("v1 is already running for this checkout; stop it before starting devc2")
 
 
-def start(repo):
+def start(repo, runtime_doctor=False):
     require_docker()
     ensure_v1_not_running(repo)
     ensure_tact_config()
@@ -316,7 +316,9 @@ def start(repo):
                     print("devc2: sanitized startup diagnostics:",file=sys.stderr)
                     compose(repo,env,'logs','--no-color','--tail','100','ssh-proxy',capture=False,check=False)
                     raise
-                command=['docker','compose','--project-name',identity(repo)[1],'-f',str(ROOT/'compose.yaml'),'run','--rm','--no-deps','devbox']
+                command=['docker','compose','--project-name',identity(repo)[1],'-f',str(ROOT/'compose.yaml'),'run','--rm','--no-deps']
+                if runtime_doctor: command.extend(['--env','DEVC2_RUNTIME_DOCTOR=1'])
+                command.append('devbox')
                 result=subprocess.run(command,env=env).returncode
                 if result:
                     print("devc2: sanitized SSH proxy diagnostics:",file=sys.stderr)
@@ -328,9 +330,12 @@ def start(repo):
                 for signum, handler in previous.items():
                     signal.signal(signum, handler)
                 try:
-                    compose(repo,env,'down','--remove-orphans',check=False)
+                    down_args=['down','--remove-orphans']
+                    if runtime_doctor: down_args.append('--volumes')
+                    compose(repo,env,*down_args,check=False)
                 finally:
                     stop_process(host_agent_relay)
+                    if runtime_doctor: shutil.rmtree(lock_directory,ignore_errors=True)
 
 def reset(repo,yes):
     if not yes:
@@ -409,7 +414,7 @@ def authenticate():
     print("Authentication saved outside all workspaces.")
     return 0
 
-def doctor():
+def doctor(runtime=False):
     checks=[]
     def check(label,fn):
         try: detail=fn(); checks.append((True,label,detail or 'ok'))
@@ -424,13 +429,29 @@ def doctor():
         return f"{len(keys)} key(s) available"
     check('1Password SSH agent', check_agent)
     for ok,label,detail in checks: print(f"{'✓' if ok else '✗'} {label}: {detail}")
-    return 0 if all(x[0] for x in checks) else 1
+    if not all(x[0] for x in checks): return 1
+    if not runtime: return 0
+    print("Running disposable end-to-end runtime checks…")
+    with tempfile.TemporaryDirectory(prefix='devc2-doctor-repo-') as raw:
+        repo=Path(raw); (repo/'.git').mkdir(); project=identity(repo)[1]
+        result=start(repo,runtime_doctor=True)
+        leftovers=[]
+        resource_commands={
+            'containers':['docker','container','ls','-aq'],
+            'volumes':['docker','volume','ls','-q'],
+            'networks':['docker','network','ls','-q'],
+        }
+        for kind,command in resource_commands.items():
+            found=run([*command,'--filter',f'label=com.docker.compose.project={project}'],timeout=15).stdout.split()
+            if found: leftovers.append(f"{kind}={len(found)}")
+        if leftovers: raise RuntimeError(f"runtime doctor teardown left resources: {', '.join(leftovers)}")
+        return result
 
 def usage_parser():
     parser = argparse.ArgumentParser(
         prog="devc2",
-        description="Run Tact in a hardened, credential-isolated devbox.",
-        epilog="commands: devc2 <repo> | devc2 auth | devc2 doctor | devc2 reset <repo> [--yes]",
+        description="Open Herdr in a hardened, credential-isolated devbox.",
+        epilog="commands: devc2 <repo> | devc2 auth | devc2 doctor [--runtime] | devc2 reset <repo> [--yes]",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     return parser
@@ -444,10 +465,14 @@ def parse_cli(argv):
     if argv[0] == "--version":
         print(f"devc2 {VERSION}")
         raise SystemExit(0)
-    if argv[0] in {"auth", "doctor"}:
-        if len(argv) != 1:
-            raise RuntimeError(f"{argv[0]} accepts no arguments")
-        return argv[0], None, False
+    if argv[0] == "auth":
+        if len(argv) != 1: raise RuntimeError("auth accepts no arguments")
+        return "auth", None, False
+    if argv[0] == "doctor":
+        parser=argparse.ArgumentParser(prog="devc2 doctor")
+        parser.add_argument("--runtime",action="store_true",help="run disposable end-to-end Docker checks")
+        args=parser.parse_args(argv[1:])
+        return "doctor-runtime" if args.runtime else "doctor", None, False
     if argv[0] == "reset":
         parser = argparse.ArgumentParser(prog="devc2 reset")
         parser.add_argument("repo")
@@ -455,15 +480,15 @@ def parse_cli(argv):
         args = parser.parse_args(argv[1:])
         return "reset", args.repo, args.yes
     if argv[0].startswith("-") or len(argv) != 1:
-        raise RuntimeError("usage: devc2 <repo> | devc2 auth | devc2 doctor | devc2 reset <repo> [--yes]")
+        raise RuntimeError("usage: devc2 <repo> | devc2 auth | devc2 doctor [--runtime] | devc2 reset <repo> [--yes]")
     return "start", argv[0], False
 
 
 def main(argv=None):
     try:
         command, raw_repo, yes = parse_cli(argv)
-        if command == "doctor":
-            return doctor()
+        if command in {"doctor","doctor-runtime"}:
+            return doctor(runtime=command=="doctor-runtime")
         if command == "auth":
             return authenticate()
         repo = canonical_repo(raw_repo)

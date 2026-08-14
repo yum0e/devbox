@@ -17,6 +17,12 @@ fi
 # be replaceable. Refresh a writable per-repository copy on every launch.
 rm -f -- "$TACT_CONFIG"
 install -m 0600 "$shared_tact_config" "$TACT_CONFIG"
+if ! tact_config_output="$(/usr/local/bin/tact config show 2>&1)"; then
+  echo "tact-dev: shared Tact configuration is invalid" >&2
+  printf '%s
+' "$tact_config_output" >&2
+  exit 1
+fi
 
 if ! user_name="$(id -un 2>/dev/null)"; then
   readonly nss_directory="$(mktemp -d /tmp/tact-nss.XXXXXX)"
@@ -128,16 +134,67 @@ if git_name="$(git config --global user.name 2>/dev/null)" && git_email="$(git c
   jj config set --user signing.key /run/devc2-public/ssh-allowed.pub
 fi
 
-# Some agent runtimes construct a reduced child environment. Persist the public
-# filtered-socket path in user shell startup files as a compatibility fallback.
-readonly ssh_agent_export='export SSH_AUTH_SOCK=/run/devc2-ssh/agent.sock'
-for shell_startup in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.zshenv"; do
-  touch "$shell_startup"
-  if ! grep -Fqx "$ssh_agent_export" "$shell_startup"; then
-    printf '%s
-' "$ssh_agent_export" >>"$shell_startup"
+if [[ "${DEVC2_RUNTIME_DOCTOR:-}" == "1" ]]; then
+  echo "✓ credential proxy: GitHub authenticated as $github_login"
+  test -w "$TACT_CONFIG"
+  test ! -w /run/devc2-public/tact-config.toml
+  config_probe="${TACT_CONFIG}.doctor"
+  cp "$TACT_CONFIG" "$config_probe"
+  mv -f "$config_probe" "$TACT_CONFIG"
+  tact config show >/dev/null
+  echo "✓ Tact configuration: valid and atomically replaceable"
+  echo "✓ Tact binary: $(tact --version)"
+  echo "✓ Herdr binary: $(herdr --version)"
+  agent_keys="$(ssh-add -L)"
+  test "$(printf '%s\n' "$agent_keys" | grep -c '^ssh-')" -eq 1
+  allowed_fingerprint="$(ssh-keygen -lf /run/devc2-public/ssh-allowed.pub -E sha256 | awk '{print $2}')"
+  agent_fingerprint="$(printf '%s\n' "$agent_keys" | ssh-keygen -lf - -E sha256 | awk '{print $2}')"
+  test "$agent_fingerprint" = "$allowed_fingerprint"
+  echo "✓ filtered SSH agent: exactly the selected identity is available"
+  chatgpt_access="$(jq -er '.tokens.access_token' "$TACT_AUTH_FILE")"
+  chatgpt_account="$(jq -er '.tokens.account_id' "$TACT_AUTH_FILE")"
+  models_response="$(mktemp /tmp/devc2-models.XXXXXX)"
+  models_status="$(curl -sS --max-time 30 -w '%{http_code}' \
+    -H "Authorization: Bearer $chatgpt_access" \
+    -H "chatgpt-account-id: $chatgpt_account" \
+    -H 'originator: codex_cli_rs' \
+    -H 'User-Agent: codex_cli_rs/0.147.0' \
+    'https://chatgpt.com/backend-api/codex/models?client_version=0.147.0' \
+    -o "$models_response")"
+  if [[ "$models_status" != 200 ]]; then
+    echo "tact-dev: ChatGPT models request failed with HTTP $models_status" >&2
+    exit 1
   fi
-done
+  jq -e 'type == "object"' "$models_response" >/dev/null
+  rm -f -- "$models_response"
+  unset chatgpt_access chatgpt_account
+  echo "✓ ChatGPT credential proxy: authenticated models request"
+  ssh_result=""
+  ssh_status=0
+  ssh_result="$(ssh -o BatchMode=yes -o ConnectTimeout=15 \
+    -i /run/devc2-public/ssh-allowed.pub -o IdentitiesOnly=yes \
+    -o IdentityAgent="$SSH_AUTH_SOCK" \
+    -o UserKnownHostsFile=/run/devc2-public/known_hosts \
+    -o StrictHostKeyChecking=yes -T git@github.com 2>&1)" || ssh_status=$?
+  if ! printf '%s' "$ssh_result" | grep -qi 'successfully authenticated'; then
+    echo "tact-dev: GitHub SSH authentication failed (status $ssh_status)" >&2
+    printf '%s
+' "$ssh_result" >&2
+    exit 1
+  fi
+  echo "✓ GitHub SSH: authenticated"
+  runtime_repo="$(mktemp -d /tmp/devc2-runtime-doctor.XXXXXX)"
+  trap 'rm -rf -- "$runtime_repo"' EXIT
+  git -C "$runtime_repo" init -q
+  printf 'devc2 runtime doctor
+' >"$runtime_repo/README.md"
+  git -C "$runtime_repo" add README.md
+  git -C "$runtime_repo" commit -q -S -m 'test: verify devc2 runtime signing'
+  git -C "$runtime_repo" verify-commit HEAD
+  echo "✓ Git signing: signed commit verified"
+  echo "✓ runtime doctor passed"
+  exit 0
+fi
 
 if [[ "${TACT_DEV_SHELL:-}" == "1" ]]; then
   exec /bin/bash

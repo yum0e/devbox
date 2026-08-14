@@ -26,7 +26,8 @@ those credentials and can export data fetched with them.
 ./v2/install.sh
 
 devc2 auth        # one-time ChatGPT + GitHub browser/device login
-devc2 doctor
+devc2 doctor             # fast host prerequisites
+devc2 doctor --runtime   # disposable live Docker/credential/signing checks
 devc2 /path/to/repository
 devc2 reset /path/to/repository
 devc2 reset /path/to/repository --yes
@@ -38,6 +39,19 @@ ends the ephemeral devbox session and tears down its containers.
 
 `reset` removes only that checkout's v2 Compose resources and state. It never
 removes the checkout or v1 resources.
+
+### Runtime diagnostics
+
+`devc2 doctor --runtime` creates a disposable temporary checkout and validates
+the real Docker Desktop path: both credential-proxy routes, the exact filtered
+SSH identity, GitHub SSH, signed-commit verification, writable Tact config, and
+the pinned Tact and Herdr binaries. It may trigger a 1Password approval and
+makes authenticated read-only requests to GitHub and the ChatGPT model catalog.
+It never mounts a real checkout and removes its project volumes during teardown.
+
+The image installs a trusted `tact` wrapper ahead of the persistent home PATH.
+The wrapper restores the selected-key proxy socket before executing the pinned
+upstream Tact binary, without modifying shell startup files.
 
 ## Tact preferences and state
 
