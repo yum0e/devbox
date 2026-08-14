@@ -40,12 +40,13 @@ RUN set -eux; \
     esac; \
     curl -fsSL "https://github.com/herdrdev/herdr/releases/download/v${HERDR_VERSION#v}/${herdr_asset}" -o /tmp/herdr; \
     echo "$herdr_sha256  /tmp/herdr" | sha256sum -c -; \
-    install -m 0755 /tmp/herdr /usr/local/bin/herdr; \
+    install -m 0755 /tmp/herdr /usr/local/libexec/devc2/herdr-upstream; \
     rm /tmp/herdr; \
-    herdr --version
+    /usr/local/libexec/devc2/herdr-upstream --version
 
+COPY devbox/herdr-wrapper.py /usr/local/bin/herdr
 COPY devbox/entrypoint.sh /usr/local/bin/devc2-entrypoint
-RUN chmod 0755 /usr/local/bin/devc2-entrypoint /usr/local/bin/tact /usr/local/libexec/devc2/tact-upstream \
+RUN chmod 0755 /usr/local/bin/devc2-entrypoint /usr/local/bin/herdr /usr/local/bin/tact /usr/local/libexec/devc2/herdr-upstream /usr/local/libexec/devc2/tact-upstream \
  && groupadd --gid 1000 devbox \
  && useradd --uid 1000 --gid devbox --create-home --shell /bin/zsh devbox \
  && mkdir -p /workspace /home/devbox/.cache /home/devbox/.local/share/tact \

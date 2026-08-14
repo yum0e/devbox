@@ -29,6 +29,8 @@ those credentials and can export data fetched with them.
 devc2 auth        # one-time ChatGPT + GitHub browser/device login
 devc2 doctor             # fast host prerequisites
 devc2 doctor --runtime   # disposable live Docker/credential/signing checks
+devc2 update             # verify and atomically activate the latest stable release
+devc2 rollback           # atomically return to the retained previous runtime
 devc2 /path/to/repository
 devc2 reset /path/to/repository
 devc2 reset /path/to/repository --yes
@@ -53,6 +55,60 @@ It never mounts a real checkout and removes its project volumes during teardown.
 The image installs a trusted `tact` wrapper ahead of the persistent home PATH.
 The wrapper restores the selected-key proxy socket before executing the pinned
 upstream Tact binary, without modifying shell startup files.
+
+
+## Safe installation and updates
+
+A checkout install remains available:
+
+```sh
+./v2/install.sh
+```
+
+After the first `devc2-v*` GitHub Release is published, installation does not
+require a clone. Download the installer as a file, inspect it, and then run it;
+do not pipe remote code directly into a shell:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fLO \
+  https://github.com/yum0e/devbox/releases/latest/download/install-devc2.sh
+less install-devc2.sh
+bash install-devc2.sh
+rm install-devc2.sh
+```
+
+Installation and updates use only `~/.local/bin`, `~/.local/share/devc2`, and
+`~/.local/state/devc2` by default. They never invoke `sudo` or edit shell startup
+files. A Docker Hub account or `docker login` is never required: devc2 only reads
+public pinned base images anonymously, builds its runtime image locally, and uses
+`--pull=never` whenever that local image is run. If `~/.local/bin` is absent from
+`PATH`, the installer prints a note and leaves the decision to the user.
+
+Program assets are installed into immutable, versioned directories. A stable
+dispatcher takes a shared lock before selecting one runtime, and that process
+keeps the resolved directory for its full lifetime. Install, update, and rollback
+need the exclusive form of the same permanent lock and immediately refuse while
+any devc2 command or session is active. There is no force override. Repository
+locks are also permanent, so `reset` cannot tear down a running checkout.
+
+The new release is fully downloaded, bounded, hash-verified, safely extracted,
+and structurally validated before activation. A same-filesystem `current` symlink
+replacement is the single atomic activation point. The old runtime remains at
+`previous`; `devc2 rollback` switches back without network access. Configuration,
+OAuth data, Tact preferences, checkout contents, and Docker state volumes live
+outside versioned program assets and are never migrated or rewritten by these
+operations.
+
+`devc2 update` trusts GitHub's TLS-verified Releases API, the repository's GitHub
+control plane, and the SHA-256 asset digest recorded by GitHub. This detects
+corruption and substitution outside that trust boundary; it does not protect
+against compromise of the GitHub repository, release workflow, or GitHub itself.
+Release tags and immutable Releases must therefore be protected in repository
+settings. The `devc2-release` environment must require approval and define its
+`DEVC2_RELEASE_APPROVED=true` environment variable. The workflow also requires a
+protected tag whose commit is on `main`; it is tag/version-gated, uses a
+commit-pinned checkout action, builds deterministic archives, tests the archive,
+and refuses to replace an existing release.
 
 ## Tact preferences and state
 

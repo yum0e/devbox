@@ -51,3 +51,10 @@ the built in terminal would login inside the container.
 - installed `fnm` Node versions persist across rebuilds via the `fnm-data` volume
 - host SSH agent forwarding is supported inside the container
 
+
+
+## devbox v2
+
+The hardened, non-destructive `devc2` runtime and its safe user-local updater are
+documented in [`v2/README.md`](v2/README.md). It coexists with the original
+`devc` flow above.

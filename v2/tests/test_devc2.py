@@ -1,5 +1,5 @@
 from __future__ import annotations
-import contextlib, importlib.util, io, os, stat, subprocess, tempfile, unittest
+import contextlib, importlib.util, io, os, stat, subprocess, sys, tempfile, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -12,6 +12,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(D.parse_cli(["doctor"]),("doctor",None,False))
         self.assertEqual(D.parse_cli(["doctor","--runtime"]),("doctor-runtime",None,False))
         self.assertEqual(D.parse_cli(["auth"]),("auth",None,False))
+        self.assertEqual(D.parse_cli(["update"]),("update",None,False))
+        self.assertEqual(D.parse_cli(["rollback"]),("rollback",None,False))
         self.assertEqual(D.parse_cli(["reset","repo","--yes"]),("reset","repo",True))
         with self.assertRaises(RuntimeError): D.parse_cli(["a","b"])
     def test_help_has_no_subprocess(self):
@@ -97,6 +99,20 @@ class CliTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 17)
             self.assertEqual(result.read_text().splitlines(), ["/run/devc2-ssh/agent.sock", "config", "show"])
 
+    def test_herdr_wrapper_normalizes_only_clean_server_shutdown(self):
+        source=(PATH.parents[1]/"devbox"/"herdr-wrapper.py").read_text()
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); upstream=root/"herdr-upstream"; wrapper=root/"herdr"; wrapper.write_text(source.replace("/usr/local/libexec/devc2/herdr-upstream",str(upstream)))
+            cases=(("herdr: server shut down: server is shutting down",1,0),("herdr: unexpected crash",1,1),("herdr: server shut down: server is shutting down",2,2))
+            for message,status,expected in cases:
+                upstream.write_text(f"#!/bin/sh\nprintf '%s\n' '{message}' >&2\nexit {status}\n"); upstream.chmod(0o755)
+                result=subprocess.run([sys.executable,str(wrapper)],text=True,capture_output=True)
+                self.assertEqual(result.returncode,expected,result.stderr)
+                self.assertIn(message,result.stderr)
+        dockerfile=(PATH.parents[1]/"Dockerfile").read_text()
+        self.assertIn("/usr/local/libexec/devc2/herdr-upstream",dockerfile)
+        self.assertIn("COPY devbox/herdr-wrapper.py /usr/local/bin/herdr",dockerfile)
+
     def test_external_build_images_are_content_pinned(self):
         dockerfile = (PATH.parents[1] / "Dockerfile").read_text()
         proxy_dockerfile = (PATH.parents[1] / "credential_proxy" / "Dockerfile").read_text()
@@ -120,7 +136,8 @@ class CliTests(unittest.TestCase):
         self.assertIn("TemporaryDirectory(prefix='devc2-doctor-repo-')", source)
         self.assertIn("DEVC2_RUNTIME_DOCTOR=1", source)
         self.assertIn("down_args.append('--volumes')", source)
-        self.assertIn("shutil.rmtree(lock_directory", source)
+        self.assertIn('locks=STATE/"locks"', source)
+        self.assertNotIn("shutil.rmtree(lock_directory", source)
         self.assertIn("runtime doctor teardown left resources", source)
         self.assertIn("ssh-add -L", entrypoint)
         self.assertIn("grep -c '^ssh-'", entrypoint)
@@ -149,7 +166,7 @@ class CliTests(unittest.TestCase):
             seen.append(repo)
             return 0
         empty=subprocess.CompletedProcess([],0,"","")
-        with mock.patch.object(D,"require_docker"), mock.patch.object(D,"read_codex",return_value=("a","b")), mock.patch.object(D,"validate_github_token",return_value="user"), mock.patch.object(D,"public_keys",return_value=["key"]), mock.patch.object(D,"start",side_effect=start), mock.patch.object(D,"run",return_value=empty) as run, contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch.object(D,"require_docker"), mock.patch.object(D,"read_codex",return_value=("a","b")), mock.patch.object(D,"validate_github_token",return_value="user"), mock.patch.object(D,"public_keys",return_value=["key"]), mock.patch.object(D,"_start_unlocked",side_effect=start), mock.patch.object(D,"run",return_value=empty) as run, contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(D.doctor(runtime=True),0)
         self.assertEqual(len(seen),1)
         self.assertFalse(seen[0].exists())
@@ -188,21 +205,25 @@ class AuthTests(unittest.TestCase):
         completed = subprocess.CompletedProcess([], 0, "", "")
         with tempfile.TemporaryDirectory() as td:
             auth = Path(td) / "auth"
-            with mock.patch.object(D, "AUTH", auth), mock.patch.object(D, "require_docker"), mock.patch.object(D, "read_codex", side_effect=[RuntimeError("missing"), ("access", "account")]) as read_codex, mock.patch.object(D, "validate_github_token", side_effect=[RuntimeError("missing"), "user"]) as github_token, mock.patch.object(D, "run", return_value=completed) as run, contextlib.redirect_stdout(io.StringIO()):
+            def auth_run(argv,**_kwargs):
+                if argv[:3]==["docker","image","inspect"]: return subprocess.CompletedProcess(argv,1,"","")
+                return completed
+            with mock.patch.object(D, "AUTH", auth), mock.patch.object(D, "require_docker"), mock.patch.object(D, "read_codex", side_effect=[RuntimeError("missing"), ("access", "account")]) as read_codex, mock.patch.object(D, "validate_github_token", side_effect=[RuntimeError("missing"), "user"]) as github_token, mock.patch.object(D, "run", side_effect=auth_run) as run, contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(D.authenticate(), 0)
             self.assertEqual(read_codex.call_count, 2)
             self.assertEqual(github_token.call_count, 2)
 
             commands = [call.args[0] for call in run.call_args_list]
-            self.assertEqual(len(commands), 3)
+            self.assertEqual(len(commands), 4)
             self.assertTrue(all(command[0] in {"docker", "gh"} for command in commands))
-            self.assertEqual(commands[0][:4], ["docker", "build", "--tag", "devc2:0.1.0"])
-            self.assertIn(f"{auth / 'codex'}:/home/devbox/.codex", commands[1])
-            self.assertIn("codex", commands[1])
-            self.assertEqual(commands[1][-2:], ["login", "--device-auth"])
-            self.assertIn(f"{auth / 'gh'}:/run/devc2-gh", commands[2])
-            self.assertIn("gh", commands[2])
-            self.assertEqual(commands[2][-7:], ["auth", "login", "--hostname", "github.com", "--git-protocol", "https", "--web"])
+            self.assertEqual(commands[0][:3], ["docker", "image", "inspect"])
+            self.assertEqual(commands[1][:4], ["docker", "build", "--tag", "devc2:0.2.0"])
+            self.assertIn(f"{auth / 'codex'}:/home/devbox/.codex", commands[2])
+            self.assertIn("codex", commands[2])
+            self.assertEqual(commands[2][-2:], ["login", "--device-auth"])
+            self.assertIn(f"{auth / 'gh'}:/run/devc2-gh", commands[3])
+            self.assertIn("gh", commands[3])
+            self.assertEqual(commands[3][-7:], ["auth", "login", "--hostname", "github.com", "--git-protocol", "https", "--web"])
             config = auth / "codex" / "config.toml"
             self.assertEqual(config.read_text(), 'cli_auth_credentials_store = "file"\n')
             self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o600)
@@ -229,15 +250,17 @@ class AuthTests(unittest.TestCase):
             gh = auth / "gh"
             gh.mkdir(parents=True)
             (gh / "hosts.yml").write_text("github.com: {}\n")
-            with mock.patch.object(D, "AUTH", auth), mock.patch.object(D, "run", return_value=completed) as run:
+            inspected=subprocess.CompletedProcess([],0,"","")
+            with mock.patch.object(D, "AUTH", auth), mock.patch.object(D, "run", side_effect=[inspected,completed]) as run:
                 self.assertEqual(D.github_token(), "managed-token")
-            run.assert_called_once_with([
-                "docker", "run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}",
+            self.assertEqual(run.call_args_list[0].args[0],["docker","image","inspect",D.AUTH_IMAGE])
+            self.assertEqual(run.call_args_list[1],mock.call([
+                "docker", "run", "--rm", "--pull=never", "--user", f"{os.getuid()}:{os.getgid()}",
                 "--env", "HOME=/tmp", "--env", "GH_CONFIG_DIR=/run/devc2-gh",
                 "--env", "GH_TOKEN=", "--env", "GITHUB_TOKEN=",
                 "--volume", f"{gh}:/run/devc2-gh:ro",
                 "--entrypoint", "gh", D.AUTH_IMAGE, "auth", "token",
-            ], timeout=30)
+            ], timeout=30))
 
     def test_bootstrapped_auth_needs_no_host_codex_or_gh(self):
         access = D.jwt({"exp": 4102444800})

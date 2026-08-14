@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """Trusted macOS launcher for devbox v2."""
 from __future__ import annotations
-import argparse, base64, fcntl, hashlib, json, os, platform, secrets, shutil, signal, stat, subprocess, sys, tempfile, time, urllib.error, urllib.request
-from pathlib import Path
+import argparse, base64, contextlib, fcntl, gzip, hashlib, json, os, platform, secrets, shlex, shutil, signal, stat, subprocess, sys, tarfile, tempfile, time, unicodedata, urllib.error, urllib.parse, urllib.request
+from pathlib import Path, PurePosixPath
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 IRON="ironsh/iron-proxy:0.49.0@sha256:c4628019c24f4cc8d77564a26b7c9cedb00accee6f93d06270e85fb8f9c6a7da"
 GH_PLACEHOLDER="devc2-github-placeholder-token"
 FAKE_ACCOUNT="00000000-0000-0000-0000-000000000000"
 GITHUB_KNOWN_HOSTS='github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\ngithub.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=\ngithub.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=\n'
 SOURCE_ROOT=Path(__file__).resolve().parents[1]
-INSTALLED_ROOT=Path(os.environ.get("DEVC2_SHARE_DIR", Path.home()/".local/share/devc2")).expanduser()
+INSTALLED_ROOT=Path(os.environ.get("DEVC2_RUNTIME_ROOT",os.environ.get("DEVC2_SHARE_DIR",Path.home()/".local/share/devc2"))).expanduser().resolve()
 ROOT=INSTALLED_ROOT if (INSTALLED_ROOT/"compose.yaml").is_file() else SOURCE_ROOT
 
 def xdg(name, default): return Path(os.environ.get(name, Path.home()/default)).expanduser()
@@ -19,7 +19,13 @@ STATE=xdg("XDG_STATE_HOME", ".local/state")/"devc2"
 AUTH=CONFIG/"auth"
 TACT_CONFIG=CONFIG/"tact"/"config.toml"
 TACT_CONFIG_DEFAULT="[agent]\nmax_subagents = 8\n"
-AUTH_IMAGE="devc2:0.1.0"
+AUTH_IMAGE=f"devc2:{VERSION}"
+INSTALL_STATE=STATE/"installation.json"
+INSTALL_LOCK=STATE/"install.lock"
+RELEASE_API="https://api.github.com/repos/yum0e/devbox/releases/latest"
+RELEASE_ASSET="devc2.tar.gz"
+MAX_RELEASE_BYTES=32*1024*1024
+MAX_RELEASE_TAR_BYTES=40*1024*1024
 
 def run(argv, *, env=None, capture=True, check=True, timeout=120):
     try:
@@ -28,6 +34,413 @@ def run(argv, *, env=None, capture=True, check=True, timeout=120):
     except subprocess.CalledProcessError as e:
         detail=(e.stderr or e.stdout or "command failed").strip()
         raise RuntimeError(f"{argv[0]} failed: {detail}") from e
+
+@contextlib.contextmanager
+def lifecycle_lock(exclusive):
+    inherited=os.environ.get("DEVC2_CONTROL_LOCK_FD")
+    if inherited:
+        try:
+            descriptor=int(inherited); opened=os.fstat(descriptor); expected=INSTALL_LOCK.stat()
+            if (opened.st_dev,opened.st_ino)!=(expected.st_dev,expected.st_ino): raise OSError
+        except (ValueError,OSError,FileNotFoundError) as error:
+            raise RuntimeError("invalid inherited installation lock") from error
+        mode=os.environ.get("DEVC2_CONTROL_LOCK_MODE")
+        if exclusive and mode!="exclusive": raise RuntimeError("management command requires the exclusive installation lock")
+        yield
+        return
+    STATE.mkdir(parents=True,exist_ok=True,mode=0o700)
+    with INSTALL_LOCK.open("a+") as lock:
+        operation=fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        try: fcntl.flock(lock,operation|fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            action="install or update" if not exclusive else "running devc2 session"
+            raise RuntimeError(f"cannot start while a devc2 {action} is active" if not exclusive else "cannot install or update while a devc2 session is active") from error
+        try: yield
+        finally: fcntl.flock(lock,fcntl.LOCK_UN)
+
+@contextlib.contextmanager
+def repository_lock(repo):
+    locks=STATE/"locks"; locks.mkdir(parents=True,exist_ok=True,mode=0o700)
+    legacy_directory=STATE/identity(repo)[0]; legacy_directory.mkdir(parents=True,exist_ok=True,mode=0o700)
+    with (locks/f"{identity(repo)[0]}.lock").open("a+") as lock, (legacy_directory/"launch.lock").open("a+") as legacy:
+        acquired=[]
+        try:
+            for candidate in (lock,legacy):
+                try: fcntl.flock(candidate,fcntl.LOCK_EX|fcntl.LOCK_NB); acquired.append(candidate)
+                except BlockingIOError as error: raise RuntimeError("devc2 is already running for this checkout") from error
+            yield
+        finally:
+            for candidate in reversed(acquired): fcntl.flock(candidate,fcntl.LOCK_UN)
+
+def active_legacy_sessions():
+    active=[]
+    if not STATE.exists(): return active
+    for path in STATE.glob("*/launch.lock"):
+        try:
+            with path.open("r") as lock:
+                try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                except BlockingIOError: active.append(path.parent.name)
+                else: fcntl.flock(lock,fcntl.LOCK_UN)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            active.append(path.parent.name)
+    return active
+
+def atomic_write(path,data,mode=0o600):
+    path.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+    descriptor,temp_name=tempfile.mkstemp(prefix=f".{path.name}.",dir=path.parent)
+    temp=Path(temp_name)
+    try:
+        os.fchmod(descriptor,mode)
+        payload=data if isinstance(data,bytes) else data.encode()
+        with os.fdopen(descriptor,"wb") as output:
+            output.write(payload); output.flush(); os.fsync(output.fileno())
+        os.replace(temp,path)
+        directory=os.open(path.parent,os.O_RDONLY)
+        try: os.fsync(directory)
+        finally: os.close(directory)
+    except Exception:
+        try: os.close(descriptor)
+        except OSError: pass
+        temp.unlink(missing_ok=True)
+        raise
+
+def source_version(source):
+    import re
+    launcher=source/"launcher"/"devc2.py"
+    try: text=launcher.read_text(encoding="utf-8")
+    except OSError as error: raise RuntimeError("release lacks launcher/devc2.py") from error
+    match=re.search(r'^VERSION="([0-9]+\.[0-9]+\.[0-9]+)"$',text,re.MULTILINE)
+    if not match: raise RuntimeError("release has an invalid VERSION")
+    return match.group(1)
+
+def validate_asset_tree(source,strict=False):
+    required=("Dockerfile","compose.yaml","devbox/entrypoint.sh","devbox/tact-wrapper.sh","devbox/herdr-wrapper.py","launcher/devc2.py","launcher/dispatcher.py","credential_proxy/ssh_agent_proxy.py")
+    if not source.is_dir() or source.is_symlink(): raise RuntimeError("release asset root must be a directory")
+    total=0; count=0; allowed={"Dockerfile","compose.yaml","README.md","install.sh","devbox","credential_proxy","launcher"}
+    for path in source.rglob("*"):
+        relative=path.relative_to(source)
+        unexpected=not relative.parts or relative.parts[0] not in allowed or "__pycache__" in relative.parts or "tests" in relative.parts
+        if unexpected:
+            if strict: raise RuntimeError(f"release contains an unexpected path: {relative}")
+            continue
+        count+=1
+        if count>256: raise RuntimeError("release contains too many files")
+        metadata=path.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)):
+            raise RuntimeError(f"release contains an unsupported file: {path.relative_to(source)}")
+        if stat.S_ISREG(metadata.st_mode):
+            total+=metadata.st_size
+            if metadata.st_size>MAX_RELEASE_BYTES or total>MAX_RELEASE_BYTES:
+                raise RuntimeError("release assets exceed the size limit")
+    for name in required:
+        path=source/name
+        if not path.is_file() or path.is_symlink(): raise RuntimeError(f"release lacks required asset: {name}")
+    return source_version(source)
+
+def read_installation_state(path=None):
+    path=INSTALL_STATE if path is None else path
+    try:
+        document=json.loads(path.read_text(encoding="utf-8"))
+        if document.get("schema")!=1: return {}
+        return document
+    except (FileNotFoundError,OSError,ValueError): return {}
+
+def wrapper_root(wrapper):
+    import re
+    try: text=wrapper.read_text(encoding="utf-8")
+    except OSError: return None
+    match=re.search(r"^export (DEVC2_SHARE_DIR|DEVC2_DATA_DIR)=(.+)$",text,re.MULTILINE)
+    if not match: return None
+    try:
+        fields=shlex.split(match.group(2))
+        root=Path(fields[0]).expanduser()
+        if match.group(1)=="DEVC2_DATA_DIR": root=root/"current"
+        return root.resolve() if len(fields)==1 else None
+    except ValueError: return None
+
+def install_wrapper_text(data_root,bin_dir):
+    return "#!/usr/bin/env bash\n"+f"export DEVC2_DATA_DIR={shlex.quote(str(data_root))}\n"+f"export DEVC2_BIN_DIR={shlex.quote(str(bin_dir))}\n"+'exec python3 "$DEVC2_DATA_DIR/bootstrap/dispatcher.py" "$@"\n'
+
+def copy_release_assets(source,destination):
+    allowed=("Dockerfile","compose.yaml","README.md","devbox","credential_proxy","launcher")
+    destination.mkdir(mode=0o700)
+    for name in allowed:
+        origin=source/name
+        if not origin.exists(): continue
+        target=destination/name
+        if origin.is_dir(): shutil.copytree(origin,target,symlinks=False,ignore=shutil.ignore_patterns("__pycache__","tests"))
+        else: shutil.copyfile(origin,target)
+    for path in destination.rglob("*"):
+        if path.is_dir(): path.chmod(0o755)
+        elif path.is_file(): path.chmod(0o644)
+    for relative in ("launcher/devc2.py","launcher/dispatcher.py","devbox/entrypoint.sh","devbox/tact-wrapper.sh","devbox/herdr-wrapper.py","credential_proxy/ssh_agent_proxy.py"):
+        (destination/relative).chmod(0o755)
+
+def freeze_asset_tree(destination):
+    for path in destination.rglob("*"):
+        if path.is_dir(): path.chmod(0o555)
+        elif path.is_file(): path.chmod(0o444)
+    for relative in ("launcher/devc2.py","launcher/dispatcher.py","devbox/entrypoint.sh","devbox/tact-wrapper.sh","devbox/herdr-wrapper.py","credential_proxy/ssh_agent_proxy.py"):
+        (destination/relative).chmod(0o555)
+    destination.chmod(0o555)
+
+def remove_staging(path):
+    if not path.exists() or path.is_symlink(): return
+    for item in path.rglob("*"):
+        try: item.chmod(0o700 if item.is_dir() else 0o600)
+        except OSError: pass
+    try: path.chmod(0o700)
+    except OSError: pass
+    shutil.rmtree(path,ignore_errors=True)
+
+def ensure_owned_directory(path):
+    path.mkdir(parents=True,exist_ok=True)
+    metadata=path.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode): raise RuntimeError(f"installation path must be a real directory: {path}")
+    if metadata.st_uid!=os.getuid() or metadata.st_mode & 0o022: raise RuntimeError(f"installation path must be owned by the current user and not group/world writable: {path}")
+
+def replace_symlink(link,target):
+    temporary=link.parent/f".{link.name}.{secrets.token_hex(8)}"
+    os.symlink(str(target),temporary)
+    try:
+        os.replace(temporary,link)
+        directory=os.open(link.parent,os.O_RDONLY)
+        try: os.fsync(directory)
+        finally: os.close(directory)
+    finally: temporary.unlink(missing_ok=True)
+
+def asset_digest(source):
+    digest=hashlib.sha256(); runtime_roots={"Dockerfile","compose.yaml","README.md","devbox","credential_proxy","launcher"}
+    for path in sorted(p for p in source.rglob("*") if p.is_file()):
+        relative=path.relative_to(source)
+        if relative.parts[0] not in runtime_roots or "tests" in relative.parts or "__pycache__" in relative.parts: continue
+        name=str(relative).encode(); content=path.read_bytes()
+        digest.update(len(name).to_bytes(4,"big")); digest.update(name)
+        digest.update(len(content).to_bytes(8,"big")); digest.update(content)
+    return digest.hexdigest()
+
+def _activate_assets(source,bin_dir,share_dir,release=False):
+    version=validate_asset_tree(source)
+    bin_dir=bin_dir.expanduser().absolute(); share_dir=share_dir.expanduser().absolute()
+    ensure_owned_directory(bin_dir); ensure_owned_directory(share_dir)
+    versions=share_dir/"versions"; ensure_owned_directory(versions)
+    digest=asset_digest(source)
+    install_id=version if release else f"{version}+local.{digest[:12]}"
+    target=versions/install_id; launcher_path=bin_dir/"devc2"
+    current_link=share_dir/"current"; previous_link=share_dir/"previous"
+    try: old_root=current_link.resolve(strict=True) if current_link.is_symlink() else wrapper_root(launcher_path)
+    except OSError: old_root=wrapper_root(launcher_path)
+    if not target.exists():
+        staging=Path(tempfile.mkdtemp(prefix=f".{install_id}.",dir=versions)); staging.rmdir()
+        try:
+            copy_release_assets(source,staging)
+            if validate_asset_tree(staging,True)!=version: raise RuntimeError("staged installation failed validation")
+            freeze_asset_tree(staging)
+            staging.rename(target)
+        except Exception:
+            if staging.exists(): remove_staging(staging)
+            raise
+    elif validate_asset_tree(target,True)!=version or asset_digest(target)!=digest:
+        raise RuntimeError(f"existing installation target failed immutable content validation: {target}")
+    # Prepare the stable dispatcher before the current pointer, which is the only
+    # activation commit point. Existing launchers keep their already-resolved root.
+    bootstrap=share_dir/"bootstrap"; bootstrap.mkdir(exist_ok=True)
+    ensure_owned_directory(bootstrap)
+    dispatcher_source=source/"launcher"/"dispatcher.py"
+    atomic_write(bootstrap/"dispatcher.py",dispatcher_source.read_bytes(),0o555)
+    expected_wrapper=install_wrapper_text(share_dir,bin_dir)
+    replace_symlink(share_dir/"manager",target)
+    if old_root and old_root!=target: replace_symlink(previous_link,old_root)
+    replace_symlink(current_link,target)
+    # On first migration, replacing the legacy bin launcher is the final commit;
+    # every path it references is already complete. Future wrappers are unchanged.
+    if not launcher_path.exists() or launcher_path.read_text(encoding="utf-8")!=expected_wrapper:
+        atomic_write(launcher_path,expected_wrapper,0o555)
+    previous_root=None
+    if previous_link.is_symlink():
+        try: previous_root=previous_link.resolve(strict=True)
+        except OSError: previous_root=None
+    previous_version=None
+    if previous_root:
+        try: previous_version=source_version(previous_root)
+        except RuntimeError: pass
+    metadata={"schema":1,"version":install_id,"current":str(target),"previous":str(previous_root) if previous_root else None,"previous_version":previous_version,"bin_dir":str(bin_dir),"share_dir":str(share_dir),"installed_at":int(time.time())}
+    try: atomic_write(INSTALL_STATE,json.dumps(metadata,sort_keys=True,indent=2)+"\n")
+    except OSError as error: print(f"devc2: warning: activation succeeded but installation metadata could not be updated: {error}",file=sys.stderr)
+    print(f"installed devc2 {install_id}: {launcher_path}")
+    print(f"installed v2 assets: {target}")
+    if previous_root: print(f"rollback preserved: {previous_root}")
+    if str(bin_dir) not in os.environ.get("PATH","").split(os.pathsep): print(f"note: add {bin_dir} to PATH")
+    return 0
+
+def install_from_directory(source,bin_dir,share_dir,release=False):
+    with lifecycle_lock(True):
+        active=active_legacy_sessions()
+        if active: raise RuntimeError("cannot install or update while a devc2 session is active")
+        return _activate_assets(source.resolve(),bin_dir,share_dir,release)
+
+def parse_release_version(tag):
+    import re
+    match=re.fullmatch(r"devc2-v([0-9]+\.[0-9]+\.[0-9]+)",tag or "")
+    if not match: raise RuntimeError(f"latest release has an invalid tag: {tag!r}")
+    return match.group(1)
+
+def version_tuple(value): return tuple(int(part) for part in value.split("."))
+
+TRUSTED_RELEASE_HOSTS={"api.github.com","github.com","release-assets.githubusercontent.com","objects.githubusercontent.com"}
+
+def trusted_https_url(url):
+    parsed=urllib.parse.urlparse(url)
+    return parsed.scheme=="https" and parsed.hostname in TRUSTED_RELEASE_HOSTS and parsed.username is None and parsed.password is None
+
+class TrustedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self,request,fp,code,msg,headers,newurl):
+        if not trusted_https_url(newurl): raise RuntimeError("release download attempted an untrusted redirect")
+        return super().redirect_request(request,fp,code,msg,headers,newurl)
+
+def read_https(request,max_bytes):
+    if not trusted_https_url(request.full_url): raise RuntimeError("release URL is not trusted GitHub HTTPS")
+    opener=urllib.request.build_opener(TrustedRedirectHandler())
+    try:
+        with opener.open(request,timeout=30) as response:
+            if not trusted_https_url(response.geturl()): raise RuntimeError("release download redirected outside trusted GitHub HTTPS hosts")
+            length=response.headers.get("Content-Length")
+            if length and int(length)>max_bytes: raise RuntimeError("release download exceeds the size limit")
+            payload=response.read(max_bytes+1)
+    except RuntimeError: raise
+    except (OSError,urllib.error.HTTPError,urllib.error.URLError,ValueError) as error: raise RuntimeError("could not download the devc2 release") from error
+    if len(payload)>max_bytes: raise RuntimeError("release download exceeds the size limit")
+    return payload
+
+def latest_release():
+    request=urllib.request.Request(RELEASE_API,headers={"Accept":"application/vnd.github+json","User-Agent":f"devc2/{VERSION}","X-GitHub-Api-Version":"2022-11-28"})
+    try: document=json.loads(read_https(request,2*1024*1024))
+    except ValueError as error: raise RuntimeError("GitHub returned invalid release metadata") from error
+    version=parse_release_version(document.get("tag_name"))
+    matches=[asset for asset in document.get("assets",[]) if isinstance(asset,dict) and asset.get("name")==RELEASE_ASSET]
+    if len(matches)!=1: raise RuntimeError(f"release {version} must contain exactly one {RELEASE_ASSET}")
+    asset=matches[0]; digest=asset.get("digest")
+    import re
+    if not isinstance(digest,str) or not re.fullmatch(r"sha256:[0-9a-f]{64}",digest):
+        raise RuntimeError("release asset lacks its GitHub SHA-256 digest")
+    url=asset.get("browser_download_url")
+    if not isinstance(url,str) or not url.startswith("https://github.com/"):
+        raise RuntimeError("release asset has an invalid download URL")
+    return version,url,digest[7:]
+
+@contextlib.contextmanager
+def bounded_release_tar(archive):
+    descriptor,name=tempfile.mkstemp(prefix="devc2-release-",suffix=".tar")
+    output_path=Path(name); total=0
+    try:
+        with os.fdopen(descriptor,"wb") as output, gzip.open(archive,"rb") as compressed:
+            while True:
+                chunk=compressed.read(1024*1024)
+                if not chunk: break
+                total+=len(chunk)
+                if total>MAX_RELEASE_TAR_BYTES: raise RuntimeError("release archive expands beyond the size limit")
+                output.write(chunk)
+            output.flush(); os.fsync(output.fileno())
+        yield output_path
+    except (OSError,gzip.BadGzipFile,EOFError) as error:
+        raise RuntimeError("release archive is not valid bounded gzip data") from error
+    finally: output_path.unlink(missing_ok=True)
+
+def _validated_archive_members(archive):
+    members=[]; total=0; names=set()
+    with tarfile.open(archive,"r:") as package:
+        while True:
+            member=package.next()
+            if member is None: break
+            if len(members)>=256: raise RuntimeError("release archive contains too many entries")
+            raw=member.name.rstrip("/") if member.isdir() else member.name
+            components=raw.split("/")
+            path=PurePosixPath(raw)
+            normalized=unicodedata.normalize("NFC",raw).casefold()
+            if not raw or "\\" in raw or any(part in {"",".",".."} for part in components) or path.is_absolute() or components[0]!="devc2":
+                raise RuntimeError("release archive contains an unsafe path")
+            if normalized in names: raise RuntimeError("release archive contains duplicate or case-colliding paths")
+            names.add(normalized)
+            if not (member.isdir() or member.isfile()) or any(key.startswith("GNU.sparse") for key in member.pax_headers):
+                raise RuntimeError("release archive contains links, sparse entries, or special files")
+            total+=member.size
+            if member.size>MAX_RELEASE_BYTES or total>MAX_RELEASE_BYTES: raise RuntimeError("release archive exceeds the size limit")
+            members.append((member.name,member.size,member.isdir()))
+    return members
+
+def extract_release(archive,destination):
+    with bounded_release_tar(archive) as tar_path:
+        members=_validated_archive_members(tar_path)
+        destination.mkdir(mode=0o700)
+        with tarfile.open(tar_path,"r:") as package:
+            for expected_name,expected_size,is_directory in members:
+                member=package.next()
+                if member is None or member.name!=expected_name or member.size!=expected_size or member.isdir()!=is_directory:
+                    raise RuntimeError("release archive changed during validation")
+                raw=member.name.rstrip("/") if member.isdir() else member.name
+                target=destination.joinpath(*raw.split("/"))
+                if member.isdir(): target.mkdir(parents=True,exist_ok=True)
+                else:
+                    target.parent.mkdir(parents=True,exist_ok=True)
+                    source=package.extractfile(member)
+                    if source is None: raise RuntimeError("release archive contains an unreadable file")
+                    descriptor=os.open(target,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600)
+                    written=0
+                    with os.fdopen(descriptor,"wb") as output:
+                        while True:
+                            chunk=source.read(min(1024*1024,expected_size-written+1))
+                            if not chunk: break
+                            written+=len(chunk)
+                            if written>expected_size: raise RuntimeError("release archive member exceeds its declared size")
+                            output.write(chunk)
+                    if written!=expected_size: raise RuntimeError("release archive member is truncated")
+    source=destination/"devc2"
+    validate_asset_tree(source,True)
+    return source
+
+def update_installation():
+    with lifecycle_lock(True):
+        if active_legacy_sessions(): raise RuntimeError("cannot install or update while a devc2 session is active")
+        latest,url,expected=latest_release()
+        data_root=Path(os.environ.get("DEVC2_DATA_DIR",Path.home()/".local/share/devc2"))
+        try: active_version=source_version((data_root/"current").resolve(strict=True))
+        except (RuntimeError,OSError): active_version=VERSION
+        if version_tuple(latest)<=version_tuple(active_version):
+            print(f"devc2 {active_version} is current")
+            return 0
+        request=urllib.request.Request(url,headers={"Accept":"application/octet-stream","User-Agent":f"devc2/{VERSION}"})
+        payload=read_https(request,MAX_RELEASE_BYTES)
+        actual=hashlib.sha256(payload).hexdigest()
+        if not secrets.compare_digest(actual,expected): raise RuntimeError("release asset SHA-256 digest does not match GitHub metadata")
+        with tempfile.TemporaryDirectory(prefix="devc2-update-") as raw:
+            temp=Path(raw); archive=temp/RELEASE_ASSET; archive.write_bytes(payload)
+            source=extract_release(archive,temp/"extracted")
+            if source_version(source)!=latest: raise RuntimeError("release tag and packaged VERSION do not match")
+            state=read_installation_state()
+            bin_dir=Path(os.environ.get("DEVC2_BIN_DIR",state.get("bin_dir",Path.home()/".local/bin")))
+            share_dir=Path(os.environ.get("DEVC2_DATA_DIR",state.get("share_dir",Path.home()/".local/share/devc2")))
+            return _activate_assets(source,bin_dir,share_dir,True)
+
+def rollback_installation():
+    with lifecycle_lock(True):
+        if active_legacy_sessions(): raise RuntimeError("cannot roll back while a devc2 session is active")
+        state=read_installation_state(); share_dir=Path(os.environ.get("DEVC2_DATA_DIR",state.get("share_dir",Path.home()/".local/share/devc2"))).expanduser().resolve(); bin_dir=Path(os.environ.get("DEVC2_BIN_DIR",state.get("bin_dir",Path.home()/".local/bin"))).expanduser().resolve()
+        current_link=share_dir/"current"; previous_link=share_dir/"previous"
+        if not current_link.is_symlink() or not previous_link.is_symlink(): raise RuntimeError("no previous devc2 installation is available")
+        try: current=current_link.resolve(strict=True); previous=previous_link.resolve(strict=True)
+        except OSError as error: raise RuntimeError("saved rollback installation is unavailable") from error
+        previous_version=validate_asset_tree(previous,previous.parent.name=="versions")
+        replace_symlink(current_link,previous)
+        try: replace_symlink(previous_link,current)
+        except Exception:
+            replace_symlink(current_link,current)
+            raise
+        metadata={"schema":1,"version":state.get("previous_version") or previous_version,"current":str(previous),"previous":str(current),"previous_version":state.get("version"),"bin_dir":str(bin_dir),"share_dir":str(share_dir),"installed_at":int(time.time())}
+        atomic_write(INSTALL_STATE,json.dumps(metadata,sort_keys=True,indent=2)+"\n")
+        print(f"rolled back devc2 to {metadata['version']}")
+        return 0
 
 def docker_env(extra=None):
     keep={k:v for k,v in os.environ.items() if k in {"PATH","HOME","DOCKER_HOST","DOCKER_CONTEXT","DOCKER_CONFIG","XDG_RUNTIME_DIR"}}
@@ -111,11 +524,18 @@ def read_codex():
     except Exception as e: raise RuntimeError("ChatGPT access token is malformed") from e
     return access,account
 
+def ensure_auth_image():
+    inspected=run(["docker","image","inspect",AUTH_IMAGE],check=False,timeout=15)
+    if inspected.returncode==0: return
+    print(f"Building local devc2 runtime image {AUTH_IMAGE}…")
+    run(["docker","build","--tag",AUTH_IMAGE,str(ROOT)],capture=False,timeout=1800)
+
 def github_token():
     managed = AUTH / "gh"
     if (managed / "hosts.yml").exists():
+        ensure_auth_image()
         value = run([
-            "docker", "run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}",
+            "docker", "run", "--rm", "--pull=never", "--user", f"{os.getuid()}:{os.getgid()}",
             "--env", "HOME=/tmp", "--env", "GH_CONFIG_DIR=/run/devc2-gh",
             "--env", "GH_TOKEN=", "--env", "GITHUB_TOKEN=",
             "--volume", f"{managed}:/run/devc2-gh:ro",
@@ -243,7 +663,7 @@ def generate_relay_pki(root):
 
 def compose_env(repo,private,public,relay_port=None,relay_tls_dir=None):
     digest,project=identity(repo)
-    values={'DEVC2_PROJECT_NAME':project,'DEVC2_WORKSPACE':str(repo),'DEVC2_WORKSPACE_HASH':digest,'DEVC2_PRIVATE_DIR':str(private),'DEVC2_PUBLIC_DIR':str(public),'DEVC2_INSTALL_DIR':str(ROOT),'DEVC2_IMAGE':'devc2:0.1.0','DEVC2_UID':str(os.getuid()),'DEVC2_GID':str(os.getgid())}
+    values={'DEVC2_PROJECT_NAME':project,'DEVC2_WORKSPACE':str(repo),'DEVC2_WORKSPACE_HASH':digest,'DEVC2_PRIVATE_DIR':str(private),'DEVC2_PUBLIC_DIR':str(public),'DEVC2_INSTALL_DIR':str(ROOT),'DEVC2_IMAGE':f'devc2:{VERSION}','DEVC2_UID':str(os.getuid()),'DEVC2_GID':str(os.getgid())}
     values['DEVC2_SSH_RELAY_PORT']=str(relay_port or 1)
     values['DEVC2_SSH_RELAY_TLS_DIR']=str(relay_tls_dir or '/dev/null')
     return docker_env(values)
@@ -311,18 +731,12 @@ def ensure_v1_not_running(repo):
         raise RuntimeError("v1 is already running for this checkout; stop it before starting devc2")
 
 
-def start(repo, runtime_doctor=False):
+def _start_unlocked(repo, runtime_doctor=False):
     require_docker()
     ensure_v1_not_running(repo)
     ensure_tact_config()
     digest, _project = identity(repo)
-    lock_directory = STATE / digest
-    lock_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with (lock_directory / "launch.lock").open("w") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise RuntimeError("devc2 is already running for this checkout") from error
+    with repository_lock(repo):
         with tempfile.TemporaryDirectory(prefix='devc2-') as raw:
             temp=Path(raw); temp.chmod(0o700); private,public=prepare(repo,temp)
             relay_server_dir,relay_client_dir=generate_relay_pki(temp/'ssh-relay-pki')
@@ -367,19 +781,27 @@ def start(repo, runtime_doctor=False):
                     if runtime_doctor: down_args.append('--volumes')
                     compose(repo,env,*down_args,check=False)
                 finally:
-                    if runtime_doctor: shutil.rmtree(lock_directory,ignore_errors=True)
+                    pass
 
-def reset(repo,yes):
+def start(repo,runtime_doctor=False):
+    with lifecycle_lock(False):
+        return _start_unlocked(repo,runtime_doctor)
+
+def _reset_unlocked(repo,yes):
     if not yes:
         try: answer=input(f"Remove v2 state for {repo}? [y/N] ")
         except EOFError: answer=''
         if answer.lower() not in {'y','yes'}: print('cancelled'); return 0
     digest,project=identity(repo)
-    dummy=STATE/'reset'; dummy.mkdir(parents=True,exist_ok=True)
-    env=compose_env(repo,dummy,dummy)
-    compose(repo,env,'down','--volumes','--remove-orphans',check=False)
-    shutil.rmtree(STATE/digest,ignore_errors=True)
+    with repository_lock(repo):
+        dummy=STATE/'reset'; dummy.mkdir(parents=True,exist_ok=True)
+        env=compose_env(repo,dummy,dummy)
+        compose(repo,env,'down','--volumes','--remove-orphans',check=False)
+        # Permanent lock inodes are intentionally retained to prevent reset/start races.
     print(f"reset {project}"); return 0
+
+def reset(repo,yes):
+    with lifecycle_lock(False): return _reset_unlocked(repo,yes)
 
 def authenticate():
     require_docker()
@@ -410,7 +832,7 @@ def authenticate():
         return 0
 
     print("Preparing the pinned authentication image…")
-    run(["docker", "build", "--tag", AUTH_IMAGE, str(ROOT)], capture=False, timeout=1800)
+    ensure_auth_image()
 
     if not codex_ready:
         print("Signing in to ChatGPT for Codex…")
@@ -467,7 +889,7 @@ def doctor(runtime=False):
     print("Running disposable end-to-end runtime checks…")
     with tempfile.TemporaryDirectory(prefix='devc2-doctor-repo-') as raw:
         repo=Path(raw); (repo/'.git').mkdir(); project=identity(repo)[1]
-        result=start(repo,runtime_doctor=True)
+        result=_start_unlocked(repo,runtime_doctor=True)
         leftovers=[]
         resource_commands={
             'containers':['docker','container','ls','-aq'],
@@ -484,7 +906,7 @@ def usage_parser():
     parser = argparse.ArgumentParser(
         prog="devc2",
         description="Open Herdr in a hardened, credential-isolated devbox.",
-        epilog="commands: devc2 <repo> | devc2 auth | devc2 doctor [--runtime] | devc2 reset <repo> [--yes]",
+        epilog="commands: devc2 <repo> | devc2 auth | devc2 doctor [--runtime] | devc2 update | devc2 rollback | devc2 reset <repo> [--yes]",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     return parser
@@ -501,6 +923,9 @@ def parse_cli(argv):
     if argv[0] == "auth":
         if len(argv) != 1: raise RuntimeError("auth accepts no arguments")
         return "auth", None, False
+    if argv[0] in {"update","rollback"}:
+        if len(argv)!=1: raise RuntimeError(f"{argv[0]} accepts no arguments")
+        return argv[0],None,False
     if argv[0] == "doctor":
         parser=argparse.ArgumentParser(prog="devc2 doctor")
         parser.add_argument("--runtime",action="store_true",help="run disposable end-to-end Docker checks")
@@ -513,20 +938,27 @@ def parse_cli(argv):
         args = parser.parse_args(argv[1:])
         return "reset", args.repo, args.yes
     if argv[0].startswith("-") or len(argv) != 1:
-        raise RuntimeError("usage: devc2 <repo> | devc2 auth | devc2 doctor [--runtime] | devc2 reset <repo> [--yes]")
+        raise RuntimeError("usage: devc2 <repo> | devc2 auth | devc2 doctor [--runtime] | devc2 update | devc2 rollback | devc2 reset <repo> [--yes]")
     return "start", argv[0], False
 
 
 def main(argv=None):
     try:
-        command, raw_repo, yes = parse_cli(argv)
+        arguments=list(sys.argv[1:] if argv is None else argv)
+        if arguments and arguments[0]=="_install-assets":
+            parser=argparse.ArgumentParser(prog="devc2 _install-assets")
+            parser.add_argument("--source",required=True); parser.add_argument("--bin-dir",required=True); parser.add_argument("--share-dir",required=True); parser.add_argument("--release",action="store_true")
+            args=parser.parse_args(arguments[1:])
+            return install_from_directory(Path(args.source),Path(args.bin_dir),Path(args.share_dir),args.release)
+        command, raw_repo, yes = parse_cli(arguments)
         if command in {"doctor","doctor-runtime"}:
-            return doctor(runtime=command=="doctor-runtime")
+            with lifecycle_lock(False): return doctor(runtime=command=="doctor-runtime")
         if command == "auth":
-            return authenticate()
+            with lifecycle_lock(False): return authenticate()
+        if command == "update": return update_installation()
+        if command == "rollback": return rollback_installation()
         repo = canonical_repo(raw_repo)
-        if command == "reset":
-            return reset(repo, yes)
+        if command == "reset": return reset(repo, yes)
         return start(repo)
     except RuntimeError as error:
         print(f"devc2: error: {error}", file=sys.stderr)

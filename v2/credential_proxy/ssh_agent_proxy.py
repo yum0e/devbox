@@ -196,7 +196,10 @@ class AgentFilter:
             if response[0] == SSH_AGENT_FAILURE:
                 LOG.warning("upstream SSH agent refused the selected key's sign request")
             return response
-        LOG.warning("rejected unsupported SSH-agent request type %d", request[0])
+        if request[0] == 27:  # OpenSSH session-bind extension; intentionally unsupported.
+            LOG.debug("rejected unsupported SSH-agent session-bind extension")
+        else:
+            LOG.warning("rejected unsupported SSH-agent request type %d",request[0])
         return bytes([SSH_AGENT_FAILURE])
 
 class AgentServer:
