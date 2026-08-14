@@ -53,8 +53,9 @@ RUN install -d -m 0755 "$PNPM_HOME" \
 # either installation in the persistent devbox home volume.
 RUN uv python install 3.14 \
  && python3.14 --version \
- && curl --fail --show-error --silent https://foundry.paradigm.xyz \
+ && curl --fail --location --show-error --silent https://getfoundry.sh/install \
       -o /tmp/foundry-install.sh \
+ && head -n 1 /tmp/foundry-install.sh | grep -q '^#!' \
  && bash /tmp/foundry-install.sh \
  && rm -f /tmp/foundry-install.sh \
  && "$FOUNDRY_DIR/bin/foundryup" \
