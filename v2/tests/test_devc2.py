@@ -33,12 +33,13 @@ class CliTests(unittest.TestCase):
                 D.ensure_tact_config()
                 self.assertEqual(config.read_text(), "[memory]\nenabled = true\n")
 
-    def test_compose_projects_shared_config_read_only_but_keeps_state_per_repo(self):
+    def test_shared_config_is_snapshotted_but_runtime_copy_is_writable_and_per_repo(self):
         raw = (PATH.parents[1] / "compose.yaml").read_text()
-        self.assertIn("source: ${DEVC2_PUBLIC_DIR:?set DEVC2_PUBLIC_DIR}/tact-config.toml", raw)
-        self.assertIn("target: /home/devbox/.local/share/tact/config.toml", raw)
-        config_mount = raw.split("source: ${DEVC2_PUBLIC_DIR:?set DEVC2_PUBLIC_DIR}/tact-config.toml", 1)[1].split("- type:", 1)[0]
-        self.assertIn("read_only: true", config_mount)
+        entrypoint = (PATH.parents[1] / "devbox" / "entrypoint.sh").read_text()
+        self.assertNotIn("source: ${DEVC2_PUBLIC_DIR:?set DEVC2_PUBLIC_DIR}/tact-config.toml", raw)
+        self.assertIn("target: /run/devc2-public", raw)
+        self.assertIn("shared_tact_config=/run/devc2-public/tact-config.toml", entrypoint)
+        self.assertIn('install -m 0600 "$shared_tact_config" "$TACT_CONFIG"', entrypoint)
         self.assertIn("source: state-v2", raw)
         self.assertIn("target: /home/devbox", raw)
 
@@ -70,6 +71,15 @@ class CliTests(unittest.TestCase):
         self.assertIn("GH_CONFIG_DIR: /run/devc2-public/gh", raw)
         self.assertNotIn("GH_TOKEN:", raw)
         self.assertNotIn("claude", raw.lower())
+
+    def test_herdr_is_pinned_and_is_the_default_environment(self):
+        dockerfile = (PATH.parents[1] / "Dockerfile").read_text()
+        entrypoint = (PATH.parents[1] / "devbox" / "entrypoint.sh").read_text()
+        self.assertIn("ARG HERDR_VERSION=0.8.0", dockerfile)
+        self.assertIn("herdr-linux-x86_64", dockerfile)
+        self.assertIn("herdr-linux-aarch64", dockerfile)
+        self.assertTrue(entrypoint.rstrip().endswith('exec herdr "$@"'))
+        self.assertNotIn('exec tact "$@"', entrypoint)
 
     def test_active_v1_is_refused(self):
         result = subprocess.CompletedProcess([], 0, "container-id\n", "")

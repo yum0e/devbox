@@ -8,10 +8,15 @@ readonly ca_file="${TACT_PROXY_CA_FILE:-/run/tact-public/ca.crt}"
 readonly wait_seconds="${TACT_PROXY_WAIT_SECONDS:-30}"
 
 mkdir -p "$TACT_HOME"
-if [[ ! -r "$TACT_CONFIG" ]]; then
-  echo "tact-dev: shared Tact config is not readable: $TACT_CONFIG" >&2
+readonly shared_tact_config=/run/devc2-public/tact-config.toml
+if [[ ! -r "$shared_tact_config" ]]; then
+  echo "tact-dev: shared Tact config snapshot is not readable: $shared_tact_config" >&2
   exit 1
 fi
+# The host snapshot is mounted read-only, but Tact requires its active file to
+# be replaceable. Refresh a writable per-repository copy on every launch.
+rm -f -- "$TACT_CONFIG"
+install -m 0600 "$shared_tact_config" "$TACT_CONFIG"
 
 if ! user_name="$(id -un 2>/dev/null)"; then
   readonly nss_directory="$(mktemp -d /tmp/tact-nss.XXXXXX)"
@@ -138,4 +143,4 @@ if [[ "${TACT_DEV_SHELL:-}" == "1" ]]; then
   exec /bin/bash
 fi
 
-exec tact "$@"
+exec herdr "$@"

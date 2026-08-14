@@ -37,10 +37,6 @@ services:
         source: ${DEVC2_WORKSPACE:?set DEVC2_WORKSPACE}
         target: /workspace
       - type: bind
-        source: ${DEVC2_PUBLIC_DIR:?set DEVC2_PUBLIC_DIR}/tact-config.toml
-        target: /home/devbox/.local/share/tact/config.toml
-        read_only: true
-      - type: bind
         source: ${DEVC2_PUBLIC_DIR:?set DEVC2_PUBLIC_DIR}
         target: /run/devc2-public
         read_only: true

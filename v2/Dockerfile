@@ -2,6 +2,7 @@
 ARG TACT_VERSION=0.5.3
 FROM ghcr.io/clabby/tact:${TACT_VERSION} AS tact
 FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+ARG HERDR_VERSION=0.8.0
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
@@ -29,6 +30,18 @@ RUN set -eux; \
     install -m 0755 /tmp/jj /usr/local/bin/jj; \
     rm /tmp/jj /tmp/jj.tar.gz; \
     jj --version
+
+RUN set -eux; \
+    case "$TARGETARCH" in \
+      amd64) herdr_asset=herdr-linux-x86_64; herdr_sha256=b872ea7e40fa2cb17e857ac9b62b1bf26db7b403c622f5d2f3f5b35f6e9acd28 ;; \
+      arm64) herdr_asset=herdr-linux-aarch64; herdr_sha256=f647ac66468d9efbc642fe534fb284468f0aea60641606fc008dfc0d82a3ca87 ;; \
+      *) exit 1 ;; \
+    esac; \
+    curl -fsSL "https://github.com/herdrdev/herdr/releases/download/v${HERDR_VERSION#v}/${herdr_asset}" -o /tmp/herdr; \
+    echo "$herdr_sha256  /tmp/herdr" | sha256sum -c -; \
+    install -m 0755 /tmp/herdr /usr/local/bin/herdr; \
+    rm /tmp/herdr; \
+    herdr --version
 
 COPY devbox/entrypoint.sh /usr/local/bin/devc2-entrypoint
 RUN chmod 0755 /usr/local/bin/devc2-entrypoint \
