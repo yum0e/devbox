@@ -6,16 +6,63 @@ ARG HERDR_VERSION=0.8.0
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      build-essential ca-certificates curl gh git jq less libnss-wrapper \
-      netcat-openbsd nodejs npm openssh-client postgresql-client procps \
-      python3 python3-venv ripgrep vim zsh \
+      bubblewrap build-essential ca-certificates curl fd-find gh git jq less \
+      libatomic1 libnss-wrapper lsof ncurses-term netcat-openbsd \
+      openssh-client procps python3 python3-venv ripgrep socat sudo \
+      unzip vim zoxide zsh \
+ && install -d /usr/share/postgresql-common/pgdg \
+ && curl --fail --show-error --silent \
+      https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+      -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+ && printf '%s\n' \
+      'Types: deb' \
+      'URIs: https://apt.postgresql.org/pub/repos/apt' \
+      'Suites: bookworm-pgdg' \
+      'Components: main' \
+      'Signed-By: /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc' \
+      >/etc/apt/sources.list.d/pgdg.sources \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      libpq-dev postgresql-17 postgresql-client-17 \
+ && ln -s /usr/bin/fdfind /usr/local/bin/fd \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=tact /tact /usr/local/libexec/devc2/tact-upstream
 COPY devbox/tact-wrapper.sh /usr/local/bin/tact
 COPY --from=ghcr.io/astral-sh/uv:0.9.26@sha256:9a23023be68b2ed09750ae636228e903a54a05ea56ed03a934d00fe9fbeded4b /uv /uvx /usr/local/bin/
-RUN npm install --global @openai/codex@0.147.0 \
- && npm cache clean --force
+
+# Bootstrap the latest standalone pnpm without Node, then let pnpm install and
+# manage the latest Node runtime. Corepack, fnm, and nvm are not used.
+ENV PNPM_HOME=/usr/local/share/pnpm
+ENV FOUNDRY_DIR=/usr/local/share/foundry
+ENV UV_PYTHON_INSTALL_DIR=/usr/local/share/uv/python
+ENV UV_PYTHON_BIN_DIR=/usr/local/bin
+ENV PATH=${FOUNDRY_DIR}/bin:${PNPM_HOME}:/usr/lib/postgresql/17/bin:/usr/local/bin:/usr/bin:/bin
+RUN install -d -m 0755 "$PNPM_HOME" \
+ && curl --fail --show-error --silent https://get.pnpm.io/install.sh \
+      -o /tmp/install-pnpm.sh \
+ && ENV=/tmp/pnpm-env SHELL=/bin/sh sh /tmp/install-pnpm.sh \
+ && rm -f /tmp/install-pnpm.sh /tmp/pnpm-env \
+ && pnpm --version \
+ && pnpm runtime set node latest --global \
+ && node --version \
+ && npm --version \
+ && pnpm add --global @openai/codex@0.147.0 \
+ && pnpm store prune
+
+# Match v1's managed Python and Ethereum development toolchain without placing
+# either installation in the persistent devbox home volume.
+RUN uv python install 3.14 \
+ && python3.14 --version \
+ && curl --fail --show-error --silent https://foundry.paradigm.xyz \
+      -o /tmp/foundry-install.sh \
+ && bash /tmp/foundry-install.sh \
+ && rm -f /tmp/foundry-install.sh \
+ && "$FOUNDRY_DIR/bin/foundryup" \
+ && forge --version \
+ && cast --version \
+ && anvil --version \
+ && chisel --version
 
 ARG TARGETARCH
 RUN set -eux; \
@@ -63,7 +110,10 @@ ENV HOME=/home/devbox \
     GH_TOKEN=devc2-github-placeholder-token \
     SSH_AUTH_SOCK=/run/devc2-ssh/agent.sock \
     TACT_PROXY_CA_FILE=/run/devc2-public/ca.crt \
-    PATH=/usr/local/bin:/home/devbox/.local/bin:/usr/bin:/bin
+    FOUNDRY_DIR=/usr/local/share/foundry \
+    UV_PYTHON_INSTALL_DIR=/usr/local/share/uv/python \
+    UV_PYTHON_BIN_DIR=/usr/local/bin \
+    PATH=/usr/local/share/foundry/bin:/usr/local/share/pnpm:/usr/lib/postgresql/17/bin:/usr/local/bin:/home/devbox/.local/bin:/usr/bin:/bin
 
 USER devbox
 WORKDIR /workspace

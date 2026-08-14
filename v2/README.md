@@ -132,5 +132,15 @@ per-checkout even when `[memory] enabled = true` is set in the shared file.
 
 Herdr is pinned to `v0.8.0`; Tact remains the only bundled coding agent.
 
+The devbox includes the v1 general developer toolset: build tools, Git and
+GitHub CLI, Jujutsu, zsh, ripgrep, fd, zoxide, PostgreSQL 17 server and
+client programs, uv-managed Python 3.14, Foundry, and the standard
+network/process utilities.
+The latest standalone pnpm installs and manages the latest Node runtime through
+`pnpm runtime`; Corepack, fnm, and nvm are not used. Legacy v1 coding agents are
+not installed because v2 remains Tact-only.
+
+Herdr is the only bundled terminal multiplexer; tmux is intentionally absent.
+
 This is an experimental v2. Pi, Prime Agent, Claude, Git LFS, and cross-repository
 private submodules are outside the initial scope.

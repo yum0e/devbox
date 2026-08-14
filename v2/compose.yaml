@@ -29,8 +29,11 @@ services:
       HTTPS_PROXY: http://127.0.0.1:8080
       http_proxy: http://127.0.0.1:8080
       https_proxy: http://127.0.0.1:8080
-      NO_PROXY: localhost,127.0.0.1,::1
-      no_proxy: localhost,127.0.0.1,::1
+      NO_PROXY: localhost,127.0.0.1,::1,.internal
+      no_proxy: localhost,127.0.0.1,::1,.internal
+      DB_HOST: ${DEVC2_DB_HOST:-postgres-primary.internal}
+      DB_PORT: ${DEVC2_DB_PORT:-5432}
+      DB_NAME: ${DEVC2_DB_NAME:-app}
       TACT_PROXY_CA_FILE: /run/devc2-public/ca.crt
     volumes:
       - type: bind

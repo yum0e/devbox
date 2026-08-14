@@ -80,6 +80,17 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("GH_TOKEN:", raw)
         self.assertNotIn("claude", raw.lower())
 
+    def test_devbox_has_technology_neutral_infra_endpoint_configuration(self):
+        raw = (PATH.parents[1] / "compose.yaml").read_text()
+        devbox_section = raw.split("  devbox:\n", 1)[1].split("\n  credential-proxy:\n", 1)[0]
+        self.assertIn("DB_HOST: ${DEVC2_DB_HOST:-postgres-primary.internal}", devbox_section)
+        self.assertIn("DB_PORT: ${DEVC2_DB_PORT:-5432}", devbox_section)
+        self.assertIn("DB_NAME: ${DEVC2_DB_NAME:-app}", devbox_section)
+        self.assertIn("NO_PROXY: localhost,127.0.0.1,::1,.internal", devbox_section)
+        self.assertIn("no_proxy: localhost,127.0.0.1,::1,.internal", devbox_section)
+        self.assertNotIn("BOUNDARY_", devbox_section)
+        self.assertNotIn("BDX_", devbox_section)
+
     def test_tact_wrapper_restores_socket_and_forwards_arguments(self):
         wrapper_source = (PATH.parents[1] / "devbox" / "tact-wrapper.sh").read_text()
         with tempfile.TemporaryDirectory() as td:
@@ -120,6 +131,32 @@ class CliTests(unittest.TestCase):
         self.assertIn("ghcr.io/clabby/tact:${TACT_VERSION}@sha256:", dockerfile)
         self.assertIn("ghcr.io/astral-sh/uv:0.9.26@sha256:", dockerfile)
         self.assertIn("python:3.12-alpine@sha256:", proxy_dockerfile)
+
+    def test_v1_developer_tools_postgres_17_and_pnpm_managed_node(self):
+        dockerfile = (PATH.parents[1] / "Dockerfile").read_text()
+        entrypoint = (PATH.parents[1] / "devbox" / "entrypoint.sh").read_text()
+        for package in (
+            "bubblewrap", "fd-find", "lsof", "ncurses-term", "socat",
+            "sudo", "unzip", "zoxide",
+        ):
+            self.assertIn(package, dockerfile)
+        self.assertIn("postgresql-17 postgresql-client-17", dockerfile)
+        self.assertIn("/usr/lib/postgresql/17/bin", dockerfile)
+        self.assertIn("https://get.pnpm.io/install.sh", dockerfile)
+        self.assertIn("pnpm runtime set node latest --global", dockerfile)
+        self.assertIn("pnpm add --global @openai/codex@0.147.0", dockerfile)
+        self.assertIn("uv python install 3.14", dockerfile)
+        self.assertIn("$FOUNDRY_DIR/bin/foundryup", dockerfile)
+        self.assertNotIn("corepack enable", dockerfile)
+        self.assertNotIn("fnm env", dockerfile)
+        self.assertNotIn("nvm install", dockerfile)
+        self.assertNotIn(" tmux ", dockerfile)
+        self.assertNotIn("tmux -V", entrypoint)
+        for probe in (
+            "psql --version", "postgres --version", "node --version",
+            "pnpm --version", "python3.14 --version", "forge --version",
+        ):
+            self.assertIn(probe, entrypoint)
 
     def test_herdr_is_pinned_and_is_the_default_environment(self):
         dockerfile = (PATH.parents[1] / "Dockerfile").read_text()

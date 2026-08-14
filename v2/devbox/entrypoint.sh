@@ -149,6 +149,12 @@ if [[ "${DEVC2_RUNTIME_DOCTOR:-}" == "1" ]]; then
   echo "✓ Tact configuration: valid and atomically replaceable"
   echo "✓ Tact binary: $(tact --version)"
   echo "✓ Herdr binary: $(herdr --version)"
+  echo "✓ PostgreSQL client: $(psql --version)"
+  echo "✓ PostgreSQL server: $(postgres --version)"
+  echo "✓ Node runtime: $(node --version)"
+  echo "✓ pnpm: $(pnpm --version)"
+  echo "✓ managed Python: $(python3.14 --version)"
+  echo "✓ Foundry forge: $(forge --version | head -n 1)"
   agent_keys="$(ssh-add -L)"
   test "$(printf '%s\n' "$agent_keys" | grep -c '^ssh-')" -eq 1
   allowed_fingerprint="$(ssh-keygen -lf /run/devc2-public/ssh-allowed.pub -E sha256 | awk '{print $2}')"
