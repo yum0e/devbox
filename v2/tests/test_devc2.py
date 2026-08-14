@@ -151,6 +151,7 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("\n && npm install", dockerfile)
         self.assertIn("uv python install 3.14", dockerfile)
         self.assertRegex(dockerfile, r"openssh-client passwd procps")
+        self.assertEqual(dockerfile.count(":/usr/sbin:"), 2)
         self.assertIn("curl --fail --location --show-error --silent https://getfoundry.sh/install", dockerfile)
         self.assertIn("head -n 1 /tmp/foundry-install.sh | grep -q '^#!'", dockerfile)
         self.assertIn("$FOUNDRY_DIR/bin/foundryup", dockerfile)
