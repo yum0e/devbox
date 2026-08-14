@@ -143,6 +143,8 @@ class CliTests(unittest.TestCase):
         self.assertIn("postgresql-17 postgresql-client-17", dockerfile)
         self.assertIn("/usr/lib/postgresql/17/bin", dockerfile)
         self.assertIn("https://get.pnpm.io/install.sh", dockerfile)
+        self.assertIn("${PNPM_HOME}/bin", dockerfile)
+        self.assertIn("/usr/local/share/pnpm/bin", dockerfile)
         self.assertIn("pnpm runtime set node latest --global", dockerfile)
         self.assertIn("pnpm add --global @openai/codex@0.147.0", dockerfile)
         self.assertIn("uv python install 3.14", dockerfile)

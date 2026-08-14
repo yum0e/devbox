@@ -37,7 +37,7 @@ ENV PNPM_HOME=/usr/local/share/pnpm
 ENV FOUNDRY_DIR=/usr/local/share/foundry
 ENV UV_PYTHON_INSTALL_DIR=/usr/local/share/uv/python
 ENV UV_PYTHON_BIN_DIR=/usr/local/bin
-ENV PATH=${FOUNDRY_DIR}/bin:${PNPM_HOME}:/usr/lib/postgresql/17/bin:/usr/local/bin:/usr/bin:/bin
+ENV PATH=${FOUNDRY_DIR}/bin:${PNPM_HOME}/bin:/usr/lib/postgresql/17/bin:/usr/local/bin:/usr/bin:/bin
 RUN install -d -m 0755 "$PNPM_HOME" \
  && curl --fail --show-error --silent https://get.pnpm.io/install.sh \
       -o /tmp/install-pnpm.sh \
@@ -113,7 +113,7 @@ ENV HOME=/home/devbox \
     FOUNDRY_DIR=/usr/local/share/foundry \
     UV_PYTHON_INSTALL_DIR=/usr/local/share/uv/python \
     UV_PYTHON_BIN_DIR=/usr/local/bin \
-    PATH=/usr/local/share/foundry/bin:/usr/local/share/pnpm:/usr/lib/postgresql/17/bin:/usr/local/bin:/home/devbox/.local/bin:/usr/bin:/bin
+    PATH=/usr/local/share/foundry/bin:/usr/local/share/pnpm/bin:/usr/lib/postgresql/17/bin:/usr/local/bin:/home/devbox/.local/bin:/usr/bin:/bin
 
 USER devbox
 WORKDIR /workspace
