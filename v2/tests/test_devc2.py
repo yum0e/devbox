@@ -67,7 +67,12 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("source: /run/host-services/ssh-auth.sock", raw)
         self.assertNotIn("DEVC2_HOST_AGENT_SOCKET", raw)
         self.assertIn("host.docker.internal:${DEVC2_SSH_RELAY_PORT", raw)
-        self.assertIn("target: /run/devc2-ssh-private", raw)
+        self.assertIn("target: /run/devc2-ssh-tls", raw)
+        self.assertEqual(raw.count("target: /run/devc2-ssh-tls"), 1)
+        self.assertNotIn("devc2-ssh-tls", devbox_section)
+        self.assertIn("--tls-server-name", raw)
+        self.assertNotIn("upstream-secret", raw)
+        self.assertIn("SSH relay credentials were exposed inside the devbox", (PATH.parents[1] / "devbox" / "entrypoint.sh").read_text())
         self.assertNotIn("gh-config", raw)
         self.assertIn("GH_CONFIG_DIR: /run/devc2-public/gh", raw)
         self.assertNotIn("GH_TOKEN:", raw)
@@ -148,7 +153,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(D.doctor(runtime=True),0)
         self.assertEqual(len(seen),1)
         self.assertFalse(seen[0].exists())
-        self.assertEqual(run.call_count,3)
+        self.assertEqual(run.call_count,4)  # OpenSSL plus three teardown resource queries.
 
     def test_doctor_rejects_empty_agent(self):
         with mock.patch.object(D, "require_docker"), mock.patch.object(D, "read_codex", return_value=("a", "b")), mock.patch.object(D, "validate_github_token", return_value="user"), mock.patch.object(D, "public_keys", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
@@ -283,24 +288,41 @@ class CredentialTests(unittest.TestCase):
             self.assertEqual(D.select_key(False),key)
             self.assertEqual(stat.S_IMODE((Path(td)/"ssh-key.pub").stat().st_mode),0o600)
 
+class RelayPKITests(unittest.TestCase):
+    def test_relay_pki_is_ephemeral_scoped_and_has_expected_extensions(self):
+        with tempfile.TemporaryDirectory() as td:
+            server,client=D.generate_relay_pki(Path(td)/"pki")
+            self.assertEqual({p.name for p in server.iterdir()},{"ca.crt","server.crt","server.key"})
+            self.assertEqual({p.name for p in client.iterdir()},{"ca.crt","client.crt","client.key"})
+            self.assertEqual(stat.S_IMODE((server/"server.key").stat().st_mode),0o600)
+            self.assertEqual(stat.S_IMODE((client/"client.key").stat().st_mode),0o444)
+            server_text=D.run(["openssl","x509","-in",str(server/"server.crt"),"-noout","-text"]).stdout
+            client_text=D.run(["openssl","x509","-in",str(client/"client.crt"),"-noout","-text"]).stdout
+            self.assertIn("DNS:host.docker.internal",server_text)
+            self.assertIn("TLS Web Server Authentication",server_text)
+            self.assertIn("TLS Web Client Authentication",client_text)
+
 class HostAgentRelayTests(unittest.TestCase):
     def test_compose_env_projects_relay_metadata_without_ambient_agent(self):
         with mock.patch.object(D, "docker_env", side_effect=lambda values: values):
             result=D.compose_env(Path("/tmp/repo"),Path("/tmp/private"),Path("/tmp/public"),49152,Path("/tmp/relay-secret"))
         self.assertEqual(result["DEVC2_SSH_RELAY_PORT"], "49152")
-        self.assertEqual(result["DEVC2_SSH_RELAY_SECRET_DIR"], "/tmp/relay-secret")
+        self.assertEqual(result["DEVC2_SSH_RELAY_TLS_DIR"], "/tmp/relay-secret")
         self.assertNotIn("SSH_AUTH_SOCK", result)
 
-    def test_host_relay_uses_ambient_agent_and_secret_file(self):
+    def test_host_relay_uses_ambient_agent_and_mutual_tls(self):
         process=mock.Mock(); process.poll.return_value=None
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); port_file=root/"port"; port_file.write_text("49152")
             with mock.patch.dict(os.environ,{"SSH_AUTH_SOCK":"/tmp/onepassword.sock"}), mock.patch.object(D.os,"stat",return_value=mock.Mock(st_mode=stat.S_IFSOCK)), mock.patch.object(D.subprocess,"Popen",return_value=process) as popen:
-                self.assertEqual(D.start_host_agent_relay(port_file,root/"secret",root/"key.pub"),(process,49152))
+                self.assertEqual(D.start_host_agent_relay(port_file,root/"tls",root/"key.pub"),(process,49152))
         command=popen.call_args.args[0]
         self.assertIn("/tmp/onepassword.sock",command)
         self.assertIn("--relay-listen",command)
-        self.assertIn("--upstream-secret-file",command)
+        self.assertIn("--tls-ca",command)
+        self.assertIn("--tls-cert",command)
+        self.assertIn("--tls-key",command)
+        self.assertNotIn("secret", " ".join(command))
         self.assertIn(str(root/"key.pub"),command)
 
 class CoexistenceTests(unittest.TestCase):

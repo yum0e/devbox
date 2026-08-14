@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Trusted macOS launcher for devbox v2."""
 from __future__ import annotations
-import argparse, base64, fcntl, hashlib, json, os, platform, shutil, signal, stat, subprocess, sys, tempfile, time, urllib.error, urllib.request
+import argparse, base64, fcntl, hashlib, json, os, platform, secrets, shutil, signal, stat, subprocess, sys, tempfile, time, urllib.error, urllib.request
 from pathlib import Path
 
 VERSION="0.1.0"
@@ -212,20 +212,49 @@ def generate_ca(private):
         if stat.S_ISLNK(s.st_mode) or not stat.S_ISREG(s.st_mode): raise RuntimeError(f"proxy generated invalid {name}")
         p.chmod(0o600)
 
-def compose_env(repo,private,public,relay_port=None,relay_secret_dir=None):
+def generate_relay_pki(root):
+    openssl='/usr/bin/openssl'
+    if not Path(openssl).is_file() or not os.access(openssl,os.X_OK):
+        raise RuntimeError("/usr/bin/openssl is required for the SSH relay")
+    server=root/'server'; client=root/'client'; server.mkdir(parents=True,mode=0o700); client.mkdir(mode=0o700)
+    ca_config=server/'ca.cnf'; server_ext=server/'server.ext'; client_ext=server/'client.ext'
+    private_write(ca_config,"[req]\nprompt=no\ndistinguished_name=dn\nx509_extensions=v3\n[dn]\nCN=devc2 ephemeral relay CA\n[v3]\nbasicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\n")
+    private_write(server_ext,"[v3]\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:host.docker.internal\n")
+    private_write(client_ext,"[v3]\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n")
+    run([openssl,'req','-x509','-newkey','rsa:2048','-nodes','-sha256','-days','30','-config',str(ca_config),'-keyout',str(server/'ca.key'),'-out',str(server/'ca.crt')],timeout=60)
+    for name,common_name,extensions,serial in (
+        ('server','host.docker.internal',server_ext,str(secrets.randbits(128) or 1)),
+        ('client','devc2 ssh proxy',client_ext,str(secrets.randbits(128) or 1)),
+    ):
+        key=server/f'{name}.key'; csr=server/f'{name}.csr'; cert=server/f'{name}.crt'
+        run([openssl,'req','-new','-newkey','rsa:2048','-nodes','-sha256','-subj',f'/CN={common_name}','-keyout',str(key),'-out',str(csr)],timeout=60)
+        run([openssl,'x509','-req','-sha256','-days','30','-in',str(csr),'-CA',str(server/'ca.crt'),'-CAkey',str(server/'ca.key'),'-set_serial',serial,'-extfile',str(extensions),'-extensions','v3','-out',str(cert)],timeout=60)
+    for name in ('ca.crt','server.crt','server.key','client.crt','client.key'):
+        path=server/name; metadata=path.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode) or metadata.st_size>1024*1024:
+            raise RuntimeError(f"OpenSSL generated invalid relay file: {name}")
+    for name in ('ca.crt','client.crt','client.key'):
+        shutil.copyfile(server/name,client/name)
+    for path in server.iterdir():
+        if path.name not in {'ca.crt','server.crt','server.key'}: path.unlink()
+    for path in server.iterdir(): path.chmod(0o600 if path.suffix=='.key' else 0o644)
+    for path in client.iterdir(): path.chmod(0o444)
+    return server,client
+
+def compose_env(repo,private,public,relay_port=None,relay_tls_dir=None):
     digest,project=identity(repo)
     values={'DEVC2_PROJECT_NAME':project,'DEVC2_WORKSPACE':str(repo),'DEVC2_WORKSPACE_HASH':digest,'DEVC2_PRIVATE_DIR':str(private),'DEVC2_PUBLIC_DIR':str(public),'DEVC2_INSTALL_DIR':str(ROOT),'DEVC2_IMAGE':'devc2:0.1.0','DEVC2_UID':str(os.getuid()),'DEVC2_GID':str(os.getgid())}
     values['DEVC2_SSH_RELAY_PORT']=str(relay_port or 1)
-    values['DEVC2_SSH_RELAY_SECRET_DIR']=str(relay_secret_dir or '/dev/null')
+    values['DEVC2_SSH_RELAY_TLS_DIR']=str(relay_tls_dir or '/dev/null')
     return docker_env(values)
 
-def start_host_agent_relay(port_file, secret_file, allowed_key_file):
+def start_host_agent_relay(port_file, tls_dir, allowed_key_file):
     upstream=os.environ.get("SSH_AUTH_SOCK", "")
     try: available=bool(upstream) and stat.S_ISSOCK(os.stat(upstream).st_mode)
     except OSError: available=False
     if not available:
         raise RuntimeError("SSH_AUTH_SOCK is not an available Unix socket; enable the 1Password SSH agent")
-    command=[sys.executable,str(ROOT/'credential_proxy'/'ssh_agent_proxy.py'),'--relay-listen','0.0.0.0:0','--relay-port-file',str(port_file),'--upstream',upstream,'--upstream-secret-file',str(secret_file),'--allowed-key',str(allowed_key_file)]
+    command=[sys.executable,str(ROOT/'credential_proxy'/'ssh_agent_proxy.py'),'--relay-listen','0.0.0.0:0','--relay-port-file',str(port_file),'--upstream',upstream,'--tls-ca',str(tls_dir/'ca.crt'),'--tls-cert',str(tls_dir/'server.crt'),'--tls-key',str(tls_dir/'server.key'),'--allowed-key',str(allowed_key_file)]
     process=subprocess.Popen(command)
     deadline=time.monotonic()+5
     while time.monotonic()<deadline:
@@ -296,10 +325,13 @@ def start(repo, runtime_doctor=False):
             raise RuntimeError("devc2 is already running for this checkout") from error
         with tempfile.TemporaryDirectory(prefix='devc2-') as raw:
             temp=Path(raw); temp.chmod(0o700); private,public=prepare(repo,temp)
-            relay_secret_dir=temp/'ssh-relay'; relay_secret_dir.mkdir(0o700)
-            relay_secret=relay_secret_dir/'secret'; private_write(relay_secret,os.urandom(32)); relay_secret.chmod(0o444)
-            host_agent_relay,relay_port=start_host_agent_relay(temp/'ssh-relay-port',relay_secret,public/'ssh-allowed.pub')
-            env=compose_env(repo,private,public,relay_port,relay_secret_dir)
+            relay_server_dir,relay_client_dir=generate_relay_pki(temp/'ssh-relay-pki')
+            host_agent_relay,relay_port=start_host_agent_relay(temp/'ssh-relay-port',relay_server_dir,public/'ssh-allowed.pub')
+            try:
+                env=compose_env(repo,private,public,relay_port,relay_client_dir)
+            except Exception:
+                stop_process(host_agent_relay)
+                raise
             stopping = False
             previous = {}
             def terminate(signum, _frame):
@@ -329,12 +361,12 @@ def start(repo, runtime_doctor=False):
             finally:
                 for signum, handler in previous.items():
                     signal.signal(signum, handler)
+                stop_process(host_agent_relay)
                 try:
                     down_args=['down','--remove-orphans']
                     if runtime_doctor: down_args.append('--volumes')
                     compose(repo,env,*down_args,check=False)
                 finally:
-                    stop_process(host_agent_relay)
                     if runtime_doctor: shutil.rmtree(lock_directory,ignore_errors=True)
 
 def reset(repo,yes):
@@ -420,6 +452,7 @@ def doctor(runtime=False):
         try: detail=fn(); checks.append((True,label,detail or 'ok'))
         except Exception as e: checks.append((False,label,str(e)))
     check('Docker Desktop',lambda: require_docker())
+    check('OpenSSL',lambda: run(['/usr/bin/openssl','version'],timeout=10).stdout.strip())
     check('ChatGPT Codex login',lambda: (read_codex() and 'access token has more than one hour remaining'))
     check('GitHub CLI OAuth',lambda: f"authenticated as {validate_github_token()}")
     def check_agent():

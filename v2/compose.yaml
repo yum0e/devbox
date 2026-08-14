@@ -90,15 +90,21 @@ services:
       - "1000"
       - --upstream-tcp
       - host.docker.internal:${DEVC2_SSH_RELAY_PORT:?set DEVC2_SSH_RELAY_PORT}
-      - --upstream-secret-file
-      - /run/devc2-ssh-private/secret
+      - --tls-ca
+      - /run/devc2-ssh-tls/ca.crt
+      - --tls-cert
+      - /run/devc2-ssh-tls/client.crt
+      - --tls-key
+      - /run/devc2-ssh-tls/client.key
+      - --tls-server-name
+      - host.docker.internal
       - --allowed-key
       - /run/devc2-public/ssh-allowed.pub
     init: true
     volumes:
       - type: bind
-        source: ${DEVC2_SSH_RELAY_SECRET_DIR:?set DEVC2_SSH_RELAY_SECRET_DIR}
-        target: /run/devc2-ssh-private
+        source: ${DEVC2_SSH_RELAY_TLS_DIR:?set DEVC2_SSH_RELAY_TLS_DIR}
+        target: /run/devc2-ssh-tls
         read_only: true
       - type: bind
         source: ${DEVC2_PUBLIC_DIR:?set DEVC2_PUBLIC_DIR}

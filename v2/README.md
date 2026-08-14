@@ -14,9 +14,10 @@ has limits of 16 GiB memory, 8 CPUs, and 4096 PIDs; credential sidecars have sep
 ChatGPT/Codex and GitHub OAuth bearer credentials are held only by the sibling
 credential proxy. The devbox sees placeholders; matching requests receive real
 headers only at their exact upstream. A trusted host-side filter connects to the
-ambient 1Password agent and relays requests over an authenticated, per-launch channel
-to a second container-side filter; the raw 1Password socket never enters Docker and
-the relay secret is not mounted in the devbox. This prevents trivial raw
+ambient 1Password agent and relays requests over an ephemeral, mutually authenticated
+TLS channel to a second container-side filter. The raw 1Password socket never enters
+Docker. The per-launch client certificate and key are mounted only into the SSH
+sidecar, never the devbox. This prevents trivial raw
 credential extraction, but a compromised agent can exercise the full authority of
 those credentials and can export data fetched with them.
 
@@ -69,7 +70,7 @@ per-checkout even when `[memory] enabled = true` is set in the shared file.
 
 ## Requirements
 
-- macOS with Docker Desktop, Docker Compose v2, and Python 3
+- macOS with Docker Desktop, Docker Compose v2, Python 3, and `/usr/bin/openssl`
 - ChatGPT subscription and GitHub account (configured by `devc2 auth`)
 - 1Password SSH agent enabled, with `SSH_AUTH_SOCK` available to the launcher
 

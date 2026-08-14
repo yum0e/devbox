@@ -2,6 +2,7 @@ import base64
 import os
 import socket
 import stat
+import subprocess
 import tempfile
 import threading
 import time
@@ -9,11 +10,11 @@ import unittest
 from pathlib import Path
 
 from credential_proxy.ssh_agent_proxy import (
-    AgentFilter, AgentServer, AuthenticatedTCPRelay, FilterConfig, SSH_AGENT_FAILURE,
+    AgentFilter, AgentServer, MutualTLSRelay, FilterConfig, SSH_AGENT_FAILURE,
     SSH2_AGENTC_REQUEST_IDENTITIES, SSH2_AGENT_IDENTITIES_ANSWER,
     SSH2_AGENTC_SIGN_REQUEST, SSH2_AGENT_SIGN_RESPONSE,
     pack_string, pack_u32, parse_identities, parse_public_key,
-    main, read_packet, write_packet,
+    client_tls_context, main, read_packet, server_tls_context, write_packet,
 )
 
 def key_blob(label: bytes) -> bytes:
@@ -21,6 +22,17 @@ def key_blob(label: bytes) -> bytes:
 
 def public_line(blob: bytes, comment="test") -> str:
     return "ssh-ed25519 " + base64.b64encode(blob).decode() + " " + comment
+
+def make_pki(root: Path):
+    ca=root/"ca.crt"; ca_key=root/"ca.key"; ca_config=root/"ca.cnf"
+    ca_config.write_text("[req]\nprompt=no\ndistinguished_name=dn\nx509_extensions=v3\n[dn]\nCN=test CA\n[v3]\nbasicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign\n")
+    subprocess.run(["openssl","req","-x509","-newkey","rsa:2048","-nodes","-sha256","-days","1","-config",str(ca_config),"-keyout",str(ca_key),"-out",str(ca)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    for name,cn,eku,san,serial in (("server","host.docker.internal","serverAuth","subjectAltName=DNS:host.docker.internal\n","2"),("client","client","clientAuth","","3")):
+        key=root/f"{name}.key"; csr=root/f"{name}.csr"; cert=root/f"{name}.crt"; ext=root/f"{name}.ext"
+        ext.write_text(f"[v3]\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage={eku}\n{san}")
+        subprocess.run(["openssl","req","-new","-newkey","rsa:2048","-nodes","-sha256","-subj",f"/CN={cn}","-keyout",str(key),"-out",str(csr)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        subprocess.run(["openssl","x509","-req","-sha256","-days","1","-in",str(csr),"-CA",str(ca),"-CAkey",str(ca_key),"-set_serial",serial,"-extfile",str(ext),"-extensions","v3","-out",str(cert)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    return ca,root/"server.crt",root/"server.key",root/"client.crt",root/"client.key"
 
 class FakeAgent:
     def __init__(self, path: str, identities):
@@ -115,30 +127,34 @@ class SSHAgentFilterTests(unittest.TestCase):
         server.shutdown(); thread.join(2)
 
 class ProductionConfigTests(unittest.TestCase):
-    def test_host_relay_cli_maps_unix_upstream_by_name(self):
+    def test_host_relay_cli_maps_unix_upstream_and_tls_by_name(self):
         from unittest import mock
         allowed=key_blob(b"allowed")
         with tempfile.TemporaryDirectory() as td:
-            root=Path(td); key=root/"key.pub"; key.write_text(public_line(allowed)); secret=root/"secret"; secret.write_bytes(b"s"*32)
-            with mock.patch("credential_proxy.ssh_agent_proxy.AuthenticatedTCPRelay") as relay, mock.patch("credential_proxy.ssh_agent_proxy.threading.Thread") as thread:
+            root=Path(td); key=root/"key.pub"; key.write_text(public_line(allowed)); tls=mock.sentinel.server_tls
+            with mock.patch("credential_proxy.ssh_agent_proxy.MutualTLSRelay") as relay, mock.patch("credential_proxy.ssh_agent_proxy.server_tls_context",return_value=tls), mock.patch("credential_proxy.ssh_agent_proxy.threading.Thread") as thread:
                 relay.return_value.port=49152; thread.return_value.is_alive.return_value=True
-                self.assertEqual(main(["--relay-listen","127.0.0.1:0","--relay-port-file",str(root/"port"),"--upstream","/tmp/onepassword.sock","--upstream-secret-file",str(secret),"--allowed-key",str(key)]),0)
+                args=["--relay-listen","127.0.0.1:0","--relay-port-file",str(root/"port"),"--upstream","/tmp/onepassword.sock","--tls-ca","ca","--tls-cert","cert","--tls-key","key","--allowed-key",str(key)]
+                self.assertEqual(main(args),0)
             config=relay.call_args.args[0].config
             self.assertEqual(config.upstream_socket,"/tmp/onepassword.sock")
             self.assertIsNone(config.upstream_tcp)
+            self.assertIs(relay.call_args.args[1],tls)
             self.assertEqual(config.allowed_comment,"test")
 
-    def test_tcp_cli_maps_arguments_by_name(self):
+    def test_tcp_cli_maps_tls_arguments_by_name(self):
         from unittest import mock
         allowed=key_blob(b"allowed")
         with tempfile.TemporaryDirectory() as td:
-            root=Path(td); key=root/"key.pub"; key.write_text(public_line(allowed)); secret=root/"secret"; secret.write_bytes(b"s"*32)
-            with mock.patch("credential_proxy.ssh_agent_proxy.AgentServer") as server:
+            root=Path(td); key=root/"key.pub"; key.write_text(public_line(allowed)); tls=mock.sentinel.client_tls
+            with mock.patch("credential_proxy.ssh_agent_proxy.AgentServer") as server, mock.patch("credential_proxy.ssh_agent_proxy.client_tls_context",return_value=tls):
                 server.return_value.serve_forever.return_value=None
-                self.assertEqual(main(["--listen",str(root/"agent.sock"),"--upstream-tcp","host.docker.internal:49152","--upstream-secret-file",str(secret),"--allowed-key",str(key)]),0)
+                args=["--listen",str(root/"agent.sock"),"--upstream-tcp","host.docker.internal:49152","--tls-ca","ca","--tls-cert","cert","--tls-key","key","--tls-server-name","host.docker.internal","--allowed-key",str(key)]
+                self.assertEqual(main(args),0)
             config=server.call_args.args[1].config
             self.assertEqual(config.upstream_tcp,("host.docker.internal",49152))
-            self.assertEqual(config.upstream_secret,b"s"*32)
+            self.assertIs(config.upstream_ssl_context,tls)
+            self.assertEqual(config.upstream_server_hostname,"host.docker.internal")
             self.assertEqual(config.allowed_comment,"test")
 
     def test_cli_configures_post_bind_privilege_drop(self):
@@ -151,24 +167,42 @@ class ProductionConfigTests(unittest.TestCase):
                 self.assertEqual(main(["--listen",str(root/"agent.sock"),"--allowed-key",str(key),"--drop-uid","1000","--drop-gid","1000"]),0)
             self.assertEqual(server.call_args.args[-2:],(1000,1000))
 
-class AuthenticatedRelayTests(unittest.TestCase):
-    def test_secret_required_and_request_round_trips(self):
+class MutualTLSRelayTests(unittest.TestCase):
+    def test_authenticated_encrypted_request_round_trips_and_wrong_hostname_fails(self):
         with tempfile.TemporaryDirectory() as td:
-            upstream_path=str(Path(td)/"upstream.sock")
-            allowed=key_blob(b"allowed")
+            root=Path(td); ca,server_cert,server_key,client_cert,client_key=make_pki(root)
+            upstream_path=str(root/"upstream.sock"); allowed=key_blob(b"allowed")
             upstream=FakeAgent(upstream_path,[(allowed,b"selected")]).start()
-            relay=AuthenticatedTCPRelay(AgentFilter(FilterConfig(upstream_path,allowed)),b"s"*32,"127.0.0.1",0)
+            relay=MutualTLSRelay(AgentFilter(FilterConfig(upstream_path,allowed)),server_tls_context(str(ca),str(server_cert),str(server_key)),"127.0.0.1",0)
             thread=threading.Thread(target=relay.serve_forever,daemon=True); thread.start()
             deadline=time.time()+2
             while relay.port==0 and time.time()<deadline: time.sleep(.01)
             request=bytes([SSH2_AGENTC_REQUEST_IDENTITIES])
-            filtered=AgentFilter(FilterConfig("",allowed,upstream_tcp=("127.0.0.1",relay.port),upstream_secret=b"s"*32))
+            context=client_tls_context(str(ca),str(client_cert),str(client_key))
+            filtered=AgentFilter(FilterConfig("",allowed,upstream_tcp=("127.0.0.1",relay.port),upstream_ssl_context=context,upstream_server_hostname="host.docker.internal"))
             self.assertEqual(parse_identities(filtered.handle(request)),[(allowed,b"selected")])
-            with socket.create_connection(("127.0.0.1",relay.port),timeout=2) as client:
-                self.assertEqual(len(client.recv(32)),32)
-                client.sendall(b"x"*32); write_packet(client,request)
-                with self.assertRaises((ConnectionResetError, BrokenPipeError, socket.timeout)):
-                    read_packet(client)
+            before=len(upstream.requests)
+            wrong=AgentFilter(FilterConfig("",allowed,upstream_tcp=("127.0.0.1",relay.port),upstream_ssl_context=context,upstream_server_hostname="wrong.invalid"))
+            self.assertEqual(wrong.handle(request),bytes([SSH_AGENT_FAILURE]))
+            self.assertEqual(len(upstream.requests),before)
+            relay.shutdown(); thread.join(2); upstream.close()
+
+    def test_client_certificate_is_required(self):
+        import ssl
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); ca,server_cert,server_key,_,_=make_pki(root)
+            upstream_path=str(root/"upstream.sock"); allowed=key_blob(b"allowed")
+            upstream=FakeAgent(upstream_path,[(allowed,b"selected")]).start()
+            relay=MutualTLSRelay(AgentFilter(FilterConfig(upstream_path,allowed)),server_tls_context(str(ca),str(server_cert),str(server_key)),"127.0.0.1",0)
+            thread=threading.Thread(target=relay.serve_forever,daemon=True); thread.start()
+            deadline=time.time()+2
+            while relay.port==0 and time.time()<deadline: time.sleep(.01)
+            context=ssl.create_default_context(cafile=str(ca))
+            with self.assertRaises((ssl.SSLError,ConnectionResetError,BrokenPipeError,EOFError)):
+                with socket.create_connection(("127.0.0.1",relay.port),timeout=2) as raw:
+                    with context.wrap_socket(raw,server_hostname="host.docker.internal") as client:
+                        write_packet(client,bytes([SSH2_AGENTC_REQUEST_IDENTITIES])); read_packet(client)
+            self.assertEqual(upstream.requests,[])
             relay.shutdown(); thread.join(2); upstream.close()
 
 if __name__ == "__main__": unittest.main()

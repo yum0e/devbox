@@ -18,6 +18,7 @@ esac
 
 script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
 command -v python3 >/dev/null 2>&1 || { echo "install.sh: Python 3 is required on the host" >&2; exit 1; }
+[[ -x /usr/bin/openssl ]] || { echo "install.sh: /usr/bin/openssl is required on the host" >&2; exit 1; }
 bin_dir="${DEVC2_BIN_DIR:-$HOME/.local/bin}"
 share_dir="${DEVC2_SHARE_DIR:-$HOME/.local/share/devc2}"
 

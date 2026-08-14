@@ -12,11 +12,10 @@ import argparse
 import base64
 import binascii
 import logging
-import hmac
 import os
-import secrets
 import signal
 import socket
+import ssl
 import stat
 import struct
 import threading
@@ -30,7 +29,6 @@ SSH2_AGENTC_SIGN_REQUEST = 13
 SSH2_AGENT_SIGN_RESPONSE = 14
 DEFAULT_MAX_MESSAGE = 1024 * 1024
 LOG = logging.getLogger("ssh-agent-filter")
-RELAY_CONTEXT = b"devc2-ssh-relay-v1\x00"
 
 class ProtocolError(Exception):
     pass
@@ -129,7 +127,8 @@ class FilterConfig:
     upstream_socket: str
     allowed_key_blob: bytes
     upstream_tcp: tuple[str, int] | None = None
-    upstream_secret: bytes | None = None
+    upstream_ssl_context: ssl.SSLContext | None = None
+    upstream_server_hostname: str | None = None
     allowed_comment: str = "devbox-selected-key"
     max_message: int = DEFAULT_MAX_MESSAGE
     upstream_timeout: float = 30.0
@@ -141,20 +140,24 @@ class AgentFilter:
     def _round_trip(self, request: bytes) -> bytes:
         family = socket.AF_INET if self.config.upstream_tcp else socket.AF_UNIX
         destination = self.config.upstream_tcp or self.config.upstream_socket
-        with socket.socket(family, socket.SOCK_STREAM) as upstream:
-            upstream.settimeout(self.config.upstream_timeout)
-            upstream.connect(destination)
+        with socket.socket(family, socket.SOCK_STREAM) as raw_upstream:
+            raw_upstream.settimeout(self.config.upstream_timeout)
+            raw_upstream.connect(destination)
             if self.config.upstream_tcp:
-                if not self.config.upstream_secret:
-                    raise ProtocolError("TCP relay secret is missing")
-                nonce = recv_exact(upstream, 32)
-                if nonce is None: raise ProtocolError("TCP relay closed during authentication")
-                upstream.sendall(hmac.digest(self.config.upstream_secret, RELAY_CONTEXT + nonce, "sha256"))
-            write_packet(upstream, request)
-            response = read_packet(upstream, self.config.max_message)
-            if response is None:
-                raise ProtocolError("upstream agent closed without a response")
-            return response
+                if not self.config.upstream_ssl_context or not self.config.upstream_server_hostname:
+                    raise ProtocolError("TCP relay requires mutual TLS")
+                upstream = self.config.upstream_ssl_context.wrap_socket(
+                    raw_upstream, server_hostname=self.config.upstream_server_hostname)
+            else:
+                upstream = raw_upstream
+            try:
+                write_packet(upstream, request)
+                response = read_packet(upstream, self.config.max_message)
+                if response is None:
+                    raise ProtocolError("upstream agent closed without a response")
+                return response
+            finally:
+                if upstream is not raw_upstream: upstream.close()
 
     def handle(self, request: bytes) -> bytes:
         if not request:
@@ -285,11 +288,10 @@ class AgentServer:
         if self._server is not None:
             self._server.close()
 
-class AuthenticatedTCPRelay:
-    """Host-only adapter from an authenticated TCP connection to a Unix agent."""
-    def __init__(self, agent_filter: AgentFilter, secret: bytes, host: str = "0.0.0.0", port: int = 0):
-        if len(secret) != 32: raise ValueError("relay secret must contain exactly 32 bytes")
-        self.agent_filter, self.secret, self.host, self.port = agent_filter, secret, host, port
+class MutualTLSRelay:
+    """Host-only adapter from a mutually authenticated TLS connection to a Unix agent."""
+    def __init__(self, agent_filter: AgentFilter, tls_context: ssl.SSLContext, host: str = "0.0.0.0", port: int = 0):
+        self.agent_filter, self.tls_context, self.host, self.port = agent_filter, tls_context, host, port
         self._server = None
         self._stopping = threading.Event()
         self._threads = set()
@@ -301,7 +303,7 @@ class AuthenticatedTCPRelay:
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             server.bind((self.host, self.port)); self.port = server.getsockname()[1]
             self._server = server; server.listen(64); server.settimeout(.5)
-            LOG.info("authenticated SSH-agent relay listening on port %d", self.port)
+            LOG.info("mutual-TLS SSH-agent relay listening on port %d", self.port)
             while not self._stopping.is_set():
                 try: client, _ = server.accept()
                 except socket.timeout: continue
@@ -318,17 +320,19 @@ class AuthenticatedTCPRelay:
         current=threading.current_thread()
         try:
             with client:
-                client.settimeout(30)
-                nonce=secrets.token_bytes(32)
-                client.sendall(nonce)
-                presented=recv_exact(client,32)
-                expected=hmac.digest(self.secret,RELAY_CONTEXT + nonce,"sha256")
-                if presented is None or not hmac.compare_digest(presented,expected): return
-                request=read_packet(client,self.agent_filter.config.max_message)
-                if request is None: return
-                write_packet(client,self.agent_filter.handle(request))
+                client.settimeout(5)
+                connection = self.tls_context.wrap_socket(client, server_side=True)
+                connection.settimeout(30)
+                try:
+                    request=read_packet(connection,self.agent_filter.config.max_message)
+                    if request is None: return
+                    write_packet(connection,self.agent_filter.handle(request))
+                finally:
+                    connection.close()
+        except ssl.SSLError:
+            LOG.warning("rejected unauthenticated SSH-agent relay connection")
         except (OSError,ProtocolError):
-            LOG.warning("authenticated host SSH-agent relay request failed",exc_info=True)
+            LOG.warning("mutual-TLS SSH-agent relay request failed",exc_info=True)
         finally:
             with self._threads_lock: self._threads.discard(current)
             self._slots.release()
@@ -336,6 +340,23 @@ class AuthenticatedTCPRelay:
     def shutdown(self) -> None:
         self._stopping.set()
         if self._server is not None: self._server.close()
+
+def server_tls_context(ca_file: str, cert_file: str, key_file: str) -> ssl.SSLContext:
+    context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version=ssl.TLSVersion.TLSv1_2
+    context.options |= ssl.OP_NO_COMPRESSION
+    context.verify_mode=ssl.CERT_REQUIRED
+    context.load_verify_locations(cafile=ca_file)
+    context.load_cert_chain(certfile=cert_file,keyfile=key_file)
+    return context
+
+def client_tls_context(ca_file: str, cert_file: str, key_file: str) -> ssl.SSLContext:
+    context=ssl.create_default_context(ssl.Purpose.SERVER_AUTH,cafile=ca_file)
+    context.minimum_version=ssl.TLSVersion.TLSv1_2
+    context.options |= ssl.OP_NO_COMPRESSION
+    context.check_hostname=True
+    context.load_cert_chain(certfile=cert_file,keyfile=key_file)
+    return context
 
 def load_allowed_key(path: str) -> tuple[bytes, str]:
     return parse_public_key(Path(path).read_text(encoding="utf-8"))
@@ -346,8 +367,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--relay-listen", help="run a host TCP relay on host:port instead of a Unix filter")
     parser.add_argument("--relay-port-file")
     parser.add_argument("--upstream", default=os.environ.get("SSH_UPSTREAM_SOCKET", "/run/host-services/ssh-auth.sock"))
-    parser.add_argument("--upstream-tcp", help="authenticated relay host:port")
-    parser.add_argument("--upstream-secret-file")
+    parser.add_argument("--upstream-tcp", help="mutual-TLS relay host:port")
+    parser.add_argument("--tls-ca")
+    parser.add_argument("--tls-cert")
+    parser.add_argument("--tls-key")
+    parser.add_argument("--tls-server-name",default="host.docker.internal")
     parser.add_argument("--allowed-key", default=os.environ.get("SSH_ALLOWED_PUBLIC_KEY_FILE", "/run/devc2-public/ssh-allowed.pub"))
     parser.add_argument("--drop-uid", type=int)
     parser.add_argument("--drop-gid", type=int)
@@ -356,11 +380,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     if args.relay_listen:
-        if not args.upstream_secret_file or not args.relay_port_file: parser.error("host relay requires --upstream-secret-file and --relay-port-file")
-        secret = Path(args.upstream_secret_file).read_bytes()
+        if not args.relay_port_file: parser.error("host relay requires --relay-port-file")
+        tls_files=(args.tls_ca,args.tls_cert,args.tls_key)
+        if not all(tls_files): parser.error("host relay requires mutual TLS files")
+        relay_tls=server_tls_context(*tls_files)
         blob, comment = load_allowed_key(args.allowed_key)
         host, port = args.relay_listen.rsplit(":", 1)
-        relay = AuthenticatedTCPRelay(AgentFilter(FilterConfig(upstream_socket=args.upstream, allowed_key_blob=blob, allowed_comment=comment)), secret, host, int(port))
+        relay = MutualTLSRelay(AgentFilter(FilterConfig(upstream_socket=args.upstream, allowed_key_blob=blob, allowed_comment=comment)), relay_tls, host, int(port))
         thread = threading.Thread(target=relay.serve_forever, daemon=True); thread.start()
         deadline = __import__("time").monotonic() + 5
         while relay.port == 0 and thread.is_alive() and __import__("time").monotonic() < deadline: __import__("time").sleep(.01)
@@ -370,14 +396,15 @@ def main(argv: list[str] | None = None) -> int:
         thread.join(); return 0
     blob, comment = load_allowed_key(args.allowed_key)
     upstream_tcp = None
-    secret = None
+    upstream_tls = None
     if args.upstream_tcp:
         host, port = args.upstream_tcp.rsplit(":", 1)
         upstream_tcp = (host, int(port))
-        if not args.upstream_secret_file: parser.error("--upstream-secret-file is required with --upstream-tcp")
-        secret = Path(args.upstream_secret_file).read_bytes()
-        if len(secret) != 32: parser.error("relay secret file must contain exactly 32 bytes")
-    server = AgentServer(args.listen, AgentFilter(FilterConfig(upstream_socket=args.upstream, allowed_key_blob=blob, allowed_comment=comment, upstream_tcp=upstream_tcp, upstream_secret=secret)), int(args.socket_mode, 8), args.drop_uid, args.drop_gid)
+        tls_files=(args.tls_ca,args.tls_cert,args.tls_key)
+        if not all(tls_files): parser.error("--upstream-tcp requires mutual TLS files")
+        upstream_tls=client_tls_context(*tls_files)
+    config=FilterConfig(upstream_socket=args.upstream,allowed_key_blob=blob,allowed_comment=comment,upstream_tcp=upstream_tcp,upstream_ssl_context=upstream_tls,upstream_server_hostname=args.tls_server_name if upstream_tls else None)
+    server = AgentServer(args.listen, AgentFilter(config), int(args.socket_mode, 8), args.drop_uid, args.drop_gid)
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, lambda _s, _f: server.shutdown())
     server.serve_forever()

@@ -102,6 +102,10 @@ if [[ ! -S "$SSH_AUTH_SOCK" ]] || ! ssh-add -L >/dev/null 2>&1; then
   echo "tact-dev: filtered SSH agent did not become ready" >&2
   exit 1
 fi
+if [[ -e /run/devc2-ssh-tls ]]; then
+  echo "tact-dev: SSH relay credentials were exposed inside the devbox" >&2
+  exit 1
+fi
 signature_probe="$(mktemp /tmp/devc2-signing-probe.XXXXXX)"
 printf 'devc2 signing readiness probe' >"$signature_probe"
 if ! ssh-keygen -Y sign -f /run/devc2-public/ssh-allowed.pub -n git "$signature_probe" >/dev/null 2>&1; then
