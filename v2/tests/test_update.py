@@ -21,7 +21,7 @@ D=importlib.util.module_from_spec(SPEC); SPEC.loader.exec_module(D)
 
 class UpdateTests(unittest.TestCase):
     def runtime(self,root):
-        D.STATE=root/"state"; D.INSTALL_LOCK=D.STATE/"install.lock"; D.INSTALL_STATE=D.STATE/"installation.json"
+        D.STATE=root/"state"; D.INSTALL_LOCK=D.STATE/"install.lock"; D.UPDATE_LOCK=D.STATE/"update.lock"; D.INSTALL_STATE=D.STATE/"installation.json"
 
     def test_versioned_install_and_rollback_preserve_configuration(self):
         with tempfile.TemporaryDirectory() as td:
@@ -40,6 +40,9 @@ class UpdateTests(unittest.TestCase):
                 second=(share/"current").resolve()
                 self.assertNotEqual(first,second)
                 self.assertEqual((share/"previous").resolve(),first)
+                installed=json.loads(D.INSTALL_STATE.read_text())
+                self.assertEqual(installed["install_kind"],"checkout")
+                self.assertEqual(installed["previous_install_kind"],"checkout")
                 environment={**os.environ,"DEVC2_DATA_DIR":str(share),"XDG_STATE_HOME":str(root/"dispatcher-state")}
                 completed=subprocess.run([sys.executable,str(share/"bootstrap"/"dispatcher.py"),"rollback"],env=environment,text=True,capture_output=True)
                 self.assertEqual(completed.returncode,0,completed.stderr)
@@ -136,6 +139,72 @@ class UpdateTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError,"digest does not match"): D.update_installation()
             activate.assert_not_called()
 
+    def test_checkout_update_reimports_recorded_source_without_release_download(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); self.runtime(root)
+            source=root/"source"; shutil.copytree(ROOT,source,ignore=shutil.ignore_patterns("__pycache__"))
+            bin_dir=root/"bin"; share=root/"share"
+            environment={"DEVC2_BIN_DIR":str(bin_dir),"DEVC2_DATA_DIR":str(share)}
+            with mock.patch.dict(os.environ,environment,clear=False), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(D.install_from_directory(source,bin_dir,share),0)
+                first=(share/"current").resolve()
+                state=json.loads(D.INSTALL_STATE.read_text())
+                self.assertEqual(state["install_kind"],"checkout")
+                self.assertEqual(state["source_dir"],str(source.resolve()))
+                (source/"README.md").write_text((source/"README.md").read_text()+"\nupdated checkout\n")
+                with D.INSTALL_LOCK.open("a+") as active_session, mock.patch.object(D,"latest_release") as latest:
+                    fcntl.flock(active_session,fcntl.LOCK_SH|fcntl.LOCK_NB)
+                    self.assertEqual(D.update_installation(),0)
+                latest.assert_not_called()
+            self.assertNotEqual((share/"current").resolve(),first)
+            self.assertEqual((share/"previous").resolve(),first)
+
+    def test_rollback_restores_checkout_update_source_metadata(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); self.runtime(root)
+            source1=root/"source1"; source2=root/"source2"
+            shutil.copytree(ROOT,source1,ignore=shutil.ignore_patterns("__pycache__"))
+            shutil.copytree(ROOT,source2,ignore=shutil.ignore_patterns("__pycache__"))
+            (source2/"README.md").write_text((source2/"README.md").read_text()+"\nsecond checkout\n")
+            bin_dir=root/"bin"; share=root/"share"
+            environment={"DEVC2_BIN_DIR":str(bin_dir),"DEVC2_DATA_DIR":str(share)}
+            with mock.patch.dict(os.environ,environment,clear=False), contextlib.redirect_stdout(io.StringIO()):
+                D.install_from_directory(source1,bin_dir,share)
+                D.install_from_directory(source2,bin_dir,share)
+                D.rollback_installation()
+            state=json.loads(D.INSTALL_STATE.read_text())
+            self.assertEqual(state["install_kind"],"checkout")
+            self.assertEqual(state["source_dir"],str(source1.resolve()))
+            self.assertEqual(state["previous_install_kind"],"checkout")
+            self.assertEqual(state["previous_source_dir"],str(source2.resolve()))
+
+    def test_checkout_update_fails_when_recorded_source_disappears(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); self.runtime(root); D.STATE.mkdir()
+            missing=root/"missing"
+            D.atomic_write(D.INSTALL_STATE,json.dumps({"schema":1,"install_kind":"checkout","source_dir":str(missing)})+"\n")
+            with self.assertRaisesRegex(RuntimeError,"checkout source is unavailable"):
+                D.update_installation()
+
+    def test_updates_are_serialized_separately_from_session_lifecycle(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); self.runtime(root); D.STATE.mkdir()
+            with D.forward_update_lock():
+                with self.assertRaisesRegex(RuntimeError,"another devc2 update"):
+                    with D.forward_update_lock(): pass
+
+    def test_checkout_snapshot_rejects_source_changes_during_copy(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); self.runtime(root)
+            source=root/"source"; shutil.copytree(ROOT,source,ignore=shutil.ignore_patterns("__pycache__"))
+            real_copy=D.copy_release_assets
+            def changing_copy(origin,destination):
+                real_copy(origin,destination)
+                (destination/"README.md").write_text((destination/"README.md").read_text()+"\nchanged during copy\n")
+            with mock.patch.object(D,"copy_release_assets",side_effect=changing_copy), self.assertRaisesRegex(RuntimeError,"changed while"):
+                D.install_from_directory(source,root/"bin",root/"share")
+            self.assertFalse((root/"share"/"current").exists())
+
     def test_update_uses_invoked_wrapper_paths_not_global_metadata(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); self.runtime(root); D.STATE.mkdir(); source=root/"source"; shutil.copytree(ROOT,source,ignore=shutil.ignore_patterns("__pycache__"))
@@ -170,6 +239,33 @@ class UpdateTests(unittest.TestCase):
                     fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
             finally:
                 process.terminate(); process.wait(timeout=5)
+
+    def test_dispatcher_allows_update_but_blocks_rollback_during_session(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); data=root/"data"; runtime=data/"versions"/"test"; launcher=runtime/"launcher"; launcher.mkdir(parents=True); data.mkdir(exist_ok=True)
+            ready=root/"ready"; updated=root/"updated"
+            (launcher/"devc2.py").write_text(
+                "import pathlib,sys,time\n"
+                f"ready=pathlib.Path({str(ready)!r}); updated=pathlib.Path({str(updated)!r})\n"
+                "if sys.argv[1:]==['update']: updated.write_text('updated')\n"
+                "else: ready.write_text('ready'); time.sleep(30)\n"
+            )
+            os.symlink(runtime,data/"current"); os.symlink(runtime,data/"manager")
+            state_home=root/"state-home"; env={**os.environ,"DEVC2_DATA_DIR":str(data),"XDG_STATE_HOME":str(state_home)}
+            session=subprocess.Popen([sys.executable,str(ROOT/"launcher"/"dispatcher.py"),"dummy"],env=env)
+            try:
+                deadline=time.time()+5
+                while not ready.exists() and time.time()<deadline: time.sleep(.02)
+                self.assertTrue(ready.exists())
+                update=subprocess.run([sys.executable,str(ROOT/"launcher"/"dispatcher.py"),"update"],env=env,text=True,capture_output=True,timeout=5)
+                self.assertEqual(update.returncode,0,update.stderr)
+                self.assertTrue(updated.exists())
+                self.assertIsNone(session.poll())
+                rollback=subprocess.run([sys.executable,str(ROOT/"launcher"/"dispatcher.py"),"rollback"],env=env,text=True,capture_output=True,timeout=5)
+                self.assertNotEqual(rollback.returncode,0)
+                self.assertIn("while a session is active",rollback.stderr)
+            finally:
+                session.terminate(); session.wait(timeout=5)
 
     def test_release_packager_rejects_top_level_directory_symlink(self):
         package_spec=importlib.util.spec_from_file_location("devc2_package",ROOT/"package-release.py"); package=importlib.util.module_from_spec(package_spec); package_spec.loader.exec_module(package)

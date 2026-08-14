@@ -14,11 +14,11 @@ def main():
     lock_path=state/"install.lock"
     descriptor=os.open(lock_path,os.O_RDWR|os.O_CREAT,0o600)
     command=sys.argv[1] if len(sys.argv)>1 else ""
-    management=command in {"update","rollback","_install-assets"}
+    management=command in {"rollback","_install-assets"}
     mode=fcntl.LOCK_EX if management else fcntl.LOCK_SH
     try: fcntl.flock(descriptor,mode|fcntl.LOCK_NB)
     except BlockingIOError:
-        action="update devc2 while a session is active" if management else "start devc2 while an install or update is active"
+        action="change the devc2 installation while a session is active" if management else "start or update devc2 while installation management is active"
         print(f"devc2: error: cannot {action}",file=sys.stderr)
         return 1
     pointer="manager" if command in {"update","rollback"} else "current"

@@ -22,6 +22,7 @@ TACT_CONFIG_DEFAULT="[agent]\nmax_subagents = 8\n"
 AUTH_IMAGE=f"devc2:{VERSION}"
 INSTALL_STATE=STATE/"installation.json"
 INSTALL_LOCK=STATE/"install.lock"
+UPDATE_LOCK=STATE/"update.lock"
 RELEASE_API="https://api.github.com/repos/yum0e/devbox/releases/latest"
 RELEASE_ASSET="devc2.tar.gz"
 MAX_RELEASE_BYTES=32*1024*1024
@@ -53,8 +54,17 @@ def lifecycle_lock(exclusive):
         operation=fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
         try: fcntl.flock(lock,operation|fcntl.LOCK_NB)
         except BlockingIOError as error:
-            action="install or update" if not exclusive else "running devc2 session"
-            raise RuntimeError(f"cannot start while a devc2 {action} is active" if not exclusive else "cannot install or update while a devc2 session is active") from error
+            if exclusive: raise RuntimeError("cannot install or roll back while a devc2 session is active") from error
+            raise RuntimeError("cannot start or update while devc2 installation management is active") from error
+        try: yield
+        finally: fcntl.flock(lock,fcntl.LOCK_UN)
+
+@contextlib.contextmanager
+def forward_update_lock():
+    STATE.mkdir(parents=True,exist_ok=True,mode=0o700)
+    with UPDATE_LOCK.open("a+") as lock:
+        try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError as error: raise RuntimeError("another devc2 update is already active") from error
         try: yield
         finally: fcntl.flock(lock,fcntl.LOCK_UN)
 
@@ -230,13 +240,15 @@ def _activate_assets(source,bin_dir,share_dir,release=False):
     install_id=version if release else f"{version}+local.{digest[:12]}"
     target=versions/install_id; launcher_path=bin_dir/"devc2"
     current_link=share_dir/"current"; previous_link=share_dir/"previous"
+    existing_state=read_installation_state()
     try: old_root=current_link.resolve(strict=True) if current_link.is_symlink() else wrapper_root(launcher_path)
     except OSError: old_root=wrapper_root(launcher_path)
     if not target.exists():
         staging=Path(tempfile.mkdtemp(prefix=f".{install_id}.",dir=versions)); staging.rmdir()
         try:
             copy_release_assets(source,staging)
-            if validate_asset_tree(staging,True)!=version: raise RuntimeError("staged installation failed validation")
+            if validate_asset_tree(staging,True)!=version or asset_digest(staging)!=digest:
+                raise RuntimeError("source assets changed while the runtime snapshot was staged")
             freeze_asset_tree(staging)
             staging.rename(target)
         except Exception:
@@ -266,7 +278,15 @@ def _activate_assets(source,bin_dir,share_dir,release=False):
     if previous_root:
         try: previous_version=source_version(previous_root)
         except RuntimeError: pass
-    metadata={"schema":1,"version":install_id,"current":str(target),"previous":str(previous_root) if previous_root else None,"previous_version":previous_version,"bin_dir":str(bin_dir),"share_dir":str(share_dir),"installed_at":int(time.time())}
+    if old_root==target:
+        previous_install_kind=existing_state.get("previous_install_kind")
+        previous_source_dir=existing_state.get("previous_source_dir")
+    elif old_root and existing_state.get("current")==str(old_root):
+        previous_install_kind=existing_state.get("install_kind")
+        previous_source_dir=existing_state.get("source_dir")
+    else:
+        previous_install_kind=None; previous_source_dir=None
+    metadata={"schema":1,"version":install_id,"current":str(target),"previous":str(previous_root) if previous_root else None,"previous_version":previous_version,"bin_dir":str(bin_dir),"share_dir":str(share_dir),"install_kind":"release" if release else "checkout","source_dir":None if release else str(source.resolve()),"previous_install_kind":previous_install_kind,"previous_source_dir":previous_source_dir,"installed_at":int(time.time())}
     try: atomic_write(INSTALL_STATE,json.dumps(metadata,sort_keys=True,indent=2)+"\n")
     except OSError as error: print(f"devc2: warning: activation succeeded but installation metadata could not be updated: {error}",file=sys.stderr)
     print(f"installed devc2 {install_id}: {launcher_path}")
@@ -278,7 +298,7 @@ def _activate_assets(source,bin_dir,share_dir,release=False):
 def install_from_directory(source,bin_dir,share_dir,release=False):
     with lifecycle_lock(True):
         active=active_legacy_sessions()
-        if active: raise RuntimeError("cannot install or update while a devc2 session is active")
+        if active: raise RuntimeError("cannot install while a devc2 session is active")
         return _activate_assets(source.resolve(),bin_dir,share_dir,release)
 
 def parse_release_version(tag):
@@ -401,8 +421,19 @@ def extract_release(archive,destination):
     return source
 
 def update_installation():
-    with lifecycle_lock(True):
-        if active_legacy_sessions(): raise RuntimeError("cannot install or update while a devc2 session is active")
+    with lifecycle_lock(False), forward_update_lock():
+        state=read_installation_state()
+        if state.get("install_kind")=="checkout":
+            raw_source=state.get("source_dir")
+            if not isinstance(raw_source,str) or not raw_source:
+                raise RuntimeError("checkout installation metadata lacks its source directory; rerun v2/install.sh once")
+            source=Path(raw_source).expanduser()
+            try: source=source.resolve(strict=True)
+            except OSError as error: raise RuntimeError(f"installed checkout source is unavailable: {source}") from error
+            validate_asset_tree(source)
+            bin_dir=Path(os.environ.get("DEVC2_BIN_DIR",state.get("bin_dir",Path.home()/".local/bin")))
+            share_dir=Path(os.environ.get("DEVC2_DATA_DIR",state.get("share_dir",Path.home()/".local/share/devc2")))
+            return _activate_assets(source,bin_dir,share_dir,False)
         latest,url,expected=latest_release()
         data_root=Path(os.environ.get("DEVC2_DATA_DIR",Path.home()/".local/share/devc2"))
         try: active_version=source_version((data_root/"current").resolve(strict=True))
@@ -418,7 +449,6 @@ def update_installation():
             temp=Path(raw); archive=temp/RELEASE_ASSET; archive.write_bytes(payload)
             source=extract_release(archive,temp/"extracted")
             if source_version(source)!=latest: raise RuntimeError("release tag and packaged VERSION do not match")
-            state=read_installation_state()
             bin_dir=Path(os.environ.get("DEVC2_BIN_DIR",state.get("bin_dir",Path.home()/".local/bin")))
             share_dir=Path(os.environ.get("DEVC2_DATA_DIR",state.get("share_dir",Path.home()/".local/share/devc2")))
             return _activate_assets(source,bin_dir,share_dir,True)
@@ -437,7 +467,7 @@ def rollback_installation():
         except Exception:
             replace_symlink(current_link,current)
             raise
-        metadata={"schema":1,"version":state.get("previous_version") or previous_version,"current":str(previous),"previous":str(current),"previous_version":state.get("version"),"bin_dir":str(bin_dir),"share_dir":str(share_dir),"installed_at":int(time.time())}
+        metadata={"schema":1,"version":state.get("previous_version") or previous_version,"current":str(previous),"previous":str(current),"previous_version":state.get("version"),"bin_dir":str(bin_dir),"share_dir":str(share_dir),"install_kind":state.get("previous_install_kind"),"source_dir":state.get("previous_source_dir"),"previous_install_kind":state.get("install_kind"),"previous_source_dir":state.get("source_dir"),"installed_at":int(time.time())}
         atomic_write(INSTALL_STATE,json.dumps(metadata,sort_keys=True,indent=2)+"\n")
         print(f"rolled back devc2 to {metadata['version']}")
         return 0

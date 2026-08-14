@@ -29,7 +29,7 @@ those credentials and can export data fetched with them.
 devc2 auth        # one-time ChatGPT + GitHub browser/device login
 devc2 doctor             # fast host prerequisites
 devc2 doctor --runtime   # disposable live Docker/credential/signing checks
-devc2 update             # verify and atomically activate the latest stable release
+devc2 update             # atomically update from the install source
 devc2 rollback           # atomically return to the retained previous runtime
 devc2 /path/to/repository
 devc2 reset /path/to/repository
@@ -84,11 +84,21 @@ public pinned base images anonymously, builds its runtime image locally, and use
 `--pull=never` whenever that local image is run. If `~/.local/bin` is absent from
 `PATH`, the installer prints a note and leaves the decision to the user.
 
+For a checkout installation made with `./v2/install.sh`, the initial install
+records that checkout's `v2/` directory. Subsequent `devc2 update` commands
+re-import its current assets directly, so rerunning `install.sh` is unnecessary.
+The command does not fetch or modify the checkout; update it with your normal Git
+workflow first. For a release installation, `devc2 update` retains the verified
+latest-stable-release download path.
+
 Program assets are installed into immutable, versioned directories. A stable
 dispatcher takes a shared lock before selecting one runtime, and that process
-keeps the resolved directory for its full lifetime. Install, update, and rollback
-need the exclusive form of the same permanent lock and immediately refuse while
-any devc2 command or session is active. There is no force override. Repository
+keeps the resolved directory for its full lifetime. A forward `devc2 update` may
+run while sessions are active: those sessions continue using their resolved
+runtime and containers, while the new runtime becomes active only for subsequent
+launches. Updates are serialized with a separate permanent lock. Install and
+rollback retain the exclusive installation lock and refuse while any session is
+active. Runtime pruning is not supported. There is no force override. Repository
 locks are also permanent, so `reset` cannot tear down a running checkout.
 
 The new release is fully downloaded, bounded, hash-verified, safely extracted,
