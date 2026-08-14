@@ -46,7 +46,6 @@ RUN install -d -m 0755 "$PNPM_HOME" \
  && pnpm --version \
  && pnpm runtime set node latest --global \
  && node --version \
- && npm --version \
  && pnpm add --global @openai/codex@0.147.0 \
  && pnpm store prune
 

@@ -147,6 +147,8 @@ class CliTests(unittest.TestCase):
         self.assertIn("/usr/local/share/pnpm/bin", dockerfile)
         self.assertIn("pnpm runtime set node latest --global", dockerfile)
         self.assertIn("pnpm add --global @openai/codex@0.147.0", dockerfile)
+        self.assertNotIn("\n && npm --version", dockerfile)
+        self.assertNotIn("\n && npm install", dockerfile)
         self.assertIn("uv python install 3.14", dockerfile)
         self.assertIn("$FOUNDRY_DIR/bin/foundryup", dockerfile)
         self.assertNotIn("corepack enable", dockerfile)
