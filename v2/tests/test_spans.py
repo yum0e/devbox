@@ -147,15 +147,37 @@ class SpanCatalogTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(spans[0].client.stat().st_mode),0o555)
             self.assertNotIn(b"openai",link.read_bytes().lower())
 
-    def test_actual_openai_world_and_link_are_executable_source_assets(self):
+    def test_actual_scoped_exec_worlds_share_one_generic_link(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root=Path(raw); destination=root/"snapshot"; destination.mkdir()
+            items=span_runtime.load_catalog(
+                root/"missing.json",("github","openai"),root/"workspace",destination/"links",destination/"worlds",
+                V2_ROOT/"spans",scoped_exec_projection=SCOPED_EXEC_PROJECTION,
+            )
+            for item in items:
+                self.assertEqual(
+                    item.provider.read_bytes(),
+                    (V2_ROOT/"spans"/item.name/"world").read_bytes(),
+                )
+                self.assertEqual(item.client.read_bytes(),SCOPED_EXEC_PROJECTION.read_bytes())
+            self.assertEqual(
+                items[0].client.read_bytes(),
+                items[1].client.read_bytes(),
+            )
+
+    def test_ssh_world_uses_only_the_generic_stream_link(self):
         with tempfile.TemporaryDirectory() as raw:
             root=Path(raw); destination=root/"snapshot"; destination.mkdir()
             item=span_runtime.load_catalog(
-                root/"missing.json",("openai",),root/"workspace",destination/"links",destination/"worlds",
-                V2_ROOT/"spans",scoped_exec_projection=SCOPED_EXEC_PROJECTION,
+                root/"missing.json",("ssh-agent",),root/"workspace",
+                destination/"links",destination/"worlds",V2_ROOT/"spans",
             )[0]
-            self.assertEqual(item.provider.read_bytes(),(V2_ROOT/"spans"/"openai"/"world").read_bytes())
-            self.assertEqual(item.client.read_bytes(),SCOPED_EXEC_PROJECTION.read_bytes())
+            self.assertEqual(
+                item.provider.read_bytes(),
+                (V2_ROOT/"spans"/"ssh-agent"/"world").read_bytes(),
+            )
+            self.assertIsNone(item.client)
+            self.assertEqual(list((destination/"links").iterdir()), [])
 
     def test_command_link_snapshots_one_world_and_the_generic_projection(self):
         with tempfile.TemporaryDirectory() as raw:

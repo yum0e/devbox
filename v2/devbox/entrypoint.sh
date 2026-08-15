@@ -56,8 +56,8 @@ jj config unset --user signing.backend >/dev/null 2>&1 || true
 jj config unset --user signing.key >/dev/null 2>&1 || true
 rm -f -- "$HOME/.config/devc2/signing-key.pub" "$HOME/.config/devc2/allowed-signers"
 
-# The SSH-agent Span is already a selected-key-only agent. No second relay,
-# credential file, or adapter is needed inside the Island.
+# The SSH World is already a selected-key-only agent. The generic stream Link
+# projects it directly; no command, credential file, or adapter is needed here.
 if [[ -S /run/devc2/spans/ssh-agent.sock ]]; then
   export SSH_AUTH_SOCK=/run/devc2/spans/ssh-agent.sock
   signing_dir="$HOME/.config/devc2"

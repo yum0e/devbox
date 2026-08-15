@@ -33,7 +33,11 @@ class UpdateTests(unittest.TestCase):
         )
         for relative in legacy_required:
             self.assertTrue((ROOT/relative).is_file(),relative)
-        for relative in ("spans/openai/provider", "spans/openai/client"):
+        for relative in (
+            "spans/openai/provider", "spans/openai/client",
+            "spans/github/provider", "spans/github/client",
+            "spans/ssh-agent/provider", "spans/ssh-agent/client",
+        ):
             self.assertTrue((ROOT/relative).is_file(), relative)
             self.assertEqual(stat.S_IMODE((ROOT/relative).stat().st_mode), 0o644, relative)
         self.assertNotIn("herdr-wrapper.py",(ROOT/"Dockerfile").read_text())

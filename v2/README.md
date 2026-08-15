@@ -15,13 +15,14 @@ has limits of 16 GiB memory, 8 CPUs, and 4096 PIDs. The Docker socket, host home
 raw OAuth credentials, raw SSH-agent socket, and Span transport keys are never
 mounted into the Island.
 
-The first-party OpenAI World and GitHub provider retain bearer credentials on
-the host and inject them only into narrowly allowed HTTPS requests. OpenAI
-exports a bounded manifest to devc2's generic scoped-exec Link; GitHub retains
-its transitional client. Both create child-scoped fake authentication and proxy state, then remove it. The
-SSH-agent provider accepts only identity queries and signing requests for one
-host-selected public key; every other agent operation and key is rejected before
-reaching the host agent. These boundaries prevent credential extraction, not
+The first-party OpenAI and GitHub Worlds retain bearer credentials on the host
+and inject them only into narrowly allowed HTTPS requests. Both export bounded
+manifests to the same generic scoped-exec Link, which creates child-scoped fake
+authentication and proxy state, then removes it. The SSH-agent World accepts
+only identity queries and signing requests for one host-selected public key;
+the generic opaque-stream Link projects it directly as `SSH_AUTH_SOCK`. Every
+other agent operation and key is rejected before reaching the host agent.
+These boundaries prevent credential extraction, not
 credential use: any process in an Island granted a Span can exercise that Span's
 authority and export the resulting data. Grant only the capabilities a checkout
 needs.

@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""Host-side SSH-agent World: selected-key signing authority."""
+from __future__ import annotations
+
+import base64
+import binascii
+import logging
+import os
+import signal
+import socket
+import stat
+import struct
+import sys
+import threading
+from dataclasses import dataclass
+from pathlib import Path
+
+
+SSH_AGENT_FAILURE = 5
+SSH2_AGENTC_REQUEST_IDENTITIES = 11
+SSH2_AGENT_IDENTITIES_ANSWER = 12
+SSH2_AGENTC_SIGN_REQUEST = 13
+SSH2_AGENT_SIGN_RESPONSE = 14
+DEFAULT_MAX_MESSAGE = 1024 * 1024
+MAX_CONNECTIONS = 64
+UPSTREAM_TIMEOUT = 30.0
+MAX_PUBLIC_KEY = 16 * 1024
+LOG = logging.getLogger("ssh-agent-span")
+
+
+class ProtocolError(Exception):
+    pass
+
+
+def pack_u32(value: int) -> bytes:
+    return struct.pack(">I", value)
+
+
+def pack_string(value: bytes) -> bytes:
+    return pack_u32(len(value)) + value
+
+
+def read_u32(data: bytes, offset: int) -> tuple[int, int]:
+    if len(data) - offset < 4:
+        raise ProtocolError("truncated uint32")
+    return struct.unpack_from(">I", data, offset)[0], offset + 4
+
+
+def read_string(data: bytes, offset: int) -> tuple[bytes, int]:
+    size, offset = read_u32(data, offset)
+    end = offset + size
+    if end > len(data):
+        raise ProtocolError("truncated string")
+    return data[offset:end], end
+
+
+def recv_exact(connection: socket.socket, size: int) -> bytes | None:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = connection.recv(remaining)
+        if not chunk:
+            if remaining == size:
+                return None
+            raise ProtocolError("connection closed mid-message")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def read_packet(connection: socket.socket, maximum: int = DEFAULT_MAX_MESSAGE) -> bytes | None:
+    header = recv_exact(connection, 4)
+    if header is None:
+        return None
+    size = struct.unpack(">I", header)[0]
+    if size < 1 or size > maximum:
+        raise ProtocolError(f"invalid SSH-agent message length: {size}")
+    return recv_exact(connection, size)
+
+
+def write_packet(connection: socket.socket, payload: bytes) -> None:
+    connection.sendall(pack_u32(len(payload)) + payload)
+
+
+def parse_public_key(line: str) -> tuple[bytes, bytes]:
+    fields = line.strip().split()
+    if len(fields) < 2:
+        raise ValueError("public key must use OpenSSH '<type> <base64> [comment]' format")
+    try:
+        blob = base64.b64decode(fields[1], validate=True)
+        algorithm, offset = read_string(blob, 0)
+        name = algorithm.decode("ascii", "strict")
+    except (binascii.Error, ProtocolError, UnicodeDecodeError, ValueError) as error:
+        raise ValueError("invalid encoded SSH public key") from error
+    if not blob or offset > len(blob) or name != fields[0]:
+        raise ValueError("public key type does not match encoded key blob")
+    comment = " ".join(fields[2:]).encode() if len(fields) > 2 else b"devc2-selected-key"
+    return blob, comment
+
+
+def read_public_key(path: Path) -> tuple[bytes, bytes]:
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+        metadata = os.fstat(descriptor)
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+                or metadata.st_mode & 0o022 or metadata.st_size > MAX_PUBLIC_KEY):
+            raise RuntimeError("selected SSH public key is not a private, bounded regular file")
+        payload = os.read(descriptor, MAX_PUBLIC_KEY + 1)
+        if len(payload) > MAX_PUBLIC_KEY or os.read(descriptor, 1):
+            raise RuntimeError("selected SSH public key exceeds its size limit")
+        return parse_public_key(payload.decode("utf-8"))
+    except RuntimeError:
+        raise
+    except (OSError, UnicodeError, ValueError) as error:
+        raise RuntimeError("selected SSH public key is unavailable or invalid") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def parse_identities(payload: bytes) -> list[tuple[bytes, bytes]]:
+    if not payload or payload[0] != SSH2_AGENT_IDENTITIES_ANSWER:
+        raise ProtocolError("upstream returned an invalid identities response")
+    count, offset = read_u32(payload, 1)
+    if count > len(payload) // 8:
+        raise ProtocolError("invalid upstream identity count")
+    identities = []
+    for _ in range(count):
+        blob, offset = read_string(payload, offset)
+        comment, offset = read_string(payload, offset)
+        identities.append((blob, comment))
+    if offset != len(payload):
+        raise ProtocolError("trailing data in identities response")
+    return identities
+
+
+def parse_sign_request(payload: bytes) -> bytes:
+    if not payload or payload[0] != SSH2_AGENTC_SIGN_REQUEST:
+        raise ProtocolError("not a sign request")
+    key, offset = read_string(payload, 1)
+    _data, offset = read_string(payload, offset)
+    _flags, offset = read_u32(payload, offset)
+    if offset != len(payload):
+        raise ProtocolError("trailing data in sign request")
+    return key
+
+
+@dataclass(frozen=True)
+class FilterConfig:
+    upstream_socket: str
+    allowed_key_blob: bytes
+    allowed_comment: bytes
+    max_message: int = DEFAULT_MAX_MESSAGE
+    upstream_timeout: float = UPSTREAM_TIMEOUT
+
+
+class AgentFilter:
+    def __init__(self, config: FilterConfig):
+        self.config = config
+
+    def _round_trip(self, request: bytes) -> bytes:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as upstream:
+            upstream.settimeout(self.config.upstream_timeout)
+            upstream.connect(self.config.upstream_socket)
+            write_packet(upstream, request)
+            response = read_packet(upstream, self.config.max_message)
+            if response is None:
+                raise ProtocolError("upstream agent closed without a response")
+            return response
+
+    def handle(self, request: bytes) -> bytes:
+        if request == bytes([SSH2_AGENTC_REQUEST_IDENTITIES]):
+            try:
+                identities = parse_identities(self._round_trip(request))
+            except (OSError, ProtocolError):
+                LOG.warning("upstream identities request failed", exc_info=True)
+                return bytes([SSH_AGENT_FAILURE])
+            match = next((item for item in identities if item[0] == self.config.allowed_key_blob), None)
+            if match is None:
+                return bytes([SSH2_AGENT_IDENTITIES_ANSWER]) + pack_u32(0)
+            comment = match[1] or self.config.allowed_comment
+            return (bytes([SSH2_AGENT_IDENTITIES_ANSWER]) + pack_u32(1)
+                    + pack_string(self.config.allowed_key_blob) + pack_string(comment))
+        if request and request[0] == SSH2_AGENTC_SIGN_REQUEST:
+            try:
+                key = parse_sign_request(request)
+            except ProtocolError:
+                return bytes([SSH_AGENT_FAILURE])
+            if key != self.config.allowed_key_blob:
+                LOG.warning("rejected SSH sign request for a non-selected key")
+                return bytes([SSH_AGENT_FAILURE])
+            try:
+                response = self._round_trip(request)
+            except (OSError, ProtocolError):
+                LOG.warning("upstream sign request failed", exc_info=True)
+                return bytes([SSH_AGENT_FAILURE])
+            if not response or response[0] not in (SSH2_AGENT_SIGN_RESPONSE, SSH_AGENT_FAILURE):
+                return bytes([SSH_AGENT_FAILURE])
+            return response
+        return bytes([SSH_AGENT_FAILURE])
+
+
+class World:
+    def __init__(self, listener: socket.socket, agent_filter: AgentFilter):
+        self.listener = listener
+        self.agent_filter = agent_filter
+        self.stopping = threading.Event()
+        self.slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        self.connections: set[socket.socket] = set()
+        self.threads: set[threading.Thread] = set()
+        self.lock = threading.Lock()
+
+    def serve_forever(self) -> None:
+        self.listener.settimeout(0.5)
+        while not self.stopping.is_set():
+            try:
+                connection, _address = self.listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                if self.stopping.is_set():
+                    break
+                raise
+            if not self.slots.acquire(blocking=False):
+                connection.close()
+                continue
+            connection.settimeout(self.agent_filter.config.upstream_timeout)
+            thread = threading.Thread(target=self._serve_connection, args=(connection,), daemon=True)
+            with self.lock:
+                self.connections.add(connection)
+                self.threads.add(thread)
+            try:
+                thread.start()
+            except RuntimeError:
+                with self.lock:
+                    self.connections.discard(connection)
+                    self.threads.discard(thread)
+                connection.close()
+                self.slots.release()
+
+    def _serve_connection(self, connection: socket.socket) -> None:
+        current = threading.current_thread()
+        try:
+            with connection:
+                while not self.stopping.is_set():
+                    try:
+                        request = read_packet(connection, self.agent_filter.config.max_message)
+                    except (OSError, ProtocolError):
+                        return
+                    if request is None:
+                        return
+                    try:
+                        write_packet(connection, self.agent_filter.handle(request))
+                    except OSError:
+                        return
+        finally:
+            with self.lock:
+                self.connections.discard(connection)
+                self.threads.discard(current)
+            self.slots.release()
+
+    def shutdown(self) -> None:
+        if self.stopping.is_set():
+            return
+        self.stopping.set()
+        try:
+            self.listener.close()
+        except OSError:
+            pass
+        with self.lock:
+            connections = list(self.connections)
+            threads = list(self.threads)
+        for connection in connections:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            connection.close()
+        for thread in threads:
+            thread.join(timeout=2)
+
+
+def configured_world() -> World:
+    try:
+        descriptor = int(os.environ["DEVC2_SPAN_SOCKET_FD"])
+        upstream_path = os.environ["SSH_AUTH_SOCK"]
+    except (KeyError, ValueError) as error:
+        raise RuntimeError("missing SSH Span runtime environment") from error
+    try:
+        if not stat.S_ISSOCK(os.stat(upstream_path).st_mode):
+            raise RuntimeError("SSH_AUTH_SOCK is not a Unix socket")
+        listener = socket.socket(fileno=descriptor)
+        if listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) != 1:
+            raise RuntimeError("DEVC2_SPAN_SOCKET_FD is not a listening socket")
+    except OSError as error:
+        raise RuntimeError("SSH Span socket is unavailable") from error
+    key_path = Path.home() / ".config" / "devc2" / "ssh-key.pub"
+    try:
+        blob, comment = read_public_key(key_path)
+    except RuntimeError as error:
+        listener.close()
+        raise RuntimeError(f"selected SSH public key is unavailable: {key_path}") from error
+    return World(listener, AgentFilter(FilterConfig(upstream_path, blob, comment)))
+
+
+def main() -> int:
+    if sys.argv[1:]:
+        print("ssh-agent-world: World accepts no arguments", file=sys.stderr)
+        return 2
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    try:
+        world = configured_world()
+    except RuntimeError as error:
+        print(f"ssh-agent-span: {error}", file=sys.stderr)
+        return 2
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, lambda _signum, _frame: world.shutdown())
+    try:
+        world.serve_forever()
+    finally:
+        world.shutdown()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

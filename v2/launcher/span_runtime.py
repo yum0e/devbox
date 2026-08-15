@@ -23,14 +23,15 @@ MAX_CLIENT_BYTES = 64 * 1024 * 1024
 MAX_PROVIDER_BYTES = 64 * 1024 * 1024
 MAX_CONNECTIONS = 64
 MAX_SPANS = 16
-SCOPED_EXEC_BUILTINS = {"openai"}
+SCOPED_EXEC_BUILTINS = {"github", "openai"}
+STREAM_BUILTINS = {"ssh-agent"}
 SUPERVISOR = Path(__file__).with_name("span_supervisor.py")
 
 
 @dataclass(frozen=True)
 class Span:
     name: str
-    client: Path
+    client: Path | None
     provider: Path
 
 
@@ -94,6 +95,8 @@ def load_catalog(path: Path, names: tuple[str, ...], forbidden_root: Path, clien
                 if scoped_exec_projection is None:
                     raise RuntimeError(f"Span {name!r} cannot be projected")
                 builtin_entries[name]=(world,scoped_exec_projection)
+            elif world.is_file() and name in STREAM_BUILTINS:
+                builtin_entries[name]=(world,None)
             elif provider.is_file() and client.is_file():
                 builtin_entries[name]={"provider":str(provider),"client":str(client)}
     external_names=[name for name in names if name not in builtin_entries]
@@ -115,7 +118,7 @@ def load_catalog(path: Path, names: tuple[str, ...], forbidden_root: Path, clien
             # snapshot them read-only and restore execute permission only on the
             # per-launch copies. Catalog-supplied executables remain strict.
             provider=_snapshot_executable(str(world),f"{name!r} World",provider_destination/name,MAX_PROVIDER_BYTES,forbidden_root,False)
-            client=_snapshot_executable(str(link),f"{name!r} scoped-exec Link",client_destination/name,MAX_CLIENT_BYTES,None,False)
+            client=None if link is None else _snapshot_executable(str(link),f"{name!r} scoped-exec Link",client_destination/name,MAX_CLIENT_BYTES,None,False)
         elif isinstance(entry,str):
             if command_projection is None:
                 raise RuntimeError(f"Span {name!r} cannot be projected")

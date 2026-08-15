@@ -1,8 +1,6 @@
 import base64
-import contextlib
 import importlib.machinery
 import importlib.util
-import io
 import os
 import socket
 import struct
@@ -27,8 +25,8 @@ def load_script(path: Path, name: str):
     return module
 
 
-P = load_script(ROOT / "spans" / "ssh-agent" / "provider", "ssh_agent_span_provider")
-C = load_script(ROOT / "spans" / "ssh-agent" / "client", "ssh_agent_span_client")
+W = load_script(ROOT / "spans" / "ssh-agent" / "world", "ssh_agent_world")
+P = W
 
 
 def key_blob(label: bytes) -> bytes:
@@ -134,8 +132,8 @@ class FilterTests(unittest.TestCase):
         self.assertEqual(len(self.upstream.requests), before)
 
 
-class ProviderTests(unittest.TestCase):
-    def test_provider_supports_multiple_packets_on_one_connection_and_stops_cleanly(self):
+class WorldTests(unittest.TestCase):
+    def test_world_supports_multiple_packets_on_one_connection_and_stops_cleanly(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             allowed = key_blob(b"allowed")
@@ -143,7 +141,7 @@ class ProviderTests(unittest.TestCase):
             listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             listener.bind(("127.0.0.1", 0))
             listener.listen()
-            provider = P.Provider(listener, P.AgentFilter(P.FilterConfig(str(upstream.path), allowed, b"selected")))
+            provider = P.World(listener, P.AgentFilter(P.FilterConfig(str(upstream.path), allowed, b"selected")))
             thread = threading.Thread(target=provider.serve_forever, daemon=True)
             thread.start()
             try:
@@ -172,7 +170,7 @@ class ProviderTests(unittest.TestCase):
             left.close()
             right.close()
 
-    def test_configured_provider_requires_runtime_socket_agent_and_saved_key(self):
+    def test_configured_world_requires_runtime_socket_agent_and_saved_key(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             config = root / ".config" / "devc2"
@@ -189,48 +187,27 @@ class ProviderTests(unittest.TestCase):
                 "SSH_AUTH_SOCK": str(agent.path),
                 "DEVC2_SPAN_SOCKET_FD": str(descriptor),
             }, clear=True):
-                provider = P.configured_provider()
+                provider = P.configured_world()
             provider.shutdown()
             listener.close()
             agent.close()
             self.assertEqual(provider.agent_filter.config.allowed_key_blob, allowed)
 
-    def test_configured_provider_rejects_missing_agent(self):
+    def test_configured_world_rejects_missing_agent(self):
         with mock.patch.dict(os.environ, {"DEVC2_SPAN_SOCKET_FD": "3"}, clear=True):
             with self.assertRaisesRegex(RuntimeError, "missing SSH Span runtime environment"):
-                P.configured_provider()
+                P.configured_world()
 
 
-class ClientTests(unittest.TestCase):
-    def test_key_diagnostic_prints_only_the_public_selected_key(self):
-        with tempfile.TemporaryDirectory() as raw:
-            path = Path(raw) / "span.sock"
-            blob = key_blob(b"selected")
-            ready = threading.Event()
-
-            def serve():
-                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
-                    listener.bind(str(path))
-                    listener.listen()
-                    ready.set()
-                    connection, _address = listener.accept()
-                    with connection:
-                        self.assertEqual(P.read_packet(connection), bytes([P.SSH2_AGENTC_REQUEST_IDENTITIES]))
-                        response = (bytes([P.SSH2_AGENT_IDENTITIES_ANSWER]) + P.pack_u32(1)
-                                    + P.pack_string(blob) + P.pack_string(b"selected"))
-                        P.write_packet(connection, response)
-
-            thread = threading.Thread(target=serve, daemon=True)
-            thread.start()
-            self.assertTrue(ready.wait(2))
-            self.assertEqual(C.selected_key(str(path)), public_line(blob, "selected"))
-            thread.join(2)
-
-    def test_client_has_one_diagnostic_command(self):
-        with mock.patch.object(C.sys, "argv", ["ssh-agent-span"]), \
-             contextlib.redirect_stderr(io.StringIO()) as error:
-            self.assertEqual(C.main(), 2)
-        self.assertIn("usage: ssh-agent-span key", error.getvalue())
+class FileContractTests(unittest.TestCase):
+    def test_world_is_executable_and_tombstones_are_inert(self):
+        world = ROOT / "spans" / "ssh-agent" / "world"
+        self.assertTrue(world.stat().st_mode & 0o100)
+        self.assertLess(world.stat().st_size, 64 * 1024 * 1024)
+        for name in ("provider", "client"):
+            path = ROOT / "spans" / "ssh-agent" / name
+            self.assertTrue(path.is_file())
+            self.assertFalse(path.stat().st_mode & 0o111)
 
 
 if __name__ == "__main__":
