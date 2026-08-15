@@ -90,7 +90,8 @@ def safe_executable(name: str) -> str:
 
 class Herdr:
     def __init__(self, path: Path):
-        self.path = path
+        # Python 3.9 on macOS does not accept PathLike Unix-socket addresses.
+        self.path = os.fspath(path)
         self.sequence = 0
         self.lock = threading.Lock()
 

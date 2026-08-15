@@ -68,6 +68,9 @@ def provider() -> H.Provider:
 
 
 class ProviderTests(unittest.TestCase):
+    def test_herdr_socket_address_is_compatible_with_host_python_39(self):
+        self.assertEqual(H.Herdr(Path("/host/herdr.sock")).path, "/host/herdr.sock")
+
     def test_upstream_validation_is_lazy_retryable_and_nonfatal(self):
         environment = {
             "DEVC2_ISLAND_ID": "island-one",
