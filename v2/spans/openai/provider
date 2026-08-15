@@ -205,6 +205,20 @@ def remove_named_container(name: str) -> bool:
     return False
 
 
+def cleanup_stale_roots(prefix: str) -> None:
+    temporary = Path(tempfile.gettempdir()).resolve()
+    for candidate in temporary.glob(prefix + "*"):
+        try:
+            metadata = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        if (candidate.parent.resolve() != temporary or stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid()
+                or metadata.st_mode & 0o077):
+            raise ProviderError("stale OpenAI credential directory is unsafe")
+        shutil.rmtree(candidate)
+
+
 def proxy_config() -> dict:
     def secret(filename: str, placeholder: str, header: str) -> dict:
         return {
@@ -285,6 +299,7 @@ class ProxyManager:
         for identifier in identifiers:
             if not remove_container(identifier):
                 raise ProviderError("stale credential proxy cleanup failed")
+        cleanup_stale_roots("devc2-openai-" + tag + "-")
 
     def _running(self, proxy: Proxy) -> bool:
         result = run_docker(["inspect", "--format", "{{.State.Running}}", proxy.container], 15)
@@ -303,13 +318,13 @@ class ProxyManager:
             return candidate
 
     def _start(self) -> Proxy:
-        root = Path(tempfile.mkdtemp(prefix="devc2-openai-"))
+        tag = self.workspace_tag()
+        self._remove_stale(tag)
+        root = Path(tempfile.mkdtemp(prefix="devc2-openai-" + tag + "-"))
         os.chmod(str(root), 0o700)
         container_id = None
         proxy_name = None
         try:
-            tag = self.workspace_tag()
-            self._remove_stale(tag)
             access, account = read_auth()
             ca_name = "devc2-openai-ca-" + uuid.uuid4().hex
             try:

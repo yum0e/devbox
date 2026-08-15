@@ -1,8 +1,8 @@
-# devbox v2 (experimental)
+# devbox v2
 
-A hardened development Island for macOS and Docker Desktop. The base Island is
-deliberately unaware of host tools such as Herdr. Host capabilities can be
-projected explicitly as experimental **Spans**.
+A hardened development Island for macOS and Docker Desktop. The Island contains
+development tools, not host authority. Credentials, signing, orchestration, and
+other host capabilities arrive only through explicitly granted **Spans**.
 It is installed as `devc2` and deliberately coexists with v1: it does not modify
 v1 files, resources, volumes, or a target repository's `.devcontainer/`.
 
@@ -11,101 +11,111 @@ v1 files, resources, volumes, or a target repository's `.devcontainer/`.
 The selected host checkout is mounted read/write and outbound network access is
 unrestricted. Treat everything readable in the checkout as visible to the agent.
 The runtime is non-root, drops Linux capabilities, sets `no-new-privileges`, and
-has limits of 16 GiB memory, 8 CPUs, and 4096 PIDs; credential sidecars have separate small limits. The Docker socket is never mounted.
+has limits of 16 GiB memory, 8 CPUs, and 4096 PIDs. The Docker socket, host home,
+raw OAuth credentials, raw SSH-agent socket, and Span transport keys are never
+mounted into the Island.
 
-ChatGPT/Codex and GitHub OAuth bearer credentials are held only by the sibling
-credential proxy. The devbox sees placeholders; matching requests receive real
-headers only at their exact upstream. A trusted host-side filter connects to the
-ambient 1Password agent and relays requests over an ephemeral, mutually authenticated
-TLS channel to a second container-side filter. The raw 1Password socket never enters
-Docker. The per-launch client certificate and key are mounted only into the SSH
-sidecar, never the devbox. This prevents trivial raw
-credential extraction, but a compromised agent can exercise the full authority of
-those credentials and can export data fetched with them.
+The first-party OpenAI and GitHub providers retain bearer credentials on the
+host and inject them only into narrowly allowed HTTPS requests. Their clients
+create child-scoped fake authentication and proxy state, then remove it. The
+SSH-agent provider accepts only identity queries and signing requests for one
+host-selected public key; every other agent operation and key is rejected before
+reaching the host agent. These boundaries prevent credential extraction, not
+credential use: any process in an Island granted a Span can exercise that Span's
+authority and export the resulting data. Grant only the capabilities a checkout
+needs.
 
 ## Interface
 
 ```sh
 ./v2/install.sh
 
-devc2 auth        # one-time ChatGPT + GitHub browser/device login
+devc2 auth               # one-time OpenAI + GitHub login and SSH key selection
 devc2 doctor             # fast host prerequisites
 devc2 doctor --runtime   # disposable live Docker/credential/signing checks
 devc2 update             # atomically update from the install source
 devc2 rollback           # atomically return to the retained previous runtime
 devc2 run /path/to/repository
+devc2 run /path/to/repository --span openai --span github --span ssh-agent
 devc2 run /path/to/repository --span herdr
 devc2 /path/to/repository       # retained shorthand, with no Spans
 devc2 reset /path/to/repository
 devc2 reset /path/to/repository --yes
 ```
 
-`devc2 run /path/to/repository` grants no Spans and opens a shell after
-credential and signing readiness checks pass. `--span herdr` is an explicit
-grant: it resolves `herdr` from the host-owned Span catalog, projects only its
-configured client, and starts its configured provider scoped to that one
-Island. Granting a Span does not automatically invoke its client. Inside the
+`devc2 run /path/to/repository` grants no Spans and opens a credential-free
+shell. `--span herdr` is an explicit grant: it resolves `herdr` from the
+host-owned catalog, starts its configured World scoped to that one Island, and
+projects devc2's single generic command shim under the exported name. Granting
+a Span does not automatically invoke the command. Inside the
 Island, the projected command and its private endpoint are `/run/devc2/bin/herdr` and
 `/run/devc2/spans/herdr.sock`.
 
 `reset` removes only that checkout's v2 Compose resources and state. It never
 removes the checkout or v1 resources.
 
+The first-party `openai`, `github`, and `ssh-agent` Spans ship with devc2 but are
+still inert until named. `tact` automatically runs authenticated operations
+through `openai`; local commands such as `tact config` and `tact --version` need
+no grant. `github run -- gh …` scopes GitHub authentication to one child command.
+GitHub repository transport is deliberately SSH-only in this iteration and
+composes with `ssh-agent`; the GitHub Span does not grant a second Git HTTPS
+credential path. When `ssh-agent` is present, the Island configures Git and
+Jujutsu signing with its single exposed identity.
+
 ### Runtime diagnostics
 
 `devc2 doctor --runtime` creates a disposable temporary checkout and validates
-the real Docker Desktop path: both credential-proxy routes, the exact filtered
-SSH identity, GitHub SSH, signed-commit verification, writable Tact config, and
-the pinned Tact binary, plus the absence of ungranted Herdr. It may trigger a
-1Password approval and
-makes authenticated read-only requests to GitHub and the ChatGPT model catalog.
+the real Docker Desktop path through all three first-party Spans: OpenAI
+transport, GitHub API authentication, the exact filtered SSH identity, signing,
+writable Tact config, and the pinned Tact binary. It may trigger a 1Password
+approval and makes authenticated read-only requests.
 It never mounts a real checkout and removes its project volumes during teardown.
 
 The image installs a trusted `tact` wrapper ahead of the persistent home PATH.
-The wrapper restores the selected-key proxy socket before executing the pinned
-upstream Tact binary, without modifying shell startup files.
+It delegates authenticated runs to the projected OpenAI client without modifying
+shell startup files or retaining authentication state.
 
-## Experimental Span contract
+## Span contract
 
 Installing a provider is not a grant. `devc2` launches no provider or Span
 transport unless its name appears in `--span`.
 An Island may grant at most 16 Spans; the transport rejects excess concurrent
 connections instead of creating unbounded threads.
 
-A Span is made available in the host-owned catalog at
+The three first-party Spans are immutable release assets outside the Island
+image and cannot be shadowed by configuration. Additional Spans are made
+available in the host-owned catalog at
 `~/.config/devc2/spans.json` (or `$XDG_CONFIG_HOME/devc2/spans.json`):
 
 ```json
 {
   "spans": {
-    "herdr": {
-      "provider": "/absolute/host/path/to/herdr-provider",
-      "client": "/absolute/host/path/to/herdr-client-linux"
-    }
+    "herdr": "/absolute/host/path/to/herdr-world"
   }
 }
 ```
 
 The catalog must be a regular file owned by the current host user and must not
-be group- or world-writable. Entries contain exactly absolute `provider` and
-`client` paths; there are no shell command strings or provider-reported fields.
-Both paths must resolve outside the mounted workspace to root/current-user-owned
-executables that are not group/world-writable or hard-linked. Each executable
-must be a self-contained file of at most 64 MiB. `devc2` opens and validates both
-without running them, snapshots their exact bytes for that launch, and mounts
-the client snapshot read-only as
-`/run/devc2/bin/<name>`; it never becomes a release asset or part of the base
-image.
+be group- or world-writable. A World entry is only its absolute executable path;
+there are no projection declarations, shell strings, schemas, or World-reported
+fields. The World must live outside the mounted workspace and be
+a root/current-user-owned executable that is not group/world-writable or
+hard-linked. `devc2` snapshots its exact bytes without running it and projects
+its own generic shim read-only as `/run/devc2/bin/<name>`. The World supplies no
+client artifact. The host resolves the granted name to this World and supplies
+the generic Link shim. Legacy exact `provider`/`client` entries remain temporarily
+accepted while OpenAI and the other working Spans migrate one at a time.
 
-The provider is executed directly with no devc2-defined arguments.
+The World (or a legacy provider) is executed directly with no devc2-defined arguments.
 `DEVC2_SPAN_SOCKET_FD` names an inherited listening socket.
 `DEVC2_ISLAND_ID` is unique to the launch and `DEVC2_WORKSPACE` is the canonical
-host checkout path. The provider accepts one connection for each client stream.
+host checkout path. It accepts one connection for each projected stream.
 The launcher and its small bridge copy bytes without interpreting or framing
 them. Tool methods, schemas, authorization, PTYs, process execution, prompts,
-and every other semantic decision belong to the provider.
+and every other semantic decision belong to the World.
 
-Provider startup is structural, not a semantic health check: devc2 verifies that
+World/provider startup is structural, not a semantic health check: devc2 verifies that
 the configured executable starts and does not exit immediately, but it does not
 ask whether Herdr, Slack, or another provider-specific upstream is ready. Clients
 surface those failures normally and providers may retry or recover without a new
@@ -126,24 +136,17 @@ execute commands or read arbitrary host files. Use it to validate installation
 versus grant, client projection, transport, and lifecycle before integrating a
 real capability.
 
-`examples/herdr-span/` is the first real capability experiment. When devc2 is
+`examples/herdr-span/` is the first production-oriented command-Link experiment. When devc2 is
 launched from a host Herdr pane, it can create host-visible panes whose fixed
-worker shim executes argv only inside that same Island. Its five-command client,
-security boundary, manual proof, and intentionally omitted features are
-documented in the example README. It is likewise not part of the Island image or
-devc2 release assets.
-
-`examples/openai-span/` experiments with moving authenticated ChatGPT/Codex
-transport out of the Island bootstrap. Its child-scoped `openai run -- …`
-client receives only a public CA and fake auth; a host provider retains the real
-credential and permits only the exact Codex host, paths, and methods. The
-existing built-in credential path remains in place until this additive example
-passes its live proof.
+worker shim executes argv only inside that same Island. Its World owns the five
+command semantics while devc2 projects the same generic executable it would use
+for any command affordance. Its security boundary, manual proof, and
+intentionally omitted features are documented in the example README.
 
 The catalog/no-argument contract replaces the earlier experimental
 `<name>-span describe|serve` prototype. Re-run the probe installer after updating.
-Other prototype providers should install immutable provider/client files outside
-the workspace and register them in `spans.json`; a legacy provider that requires
+Other command Worlds should install one immutable executable outside the
+workspace and register it in `spans.json`; a legacy provider that requires
 `serve` needs a tiny external wrapper that executes it with that argument. There
 is no automatic PATH migration because availability is now intentionally an
 explicit host configuration decision.
@@ -233,8 +236,8 @@ per-checkout even when `[memory] enabled = true` is set in the shared file.
 ## Requirements
 
 - macOS with Docker Desktop, Docker Compose v2, Python 3, and `/usr/bin/openssl`
-- ChatGPT subscription and GitHub account (configured by `devc2 auth`)
-- 1Password SSH agent enabled, with `SSH_AUTH_SOCK` available to the launcher
+- ChatGPT subscription and GitHub account for their respective optional Spans
+- An SSH agent, such as 1Password, for the optional SSH-agent Span
 
 Tact remains the only bundled coding agent. Herdr is intentionally not bundled.
 
@@ -249,5 +252,5 @@ not installed because v2 remains Tact-only.
 No terminal multiplexer is bundled; tmux remains intentionally absent. Herdr
 must arrive through an explicitly granted Span.
 
-This is an experimental v2. Pi, Prime Agent, Claude, Git LFS, and cross-repository
-private submodules are outside the initial scope.
+Pi, Prime Agent, Claude, Git LFS, and cross-repository private submodules are
+outside the initial scope.

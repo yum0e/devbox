@@ -79,23 +79,18 @@ RUN set -eux; \
     jj --version
 
 COPY devbox/entrypoint.sh /usr/local/bin/devc2-entrypoint
+COPY devbox/github-known-hosts /etc/ssh/ssh_known_hosts
 RUN chmod 0755 /usr/local/bin/devc2-entrypoint /usr/local/bin/tact /usr/local/libexec/devc2/tact-upstream \
  && groupadd --gid 1000 devbox \
  && useradd --uid 1000 --gid devbox --create-home --shell /bin/zsh devbox \
  && mkdir -p /workspace /home/devbox/.cache /home/devbox/.local/share/tact \
-      /run/devc2-public /run/devc2-ssh /run/devc2/spans \
+      /run/devc2-public /run/devc2/spans \
  && chown -R devbox:devbox /workspace /home/devbox \
  && chmod 0777 /home/devbox
 
 ENV HOME=/home/devbox \
     TACT_HOME=/home/devbox/.local/share/tact \
     TACT_WORKSPACE=/workspace \
-    TACT_AUTH=chatgpt \
-    TACT_AUTH_FILE=/run/devc2-public/auth.json \
-    CODEX_HOME=/run/devc2-public/codex \
-    GH_TOKEN=devc2-github-placeholder-token \
-    SSH_AUTH_SOCK=/run/devc2-ssh/agent.sock \
-    TACT_PROXY_CA_FILE=/run/devc2-public/ca.crt \
     FOUNDRY_DIR=/usr/local/share/foundry \
     UV_PYTHON_INSTALL_DIR=/usr/local/share/uv/python \
     UV_PYTHON_BIN_DIR=/usr/local/bin \

@@ -8,10 +8,6 @@ sys.path.insert(0,str(Path(__file__).resolve().parent))
 import span_runtime
 
 VERSION="0.2.0"
-IRON="ironsh/iron-proxy:0.49.0@sha256:c4628019c24f4cc8d77564a26b7c9cedb00accee6f93d06270e85fb8f9c6a7da"
-GH_PLACEHOLDER="devc2-github-placeholder-token"
-FAKE_ACCOUNT="00000000-0000-0000-0000-000000000000"
-GITHUB_KNOWN_HOSTS='github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\ngithub.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=\ngithub.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=\n'
 SOURCE_ROOT=Path(__file__).resolve().parents[1]
 INSTALLED_ROOT=Path(os.environ.get("DEVC2_RUNTIME_ROOT",os.environ.get("DEVC2_SHARE_DIR",Path.home()/".local/share/devc2"))).expanduser().resolve()
 ROOT=INSTALLED_ROOT if (INSTALLED_ROOT/"compose.yaml").is_file() else SOURCE_ROOT
@@ -130,9 +126,9 @@ def source_version(source):
     return match.group(1)
 
 def validate_asset_tree(source,strict=False):
-    required=("Dockerfile","compose.yaml","devbox/entrypoint.sh","devbox/tact-wrapper.sh","launcher/devc2.py","launcher/span_runtime.py","launcher/span_supervisor.py","launcher/dispatcher.py","credential_proxy/ssh_agent_proxy.py","credential_proxy/span_bridge.py")
+    required=("Dockerfile","compose.yaml","devbox/entrypoint.sh","devbox/tact-wrapper.sh","launcher/devc2.py","launcher/span_runtime.py","launcher/span_supervisor.py","launcher/dispatcher.py","launcher/command_projection.py","credential_proxy/span_bridge.py","spans/openai/provider","spans/openai/client","spans/github/provider","spans/github/client","spans/ssh-agent/provider","spans/ssh-agent/client")
     if not source.is_dir() or source.is_symlink(): raise RuntimeError("release asset root must be a directory")
-    total=0; count=0; allowed={"Dockerfile","compose.yaml","README.md","install.sh","devbox","credential_proxy","launcher"}
+    total=0; count=0; allowed={"Dockerfile","compose.yaml","README.md","install.sh","devbox","credential_proxy","launcher","spans"}
     for path in source.rglob("*"):
         relative=path.relative_to(source)
         unexpected=not relative.parts or relative.parts[0] not in allowed or "__pycache__" in relative.parts or "tests" in relative.parts
@@ -178,7 +174,7 @@ def install_wrapper_text(data_root,bin_dir):
     return "#!/usr/bin/env bash\n"+f"export DEVC2_DATA_DIR={shlex.quote(str(data_root))}\n"+f"export DEVC2_BIN_DIR={shlex.quote(str(bin_dir))}\n"+'exec python3 "$DEVC2_DATA_DIR/bootstrap/dispatcher.py" "$@"\n'
 
 def copy_release_assets(source,destination):
-    allowed=("Dockerfile","compose.yaml","README.md","devbox","credential_proxy","launcher")
+    allowed=("Dockerfile","compose.yaml","README.md","devbox","credential_proxy","launcher","spans")
     destination.mkdir(mode=0o700)
     for name in allowed:
         origin=source/name
@@ -189,14 +185,14 @@ def copy_release_assets(source,destination):
     for path in destination.rglob("*"):
         if path.is_dir(): path.chmod(0o755)
         elif path.is_file(): path.chmod(0o644)
-    for relative in ("launcher/devc2.py","launcher/dispatcher.py","devbox/entrypoint.sh","devbox/tact-wrapper.sh","devbox/herdr-wrapper.py","credential_proxy/ssh_agent_proxy.py"):
+    for relative in ("launcher/devc2.py","launcher/dispatcher.py","launcher/command_projection.py","devbox/entrypoint.sh","devbox/tact-wrapper.sh","devbox/herdr-wrapper.py","spans/openai/provider","spans/openai/client","spans/github/provider","spans/github/client","spans/ssh-agent/provider","spans/ssh-agent/client"):
         (destination/relative).chmod(0o755)
 
 def freeze_asset_tree(destination):
     for path in destination.rglob("*"):
         if path.is_dir(): path.chmod(0o555)
         elif path.is_file(): path.chmod(0o444)
-    for relative in ("launcher/devc2.py","launcher/dispatcher.py","devbox/entrypoint.sh","devbox/tact-wrapper.sh","devbox/herdr-wrapper.py","credential_proxy/ssh_agent_proxy.py"):
+    for relative in ("launcher/devc2.py","launcher/dispatcher.py","launcher/command_projection.py","devbox/entrypoint.sh","devbox/tact-wrapper.sh","devbox/herdr-wrapper.py","spans/openai/provider","spans/openai/client","spans/github/provider","spans/github/client","spans/ssh-agent/provider","spans/ssh-agent/client"):
         (destination/relative).chmod(0o555)
     destination.chmod(0o555)
 
@@ -226,7 +222,7 @@ def replace_symlink(link,target):
     finally: temporary.unlink(missing_ok=True)
 
 def asset_digest(source):
-    digest=hashlib.sha256(); runtime_roots={"Dockerfile","compose.yaml","README.md","devbox","credential_proxy","launcher"}
+    digest=hashlib.sha256(); runtime_roots={"Dockerfile","compose.yaml","README.md","devbox","credential_proxy","launcher","spans"}
     for path in sorted(p for p in source.rglob("*") if p.is_file()):
         relative=path.relative_to(source)
         if relative.parts[0] not in runtime_roots or "tests" in relative.parts or "__pycache__" in relative.parts: continue
@@ -521,12 +517,6 @@ def identity(repo):
     digest=hashlib.sha256(os.fsencode(repo)).hexdigest()[:16]
     return digest, f"devc2-{digest}"
 
-def jwt(claims):
-    enc=lambda x:base64.urlsafe_b64encode(json.dumps(x,separators=(",",":")).encode()).decode().rstrip("=")
-    return f"{enc({'alg':'none','typ':'JWT'})}.{enc(claims)}.signature"
-FAKE_ACCESS=jwt({'aud':['https://api.openai.com/v1','https://chatgpt.com/backend-api'],'exp':4102444800,'sub':'devc2'})
-FAKE_ID=jwt({'exp':4102444800,'https://api.openai.com/auth':{'chatgpt_account_id':FAKE_ACCOUNT,'chatgpt_plan_type':'plus'},'sub':'devc2'})
-
 def ensure_tact_config():
     TACT_CONFIG.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
@@ -654,41 +644,19 @@ def select_key(interactive=True):
     private_write(selected_path,(selected+"\n").encode()); os.chmod(selected_path,0o600)
     return selected
 
-def proxy_config():
-    def secret(file,placeholder,header,host,paths,methods):
-        return {'source':{'type':'file','path':f'/run/devc2-private/{file}'},'replace':{'proxy_value':placeholder,'match_headers':[header],'require':True},'rules':[{'host':host,'methods':methods,'paths':paths}]}
-    methods=['GET','POST','PUT','PATCH','DELETE','HEAD','OPTIONS']
-    secrets=[
-      secret('access-token',FAKE_ACCESS,'Authorization','chatgpt.com',['/backend-api/codex','/backend-api/codex/*'],['GET','POST']),
-      secret('account-id',FAKE_ACCOUNT,'chatgpt-account-id','chatgpt.com',['/backend-api/codex','/backend-api/codex/*'],['GET','POST']),
-      secret('github-token',GH_PLACEHOLDER,'Authorization','api.github.com',['/','/*'],methods),
-      secret('github-token',GH_PLACEHOLDER,'Authorization','uploads.github.com',['/','/*'],methods),
-    ]
-    return {'dns':{'enabled':False},'proxy':{'tunnel_listen':'127.0.0.1:8080','http_listen':'127.0.0.1:0','https_listen':'127.0.0.1:0'},'metrics':{'listen':'127.0.0.1:0'},'tls':{'mode':'mitm','ca_cert':'/run/devc2-private/ca.crt','ca_key':'/run/devc2-private/ca.key'},'transforms':[{'name':'secrets','config':{'secrets':secrets}}],'log':{'level':'warn'}}
-
-def fake_auth():
-    return {'OPENAI_API_KEY':None,'auth_mode':'chatgpt','tokens':{'id_token':FAKE_ID,'access_token':FAKE_ACCESS,'refresh_token':'not-a-real-refresh-token','account_id':FAKE_ACCOUNT},'last_refresh':'2025-01-01T00:00:00.000Z'}
-
-def generate_ca(private):
-    run(['docker','run','--rm','--network','none','--volume',f'{private}:/out',IRON,'generate-ca','-outdir','/out','-alg','ed25519','-name','devbox v2'],env=docker_env(),timeout=120)
-    for name in ('ca.crt','ca.key'):
-        p=private/name; s=p.lstat()
-        if stat.S_ISLNK(s.st_mode) or not stat.S_ISREG(s.st_mode): raise RuntimeError(f"proxy generated invalid {name}")
-        p.chmod(0o600)
-
 def generate_relay_pki(root):
     openssl='/usr/bin/openssl'
     if not Path(openssl).is_file() or not os.access(openssl,os.X_OK):
-        raise RuntimeError("/usr/bin/openssl is required for the SSH relay")
+        raise RuntimeError("/usr/bin/openssl is required for Span transport")
     server=root/'server'; client=root/'client'; server.mkdir(parents=True,mode=0o700); client.mkdir(mode=0o700)
     ca_config=server/'ca.cnf'; server_ext=server/'server.ext'; client_ext=server/'client.ext'
-    private_write(ca_config,"[req]\nprompt=no\ndistinguished_name=dn\nx509_extensions=v3\n[dn]\nCN=devc2 ephemeral relay CA\n[v3]\nbasicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\n")
+    private_write(ca_config,"[req]\nprompt=no\ndistinguished_name=dn\nx509_extensions=v3\n[dn]\nCN=devc2 ephemeral Span CA\n[v3]\nbasicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\n")
     private_write(server_ext,"[v3]\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:host.docker.internal\n")
     private_write(client_ext,"[v3]\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n")
     run([openssl,'req','-x509','-newkey','rsa:2048','-nodes','-sha256','-days','30','-config',str(ca_config),'-keyout',str(server/'ca.key'),'-out',str(server/'ca.crt')],timeout=60)
     for name,common_name,extensions,serial in (
         ('server','host.docker.internal',server_ext,str(secrets.randbits(128) or 1)),
-        ('client','devc2 ssh proxy',client_ext,str(secrets.randbits(128) or 1)),
+        ('client','devc2 span bridge',client_ext,str(secrets.randbits(128) or 1)),
     ):
         key=server/f'{name}.key'; csr=server/f'{name}.csr'; cert=server/f'{name}.crt'
         run([openssl,'req','-new','-newkey','rsa:2048','-nodes','-sha256','-subj',f'/CN={common_name}','-keyout',str(key),'-out',str(csr)],timeout=60)
@@ -705,71 +673,31 @@ def generate_relay_pki(root):
     for path in client.iterdir(): path.chmod(0o444)
     return server,client
 
-def compose_env(repo,private,public,relay_port=None,relay_tls_dir=None,span_client_dir=None,spans=False):
+def compose_env(repo,public,relay_tls_dir=None,span_client_dir=None,spans=False):
     digest,project=identity(repo)
-    values={'DEVC2_PROJECT_NAME':project,'DEVC2_WORKSPACE':str(repo),'DEVC2_WORKSPACE_HASH':digest,'DEVC2_PRIVATE_DIR':str(private),'DEVC2_PUBLIC_DIR':str(public),'DEVC2_INSTALL_DIR':str(ROOT),'DEVC2_IMAGE':f'devc2:{VERSION}','DEVC2_UID':str(os.getuid()),'DEVC2_GID':str(os.getgid())}
-    values['DEVC2_SSH_RELAY_PORT']=str(relay_port or 1)
-    values['DEVC2_SSH_RELAY_TLS_DIR']=str(relay_tls_dir or '/dev/null')
+    values={'DEVC2_PROJECT_NAME':project,'DEVC2_WORKSPACE':str(repo),'DEVC2_WORKSPACE_HASH':digest,'DEVC2_PUBLIC_DIR':str(public),'DEVC2_INSTALL_DIR':str(ROOT),'DEVC2_IMAGE':f'devc2:{VERSION}'}
+    values['DEVC2_SPAN_RELAY_TLS_DIR']=str(relay_tls_dir or '/dev/null')
     values['DEVC2_SPAN_CLIENT_DIR']=str(span_client_dir or public)
+    values['DEVC2_SPAN_VOLUME']=project+'-span-sockets-v2'
     if spans: values['COMPOSE_PROFILES']='spans'
     return docker_env(values)
 
-def start_host_agent_relay(port_file, tls_dir, allowed_key_file):
-    upstream=os.environ.get("SSH_AUTH_SOCK", "")
-    try: available=bool(upstream) and stat.S_ISSOCK(os.stat(upstream).st_mode)
-    except OSError: available=False
-    if not available:
-        raise RuntimeError("SSH_AUTH_SOCK is not an available Unix socket; enable the 1Password SSH agent")
-    command=[sys.executable,str(ROOT/'credential_proxy'/'ssh_agent_proxy.py'),'--relay-listen','0.0.0.0:0','--relay-port-file',str(port_file),'--upstream',upstream,'--tls-ca',str(tls_dir/'ca.crt'),'--tls-cert',str(tls_dir/'server.crt'),'--tls-key',str(tls_dir/'server.key'),'--allowed-key',str(allowed_key_file)]
-    process=subprocess.Popen(command)
-    deadline=time.monotonic()+5
-    while time.monotonic()<deadline:
-        if process.poll() is not None: raise RuntimeError("host SSH-agent relay exited before it was ready")
-        try:
-            port=int(port_file.read_text())
-            if 1 <= port <= 65535: return process,port
-        except (FileNotFoundError,ValueError): pass
-        time.sleep(.05)
-    stop_process(process)
-    raise RuntimeError("host SSH-agent relay did not become ready")
-
-def stop_process(process):
-    if process is None or process.poll() is not None: return
-    process.terminate()
-    try: process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill(); process.wait(timeout=5)
-
-def prepare(repo,temp):
-    private=temp/'private'; public=temp/'public'; private.mkdir(0o700); public.mkdir(0o700)
-    access,account=read_codex(); gh=github_token(); key=select_key(True)
-    generate_ca(private)
-    private_write(private/'access-token',access); private_write(private/'account-id',account); private_write(private/'github-token',gh)
-    private_write(private/'proxy.yaml',json.dumps(proxy_config(),separators=(',',':')))
-    shutil.copyfile(private/'ca.crt',public/'ca.crt'); (public/'ca.crt').chmod(0o644)
-    (public/'auth.json').write_text(json.dumps(fake_auth(),separators=(',',':'))); (public/'auth.json').chmod(0o644)
-    (public/'codex').mkdir(); shutil.copyfile(public/'auth.json',public/'codex'/'auth.json'); (public/'codex'/'auth.json').chmod(0o644)
+def prepare(temp):
+    public=temp/'public'; public.mkdir(0o700)
     shutil.copyfile(TACT_CONFIG, public / 'tact-config.toml')
     (public / 'tact-config.toml').chmod(0o644)
-    (public/'ssh-allowed.pub').write_text(key+'\n'); (public/'ssh-allowed.pub').chmod(0o644)
-    key_fields=key.split()
-    (public/'allowed_signers').write_text(f'* namespaces="git" {key_fields[0]} {key_fields[1]}\n')
-    (public/'allowed_signers').chmod(0o644)
-    (public/'known_hosts').write_text(GITHUB_KNOWN_HOSTS); (public/'known_hosts').chmod(0o644)
-    gh_config = public / 'gh'
-    gh_config.mkdir()
-    (gh_config / 'hosts.yml').write_text(
-        'github.com:\n'
-        '  git_protocol: ssh\n'
-        f'  oauth_token: {GH_PLACEHOLDER}\n'
-        '  user: devc2\n'
-    )
-    (gh_config / 'hosts.yml').chmod(0o644)
-    return private,public
+    return public
 
 def compose(repo,env,*args,capture=False,check=True):
     cmd=['docker','compose','--project-name',identity(repo)[1],'-f',str(ROOT/'compose.yaml'),*args]
     return run(cmd,env=env,capture=capture,check=check,timeout=1800)
+
+def remove_span_volume(name):
+    if not isinstance(name,str) or not name.startswith("devc2-") or not name.endswith("-span-sockets-v2"):
+        raise RuntimeError("invalid Span socket volume identity")
+    run(["docker","volume","rm",name],check=False,timeout=30)
+    if run(["docker","volume","inspect",name],check=False,timeout=15).returncode==0:
+        raise RuntimeError("could not remove the previous Span socket volume")
 
 def ensure_v1_not_running(repo):
     result = run(["docker", "ps", "--filter", f"label=devcontainer.local_folder={repo}", "--format", "{{.ID}}"], timeout=15)
@@ -786,18 +714,19 @@ def _start_unlocked(repo, runtime_doctor=False, span_names=()):
         with tempfile.TemporaryDirectory(prefix='devc2-') as raw:
             temp=Path(raw); temp.chmod(0o700)
             span_clients=temp/'span-clients'; span_providers=temp/'span-providers'
-            granted_spans=span_runtime.load_catalog(SPAN_CATALOG,span_names,repo,span_clients,span_providers)
+            granted_spans=span_runtime.load_catalog(SPAN_CATALOG,span_names,repo,span_clients,span_providers,ROOT/'spans',ROOT/'launcher'/'command_projection.py')
             empty=temp/'empty'; empty.mkdir(0o700)
             # A killed launcher may have left sidecars behind. Stop the old
             # project before projecting this launch's explicit grant set.
-            cleanup_env=compose_env(repo,empty,empty,span_client_dir=empty,spans=True)
+            cleanup_env=compose_env(repo,empty,span_client_dir=empty,spans=True)
             compose(repo,cleanup_env,'down','--remove-orphans',check=False)
-            private,public=prepare(repo,temp)
-            relay_server_dir,relay_client_dir=generate_relay_pki(temp/'ssh-relay-pki')
-            host_agent_relay,relay_port=start_host_agent_relay(temp/'ssh-relay-port',relay_server_dir,public/'ssh-allowed.pub')
+            remove_span_volume(cleanup_env['DEVC2_SPAN_VOLUME'])
+            public=prepare(temp)
+            relay_server_dir=relay_client_dir=None
             spans=None
             try:
                 if granted_spans:
+                    relay_server_dir,relay_client_dir=generate_relay_pki(temp/'span-relay-pki')
                     spans=span_runtime.SpanRuntime(granted_spans,repo,f'{digest}-{secrets.token_hex(8)}',relay_server_dir)
                 if granted_spans:
                     (public/'span-ready').write_text(secrets.token_hex(16))
@@ -806,10 +735,9 @@ def _start_unlocked(repo, runtime_doctor=False, span_names=()):
                         {'name':item.name,'port':spans.ports[item.name]} for item in granted_spans
                     ],separators=(',',':')))
                     (public/'spans.json').chmod(0o444)
-                env=compose_env(repo,private,public,relay_port,relay_client_dir,span_clients,bool(granted_spans))
+                env=compose_env(repo,public,relay_client_dir,span_clients,bool(granted_spans))
             except Exception:
                 if spans is not None: spans.stop()
-                stop_process(host_agent_relay)
                 raise
             stopping = False
             previous = {}
@@ -820,16 +748,13 @@ def _start_unlocked(repo, runtime_doctor=False, span_names=()):
             for signum in (signal.SIGINT, signal.SIGTERM):
                 previous[signum] = signal.signal(signum, terminate)
             try:
-                build_services=['devbox','ssh-proxy']
+                build_services=['devbox']
                 if granted_spans: build_services.append('span-proxy')
                 compose(repo,env,'build',*build_services)
                 try:
-                    services=['credential-proxy','ssh-proxy']
-                    if granted_spans: services.append('span-proxy')
-                    compose(repo,env,'up','-d',*services)
+                    if granted_spans: compose(repo,env,'up','-d','span-proxy')
                 except RuntimeError:
                     print("devc2: sanitized startup diagnostics:",file=sys.stderr)
-                    compose(repo,env,'logs','--no-color','--tail','100','ssh-proxy',capture=False,check=False)
                     if granted_spans: compose(repo,env,'logs','--no-color','--tail','100','span-proxy',capture=False,check=False)
                     raise
                 command=['docker','compose','--project-name',identity(repo)[1],'-f',str(ROOT/'compose.yaml'),'run','--rm','--no-deps']
@@ -837,8 +762,7 @@ def _start_unlocked(repo, runtime_doctor=False, span_names=()):
                 command.append('devbox')
                 result=subprocess.run(command,env=env).returncode
                 if result:
-                    print("devc2: sanitized SSH proxy diagnostics:",file=sys.stderr)
-                    compose(repo,env,'logs','--no-color','--tail','100','ssh-proxy',capture=False,check=False)
+                    print("devc2: sanitized Span diagnostics:",file=sys.stderr)
                     if granted_spans: compose(repo,env,'logs','--no-color','--tail','100','span-proxy',capture=False,check=False)
                 return result
             except KeyboardInterrupt:
@@ -846,14 +770,14 @@ def _start_unlocked(repo, runtime_doctor=False, span_names=()):
             finally:
                 for signum, handler in previous.items():
                     signal.signal(signum, handler)
-                stop_process(host_agent_relay)
                 if spans is not None: spans.stop()
                 try:
                     down_args=['down','--remove-orphans']
                     if runtime_doctor: down_args.append('--volumes')
                     compose(repo,env,*down_args,check=False)
                 finally:
-                    pass
+                    try: remove_span_volume(env['DEVC2_SPAN_VOLUME'])
+                    except RuntimeError as error: print(f"devc2: warning: {error}",file=sys.stderr)
 
 def start(repo,runtime_doctor=False,span_names=()):
     with lifecycle_lock(False):
@@ -867,7 +791,7 @@ def _reset_unlocked(repo,yes):
     digest,project=identity(repo)
     with repository_lock(repo):
         dummy=STATE/'reset'; dummy.mkdir(parents=True,exist_ok=True)
-        env=compose_env(repo,dummy,dummy)
+        env=compose_env(repo,dummy)
         compose(repo,env,'down','--volumes','--remove-orphans',check=False)
         # Permanent lock inodes are intentionally retained to prevent reset/start races.
     print(f"reset {project}"); return 0
@@ -888,6 +812,7 @@ def authenticate():
 
     codex_ready = False
     github_ready = False
+    ssh_ready = False
     try:
         read_codex()
         codex_ready = True
@@ -898,9 +823,14 @@ def authenticate():
         github_ready = True
     except RuntimeError:
         pass
+    try:
+        select_key(False)
+        ssh_ready = True
+    except RuntimeError:
+        pass
 
-    if codex_ready and github_ready:
-        print("ChatGPT and GitHub authentication are already configured.")
+    if codex_ready and github_ready and ssh_ready:
+        print("OpenAI, GitHub, and SSH Span authentication are already configured.")
         return 0
 
     print("Preparing the pinned authentication image…")
@@ -931,13 +861,19 @@ def authenticate():
             "--volume", f"{gh_home}:/run/devc2-gh",
             "--entrypoint", "gh", AUTH_IMAGE,
             "auth", "login", "--hostname", "github.com",
-            "--git-protocol", "https", "--web",
+            "--git-protocol", "ssh", "--web",
         ], capture=False, timeout=900)
         validate_github_token()
     else:
         print("GitHub authentication is already configured; skipping.")
 
-    print("Authentication saved outside all workspaces.")
+    if not ssh_ready:
+        print("Selecting the SSH identity exposed by the SSH-agent Span…")
+        select_key(True)
+    else:
+        print("SSH identity is already configured; skipping.")
+
+    print("Span authentication saved outside all workspaces.")
     return 0
 
 def doctor(runtime=False):
@@ -961,7 +897,7 @@ def doctor(runtime=False):
     print("Running disposable end-to-end runtime checks…")
     with tempfile.TemporaryDirectory(prefix='devc2-doctor-repo-') as raw:
         repo=Path(raw); (repo/'.git').mkdir(); project=identity(repo)[1]
-        result=_start_unlocked(repo,runtime_doctor=True)
+        result=_start_unlocked(repo,runtime_doctor=True,span_names=("openai","github","ssh-agent"))
         leftovers=[]
         resource_commands={
             'containers':['docker','container','ls','-aq'],

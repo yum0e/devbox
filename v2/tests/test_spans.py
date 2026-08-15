@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import base64
 import json
 import contextlib
 import os
 import socket
 import ssl
 import stat
+import struct
 import subprocess
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -18,6 +21,10 @@ from unittest import mock
 from credential_proxy import span_bridge
 from launcher import devc2
 from launcher import span_runtime
+
+
+V2_ROOT = Path(__file__).parents[1]
+COMMAND_PROJECTION = V2_ROOT / "launcher" / "command_projection.py"
 
 
 class SpanCatalogTests(unittest.TestCase):
@@ -120,6 +127,75 @@ class SpanCatalogTests(unittest.TestCase):
             for name in ("../echo", "Echo", "echo/span", "-echo", "echo-"):
                 with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, "invalid Span name"):
                     self.load(catalog,(name,))
+
+    def test_builtin_span_needs_no_external_catalog_and_cannot_be_shadowed(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root=Path(raw); builtin=root/"builtins"/"openai"; builtin.mkdir(parents=True)
+            provider,client=self.files(builtin)
+            destination=root/"snapshot"; destination.mkdir()
+            spans=span_runtime.load_catalog(root/"missing.json",("openai",),root/"workspace",destination/"clients",destination/"providers",root/"builtins")
+            self.assertEqual([(item.name,item.provider.read_bytes(),item.client.read_bytes()) for item in spans],[('openai',provider.read_bytes(),client.read_bytes())])
+
+    def test_command_link_snapshots_one_world_and_the_generic_projection(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root=Path(raw); world=root/"herdr-world"
+            world.write_text("#!/bin/sh\nexit 0\n"); world.chmod(0o755)
+            catalog=self.catalog(root,{"herdr":str(world)})
+            destination=root/"snapshot"; destination.mkdir()
+            item=span_runtime.load_catalog(
+                catalog,("herdr",),root/"workspace",destination/"clients",destination/"worlds",
+                command_projection=COMMAND_PROJECTION,
+            )[0]
+            self.assertEqual(item.provider.read_bytes(),world.read_bytes())
+            self.assertEqual(item.client.read_bytes(),COMMAND_PROJECTION.read_bytes())
+            self.assertEqual(item.client.name,"herdr")
+            self.assertNotIn(b"herdr",COMMAND_PROJECTION.read_bytes().lower())
+
+    def test_structured_world_entry_fails_closed(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root=Path(raw); world=root/"world"
+            world.write_text("#!/bin/sh\n"); world.chmod(0o755)
+            catalog=self.catalog(root,{"x":{"world":str(world)}})
+            with self.assertRaisesRegex(RuntimeError,"invalid catalog entry"):
+                self.load(catalog,("x",))
+
+
+class CommandProjectionTests(unittest.TestCase):
+    def test_generic_projection_preserves_argv_stdin_outputs_and_status(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root=Path(raw); socket_dir=root/"sockets"; socket_dir.mkdir()
+            projected=root/"herdr"; projected.symlink_to(COMMAND_PROJECTION)
+            server=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+            server.bind(str(socket_dir/"herdr.sock")); server.listen()
+            observed={}
+
+            def serve():
+                connection,_=server.accept()
+                with connection:
+                    size=struct.unpack("!I",connection.recv(4))[0]
+                    payload=bytearray()
+                    while len(payload)<size: payload.extend(connection.recv(size-len(payload)))
+                    observed.update(json.loads(payload))
+                    response=json.dumps({
+                        "ok":True,
+                        "stdout_b64":base64.b64encode(b"output\n").decode(),
+                        "stderr_b64":base64.b64encode(b"warning\n").decode(),
+                        "exit_code":23,
+                    },separators=(",",":")).encode()
+                    connection.sendall(struct.pack("!I",len(response))+response)
+
+            thread=threading.Thread(target=serve,daemon=True); thread.start()
+            try:
+                completed=subprocess.run(
+                    [str(projected),"wait","worker"],input=b"input",capture_output=True,
+                    env={**os.environ,"DEVC2_COMMAND_SOCKET_DIR":str(socket_dir)},check=False,
+                )
+            finally:
+                thread.join(timeout=2); server.close()
+            self.assertEqual(completed.returncode,23,completed.stderr)
+            self.assertEqual(completed.stdout,b"output\n")
+            self.assertEqual(completed.stderr,b"warning\n")
+            self.assertEqual(observed,{"v":1,"command":"herdr","argv":["wait","worker"],"stdin_b64":"aW5wdXQ="})
 
 
 class ProviderLifecycleTests(unittest.TestCase):
@@ -342,7 +418,7 @@ class BridgeConfigTests(unittest.TestCase):
 
     def test_compose_keeps_transport_credentials_outside_the_island(self):
         compose = (Path(__file__).parents[1] / "compose.yaml").read_text()
-        island = compose.split("  devbox:\n", 1)[1].split("\n  credential-proxy:\n", 1)[0]
+        island = compose.split("  devbox:\n", 1)[1].split("\n  span-proxy:\n", 1)[0]
         bridge = compose.split("  span-proxy:\n", 1)[1].split("\nvolumes:\n", 1)[0]
         self.assertIn("target: /run/devc2/bin", island)
         self.assertIn("target: /run/devc2/spans", island)
@@ -355,14 +431,11 @@ class BridgeConfigTests(unittest.TestCase):
 
 class LauncherGrantTests(unittest.TestCase):
     def run_launcher(self, root: Path, names: tuple[str, ...]):
-        private, public = root / "private", root / "public"
-        private.mkdir()
+        public = root / "public"
         public.mkdir()
         relay_server, relay_client = root / "relay-server", root / "relay-client"
         relay_server.mkdir()
         relay_client.mkdir()
-        process = mock.Mock()
-        process.poll.return_value = 0
         calls = []
         runtime = mock.Mock(ports={"herdr": 49153})
         client = root / "herdr-client"
@@ -374,10 +447,9 @@ class LauncherGrantTests(unittest.TestCase):
              mock.patch.object(devc2, "ensure_v1_not_running"), \
              mock.patch.object(devc2, "ensure_tact_config"), \
              mock.patch.object(devc2, "repository_lock", return_value=contextlib.nullcontext()), \
-             mock.patch.object(devc2, "prepare", return_value=(private, public)), \
+             mock.patch.object(devc2, "prepare", return_value=public), \
              mock.patch.object(devc2, "generate_relay_pki", return_value=(relay_server, relay_client)), \
-             mock.patch.object(devc2, "start_host_agent_relay", return_value=(process, 49152)), \
-             mock.patch.object(devc2, "stop_process"), \
+             mock.patch.object(devc2, "remove_span_volume"), \
              mock.patch.object(devc2, "compose", side_effect=lambda *args, **kwargs: calls.append(args)), \
              mock.patch.object(devc2.subprocess, "run", return_value=completed), \
              mock.patch.object(devc2.span_runtime, "load_catalog", return_value=[span] if names else []) as load_catalog, \
@@ -392,6 +464,7 @@ class LauncherGrantTests(unittest.TestCase):
             args=load_catalog.call_args.args
             self.assertEqual(args[:3],(devc2.SPAN_CATALOG,(),Path(raw)))
             self.assertEqual((args[3].name,args[4].name),("span-clients","span-providers"))
+            self.assertEqual(args[5],devc2.ROOT/"spans")
             start_runtime.assert_not_called()
             runtime.stop.assert_not_called()
             self.assertFalse((public / "spans.json").exists())
@@ -405,6 +478,7 @@ class LauncherGrantTests(unittest.TestCase):
             args=load_catalog.call_args.args
             self.assertEqual(args[:3],(devc2.SPAN_CATALOG,("herdr",),Path(raw)))
             self.assertEqual((args[3].name,args[4].name),("span-clients","span-providers"))
+            self.assertEqual(args[5],devc2.ROOT/"spans")
             start_runtime.assert_called_once()
             runtime.stop.assert_called_once()
             self.assertEqual(json.loads((public / "spans.json").read_text()), [{"name": "herdr", "port": 49153}])

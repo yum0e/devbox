@@ -1,6 +1,6 @@
 # Herdr Span
 
-This experimental Span lets one Island create host-visible Herdr panes without
+This command-Link experiment lets one Island create host-visible Herdr panes without
 giving the Island Herdr's host socket or Docker. Every spawned command still
 runs inside the same Island.
 
@@ -30,11 +30,11 @@ runs inside the same Island.
        │  no Docker socket · no host Herdr socket       │
        └────────────────────────────────────────────────┘
 
- grant: provider + client + opaque byte stream
+ grant: Herdr World + generic command projection + opaque byte stream
  deny:  host command · host pane ID · Docker option · host socket
 ```
 
-The pattern is intentionally small: the provider performs five fixed operations
+The pattern is intentionally small: the World performs five fixed operations
 and Herdr remains unaware of Spans or Islands. As in a narrow control-plane
 agent, adding more orchestration later should be a loop over these primitives,
 not a reason to widen the boundary.
@@ -48,7 +48,7 @@ Herdr must already be running on the host. From a host Herdr pane:
 devc2 run . --span herdr
 ```
 
-The provider starts independently of Herdr's current health. Each client call
+The World starts independently of Herdr's current health. Each projected command
 checks the pane inherited from the host launch, reports a bounded error if
 Herdr is unavailable, and retries that check on the next call. Calls are
 rejected if `devc2` was not launched from a Herdr-managed pane.
@@ -78,12 +78,21 @@ Enter to a still-running worker:
 printf 'continue with the tests' | herdr send reviewer
 ```
 
-The client never accepts a Herdr pane ID, container ID, cwd, environment, Docker
-option, or host command. The provider targets only the pane inherited from the
+The projected command never accepts a Herdr pane ID, container ID, cwd, environment, Docker
+option, or host command. The World targets only the pane inherited from the
 host launch, remembers only panes it created, and rechecks each pane's terminal
 identity before using it. The host shell `exec`s the trusted worker, so there is
 no host prompt underneath it; a completed worker stays parked for inspection.
-Provider teardown makes bounded best-effort attempts to close its panes.
+World teardown makes bounded best-effort attempts to close its panes.
+`herdr read` returns only content between private worker boundaries; it does not
+expose the host bootstrap command, executable path, container identity, payload,
+or completion marker.
+
+The Herdr installation and catalog contribute only the World executable path.
+The host resolves the granted name and supplies one generic Link shim, which
+derives `herdr` from `argv[0]` and transports only
+bounded argv, optional stdin, stdout, stderr, and an exit status. The protocol
+has no arbitrary executable, shell string, cwd, environment, PTY, or signal API.
 
 This first version intentionally has no Island discovery, peer communication,
 raw terminal keys, arbitrary Herdr methods, persistence, or recovery protocol.

@@ -1,10 +1,14 @@
 from __future__ import annotations
-import contextlib, importlib.util, io, os, stat, subprocess, sys, tempfile, unittest
+import base64, contextlib, importlib.util, io, json, os, re, stat, subprocess, sys, tempfile, unittest
 from pathlib import Path
 from unittest import mock
 
 PATH=Path(__file__).parents[1]/"launcher"/"devc2.py"
 spec=importlib.util.spec_from_file_location("devc2",PATH); D=importlib.util.module_from_spec(spec); spec.loader.exec_module(D)
+
+def jwt(payload):
+    body=base64.urlsafe_b64encode(json.dumps(payload,separators=(",",":")).encode()).decode().rstrip("=")
+    return f"header.{body}.signature"
 
 class CliTests(unittest.TestCase):
     def test_cli(self):
@@ -52,67 +56,60 @@ class CliTests(unittest.TestCase):
 
     def test_compose_hardening_and_v1_namespace(self):
         raw = (PATH.parents[1] / "compose.yaml").read_text()
+        services = raw.split("services:\n", 1)[1].split("\nvolumes:\n", 1)[0]
+        self.assertEqual(re.findall(r"^  ([a-z][a-z0-9-]*):$", services, re.MULTILINE), ["devbox", "span-proxy"])
+        self.assertNotIn("credential-proxy:", raw)
+        self.assertNotIn("ssh-proxy:", raw)
         self.assertIn("mem_limit: 16g", raw)
         self.assertIn("cpus: 8", raw)
         self.assertIn("cap_drop: [ALL]", raw)
         self.assertIn("no-new-privileges:true", raw)
         self.assertNotIn("tmpfs: [/tmp:", raw)
-        self.assertIn("- /tmp:size=16m,mode=1777", raw)
         self.assertIn("- /tmp:size=8m,mode=1777", raw)
-        devbox_section = raw.split("  devbox:", 1)[1].split("  credential-proxy:", 1)[0]
+        devbox_section = raw.split("  devbox:", 1)[1].split("  span-proxy:", 1)[0]
         self.assertNotIn('user: "${DEVC2_UID', devbox_section)
-        ssh_proxy_section = raw.rsplit("  ssh-proxy:", 1)[1]
-        self.assertIn('user: "0:0"', ssh_proxy_section)
-        self.assertIn("--drop-uid", ssh_proxy_section)
-        self.assertIn("--drop-gid", ssh_proxy_section)
-        self.assertIn("cap_add: [SETUID, SETGID]", ssh_proxy_section)
-        self.assertNotIn("ssh-socket-init", raw)
         self.assertNotIn("docker.sock", raw)
-        self.assertIn("source: ssh-socket-v2", raw)
-        self.assertNotIn("source: ssh-socket\n", raw)
-        self.assertNotIn("source: /run/host-services/ssh-auth.sock", raw)
-        self.assertNotIn("DEVC2_HOST_AGENT_SOCKET", raw)
-        self.assertIn("host.docker.internal:${DEVC2_SSH_RELAY_PORT", raw)
-        self.assertIn("target: /run/devc2-ssh-tls", raw)
-        self.assertEqual(raw.count("target: /run/devc2-ssh-tls"), 1)
-        self.assertNotIn("devc2-ssh-tls", devbox_section)
-        self.assertIn("--tls-server-name", raw)
+        self.assertIn("source: span-sockets-v2", raw)
+        self.assertEqual(raw.count("target: /run/devc2/spans"), 2)
+        self.assertIn("target: /run/devc2-span-tls", raw)
+        self.assertNotIn("/run/host-services/ssh-auth.sock", raw)
+        self.assertNotIn("DEVC2_SSH_RELAY", raw)
         self.assertNotIn("upstream-secret", raw)
-        self.assertIn("SSH relay credentials were exposed inside the devbox", (PATH.parents[1] / "devbox" / "entrypoint.sh").read_text())
         self.assertNotIn("gh-config", raw)
-        self.assertIn("GH_CONFIG_DIR: /run/devc2-public/gh", raw)
         self.assertNotIn("GH_TOKEN:", raw)
         self.assertNotIn("claude", raw.lower())
 
     def test_devbox_has_technology_neutral_infra_endpoint_configuration(self):
         raw = (PATH.parents[1] / "compose.yaml").read_text()
-        devbox_section = raw.split("  devbox:\n", 1)[1].split("\n  credential-proxy:\n", 1)[0]
+        devbox_section = raw.split("  devbox:\n", 1)[1].split("\n  span-proxy:\n", 1)[0]
         self.assertIn("DB_HOST: ${DEVC2_DB_HOST:-postgres-primary.internal}", devbox_section)
         self.assertIn("DB_PORT: ${DEVC2_DB_PORT:-5432}", devbox_section)
         self.assertIn("DB_NAME: ${DEVC2_DB_NAME:-app}", devbox_section)
-        self.assertIn("NO_PROXY: localhost,127.0.0.1,::1,.internal", devbox_section)
-        self.assertIn("no_proxy: localhost,127.0.0.1,::1,.internal", devbox_section)
+        environment = devbox_section.split("    environment:\n", 1)[1].split("    volumes:\n", 1)[0]
+        for placeholder in ("TOKEN", "AUTH", "CREDENTIAL", "PROXY", "SOCK", "OPENAI", "GITHUB", "GH_"):
+            self.assertNotIn(placeholder, environment.upper())
         self.assertNotIn("BOUNDARY_", devbox_section)
         self.assertNotIn("BDX_", devbox_section)
 
-    def test_tact_wrapper_restores_socket_and_forwards_arguments(self):
+    def test_tact_wrapper_uses_openai_span_except_for_local_commands(self):
         wrapper_source = (PATH.parents[1] / "devbox" / "tact-wrapper.sh").read_text()
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            upstream = root / "upstream"
-            result = root / "result"
-            upstream.write_text(
-                "#!/bin/sh\n"
-                f"printf '%s\n' \"$SSH_AUTH_SOCK\" \"$@\" >{result}\n"
-                "exit 17\n"
-            )
+            upstream, openai, result = root / "upstream", root / "openai", root / "result"
+            upstream.write_text("#!/bin/sh\n" f"printf 'upstream:%s\\n' \"$*\" >>{result}\n" "exit 17\n")
             upstream.chmod(0o755)
+            openai.write_text("#!/bin/sh\n" f"printf 'openai:%s\\n' \"$*\" >>{result}\n" "shift 2\nexec \"$@\"\n")
+            openai.chmod(0o755)
             wrapper = root / "tact"
-            wrapper.write_text(wrapper_source.replace("/usr/local/libexec/devc2/tact-upstream", str(upstream)))
+            wrapper.write_text(wrapper_source.replace("/usr/local/libexec/devc2/tact-upstream", str(upstream)).replace("/run/devc2/bin/openai", str(openai)))
             wrapper.chmod(0o755)
-            completed = subprocess.run([str(wrapper), "config", "show"], env={**os.environ, "SSH_AUTH_SOCK": "/wrong"})
-            self.assertEqual(completed.returncode, 17)
-            self.assertEqual(result.read_text().splitlines(), ["/run/devc2-ssh/agent.sock", "config", "show"])
+            for arguments in (["config", "show"], ["--version"]):
+                self.assertEqual(subprocess.run([str(wrapper), *arguments]).returncode, 17)
+            self.assertEqual(subprocess.run([str(wrapper), "run", "task"]).returncode, 17)
+            self.assertEqual(result.read_text().splitlines(), [
+                "upstream:config show", "upstream:--version",
+                f"openai:run -- {upstream} run task", "upstream:run task",
+            ])
 
     def test_external_build_images_are_content_pinned(self):
         dockerfile = (PATH.parents[1] / "Dockerfile").read_text()
@@ -151,7 +148,7 @@ class CliTests(unittest.TestCase):
         self.assertNotIn(" tmux ", dockerfile)
         self.assertNotIn("tmux -V", entrypoint)
         for probe in (
-            "psql --version", "postgres --version", "node --version",
+            "psql --version", "node --version",
             "pnpm --version", "python3.14 --version", "forge --version",
         ):
             self.assertIn(probe, entrypoint)
@@ -179,16 +176,13 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("shutil.rmtree(lock_directory", source)
         self.assertIn("runtime doctor teardown left resources", source)
         self.assertIn("ssh-add -L", entrypoint)
-        self.assertIn("grep -c '^ssh-'", entrypoint)
-        self.assertIn("allowed_fingerprint", entrypoint)
+        self.assertIn('test "${#doctor_identities[@]}" -eq 1', entrypoint)
+        self.assertNotIn("grep -c '^ssh-'", entrypoint)
+        self.assertIn("openai run -- /bin/sh -ceu", entrypoint)
         self.assertIn("backend-api/codex/models?client_version=0.147.0", entrypoint)
-        self.assertIn("originator: codex_cli_rs", entrypoint)
-        self.assertIn("ChatGPT models request failed with HTTP", entrypoint)
-        self.assertIn('mv -f "$config_probe" "$TACT_CONFIG"', entrypoint)
-        self.assertIn("successfully authenticated", entrypoint)
-        self.assertIn('git -C "$runtime_repo" verify-commit HEAD', entrypoint)
+        self.assertIn("OpenAI Span: authenticated models request", entrypoint)
+        self.assertIn("github run -- gh api user", entrypoint)
         self.assertIn("tact config show", entrypoint)
-        self.assertIn("Herdr must not be bundled in an ungranted Island", entrypoint)
         self.assertNotIn("set -x", entrypoint)
 
     def test_active_v1_is_refused(self):
@@ -199,8 +193,9 @@ class CliTests(unittest.TestCase):
 
     def test_runtime_doctor_uses_a_temporary_repo_and_checks_teardown(self):
         seen=[]
-        def start(repo, runtime_doctor=False):
+        def start(repo, runtime_doctor=False, span_names=()):
             self.assertTrue(runtime_doctor)
+            self.assertEqual(span_names, ("openai", "github", "ssh-agent"))
             self.assertTrue((repo / ".git").is_dir())
             seen.append(repo)
             return 0
@@ -215,24 +210,26 @@ class CliTests(unittest.TestCase):
         with mock.patch.object(D, "require_docker"), mock.patch.object(D, "read_codex", return_value=("a", "b")), mock.patch.object(D, "validate_github_token", return_value="user"), mock.patch.object(D, "public_keys", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(D.doctor(), 1)
 
-    def test_entrypoint_requires_live_github_and_signing(self):
+    def test_entrypoint_uses_optional_github_and_ssh_agent_spans_with_signing_readiness(self):
         entrypoint = (PATH.parents[1] / "devbox" / "entrypoint.sh").read_text()
-        self.assertIn("gh api user", entrypoint)
+        self.assertIn("github run -- gh api user", entrypoint)
         self.assertIn("ssh-keygen -Y sign", entrypoint)
-        self.assertIn("gpg.ssh.allowedSignersFile /run/devc2-public/allowed_signers", entrypoint)
-        self.assertIn("namespaces=\"git\"", PATH.read_text())
-        self.assertIn("filtered SSH agent did not become ready", entrypoint)
+        self.assertIn('gpg.ssh.allowedSignersFile "$allowed_signers"', entrypoint)
+        self.assertIn("namespaces=\"git\"", entrypoint)
+        self.assertIn("SSH-agent Span selected identity could not sign", entrypoint)
+        self.assertIn("if [[ -S /run/devc2/spans/ssh-agent.sock ]]", entrypoint)
+        self.assertIn("git config --global --unset-all core.sshCommand", entrypoint)
+        self.assertIn("jj config unset --user signing.key", entrypoint)
+        self.assertLess(entrypoint.index("--unset-all core.sshCommand"),entrypoint.index("if [[ -S /run/devc2/spans/ssh-agent.sock ]]"))
+        self.assertIn("if command -v github", entrypoint)
         self.assertNotIn('$HOME/.zshenv', entrypoint)
         self.assertNotIn('$HOME/.bashrc', entrypoint)
         wrapper = (PATH.parents[1] / "devbox" / "tact-wrapper.sh").read_text()
-        self.assertIn("export SSH_AUTH_SOCK=/run/devc2-ssh/agent.sock", wrapper)
-        self.assertIn('exec /usr/local/libexec/devc2/tact-upstream "$@"', wrapper)
+        self.assertIn('exec /run/devc2/bin/openai run -- /usr/local/libexec/devc2/tact-upstream "$@"', wrapper)
         runtime_path=(PATH.parents[1]/"Dockerfile").read_text().split("ENV HOME=",1)[1]
         self.assertLess(runtime_path.index("/usr/local/bin"),runtime_path.index("/run/devc2/bin"))
         self.assertLess(runtime_path.index("/run/devc2/bin"),runtime_path.index("/home/devbox/.local/bin"))
-        self.assertIn("selected 1Password key could not sign", entrypoint)
-        self.assertIn("sanitized SSH proxy diagnostics", PATH.read_text())
-        self.assertIn("sanitized startup diagnostics", PATH.read_text())
+        self.assertIn("sanitized Span diagnostics", PATH.read_text())
 
 class AuthTests(unittest.TestCase):
     def test_parse_cli_auth_is_a_standalone_command(self):
@@ -249,10 +246,11 @@ class AuthTests(unittest.TestCase):
             def auth_run(argv,**_kwargs):
                 if argv[:3]==["docker","image","inspect"]: return subprocess.CompletedProcess(argv,1,"","")
                 return completed
-            with mock.patch.object(D, "AUTH", auth), mock.patch.object(D, "require_docker"), mock.patch.object(D, "read_codex", side_effect=[RuntimeError("missing"), ("access", "account")]) as read_codex, mock.patch.object(D, "validate_github_token", side_effect=[RuntimeError("missing"), "user"]) as github_token, mock.patch.object(D, "run", side_effect=auth_run) as run, contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch.object(D, "AUTH", auth), mock.patch.object(D, "require_docker"), mock.patch.object(D, "read_codex", side_effect=[RuntimeError("missing"), ("access", "account")]) as read_codex, mock.patch.object(D, "validate_github_token", side_effect=[RuntimeError("missing"), "user"]) as github_token, mock.patch.object(D, "select_key", side_effect=[RuntimeError("missing"), "ssh-key"]) as select_key, mock.patch.object(D, "run", side_effect=auth_run) as run, contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(D.authenticate(), 0)
             self.assertEqual(read_codex.call_count, 2)
             self.assertEqual(github_token.call_count, 2)
+            self.assertEqual(select_key.call_args_list, [mock.call(False), mock.call(True)])
 
             commands = [call.args[0] for call in run.call_args_list]
             self.assertEqual(len(commands), 4)
@@ -264,13 +262,13 @@ class AuthTests(unittest.TestCase):
             self.assertEqual(commands[2][-2:], ["login", "--device-auth"])
             self.assertIn(f"{auth / 'gh'}:/run/devc2-gh", commands[3])
             self.assertIn("gh", commands[3])
-            self.assertEqual(commands[3][-7:], ["auth", "login", "--hostname", "github.com", "--git-protocol", "https", "--web"])
+            self.assertEqual(commands[3][-7:], ["auth", "login", "--hostname", "github.com", "--git-protocol", "ssh", "--web"])
             config = auth / "codex" / "config.toml"
             self.assertEqual(config.read_text(), 'cli_auth_credentials_store = "file"\n')
             self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o600)
 
     def test_read_codex_prefers_managed_auth(self):
-        access = D.jwt({"exp": 4102444800})
+        access = jwt({"exp": 4102444800})
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             managed = root / "managed"
@@ -304,7 +302,7 @@ class AuthTests(unittest.TestCase):
             ], timeout=30))
 
     def test_bootstrapped_auth_needs_no_host_codex_or_gh(self):
-        access = D.jwt({"exp": 4102444800})
+        access = jwt({"exp": 4102444800})
         completed = lambda argv, stdout="": subprocess.CompletedProcess(argv, 0, stdout, "")
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -327,7 +325,7 @@ class AuthTests(unittest.TestCase):
                     return completed(argv, "docker-gh-token\n")
                 return completed(argv)
 
-            with mock.patch.object(D, "AUTH", auth), mock.patch.object(D, "require_docker"), mock.patch.object(D, "validate_github_token", side_effect=[RuntimeError("missing"), "user"]), mock.patch.object(D, "run", side_effect=docker_only), mock.patch.dict(os.environ, {"CODEX_HOME": str(host_codex), "PATH": ""}), contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch.object(D, "AUTH", auth), mock.patch.object(D, "require_docker"), mock.patch.object(D, "validate_github_token", side_effect=[RuntimeError("missing"), "user"]), mock.patch.object(D, "select_key", side_effect=[RuntimeError("missing"), "ssh-key"]), mock.patch.object(D, "run", side_effect=docker_only), mock.patch.dict(os.environ, {"CODEX_HOME": str(host_codex), "PATH": ""}), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(D.authenticate(), 0)
                 self.assertEqual(D.read_codex(), (access, "bootstrapped"))
                 self.assertEqual(D.github_token(), "docker-gh-token")
@@ -336,15 +334,10 @@ class AuthTests(unittest.TestCase):
             self.assertTrue(all(command[0] in {"docker", "gh"} for command in commands))
 
 
-class CredentialTests(unittest.TestCase):
+class AuthMaterialTests(unittest.TestCase):
     def test_github_token_not_logged(self):
         completed=subprocess.CompletedProcess([],0,"secret-token\n","")
         with mock.patch.object(D,"run",return_value=completed): self.assertEqual(D.github_token(),"secret-token")
-    def test_proxy_config_uses_file_sources_and_exact_hosts(self):
-        doc=D.proxy_config(); raw=str(doc)
-        self.assertIn("/run/devc2-private/github-token",raw)
-        self.assertIn("api.github.com",raw); self.assertIn("uploads.github.com",raw); self.assertIn("chatgpt.com",raw)
-        self.assertNotIn("secret-token",raw)
     def test_key_filter_selects_saved_key(self):
         blob="AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         key=f"ssh-ed25519 {blob} selected"
@@ -352,7 +345,7 @@ class CredentialTests(unittest.TestCase):
             self.assertEqual(D.select_key(False),key)
             self.assertEqual(stat.S_IMODE((Path(td)/"ssh-key.pub").stat().st_mode),0o600)
 
-class RelayPKITests(unittest.TestCase):
+class SpanTransportPKITests(unittest.TestCase):
     def test_relay_pki_is_ephemeral_scoped_and_has_expected_extensions(self):
         with tempfile.TemporaryDirectory() as td:
             server,client=D.generate_relay_pki(Path(td)/"pki")
@@ -366,28 +359,35 @@ class RelayPKITests(unittest.TestCase):
             self.assertIn("TLS Web Server Authentication",server_text)
             self.assertIn("TLS Web Client Authentication",client_text)
 
-class HostAgentRelayTests(unittest.TestCase):
-    def test_compose_env_projects_relay_metadata_without_ambient_agent(self):
-        with mock.patch.object(D, "docker_env", side_effect=lambda values: values):
-            result=D.compose_env(Path("/tmp/repo"),Path("/tmp/private"),Path("/tmp/public"),49152,Path("/tmp/relay-secret"))
-        self.assertEqual(result["DEVC2_SSH_RELAY_PORT"], "49152")
-        self.assertEqual(result["DEVC2_SSH_RELAY_TLS_DIR"], "/tmp/relay-secret")
-        self.assertNotIn("SSH_AUTH_SOCK", result)
+class ComposeEnvironmentTests(unittest.TestCase):
+    def test_compose_env_projects_only_explicit_span_paths_without_ambient_auth(self):
+        ambient = {
+            "SSH_AUTH_SOCK": "/tmp/ambient-agent.sock", "GH_TOKEN": "github-secret",
+            "GITHUB_TOKEN": "github-secret-2", "OPENAI_API_KEY": "openai-secret",
+            "CODEX_HOME": "/tmp/codex", "HTTP_PROXY": "http://proxy.invalid",
+        }
+        with mock.patch.dict(os.environ, ambient, clear=False):
+            result=D.compose_env(
+                Path("/tmp/repo"), Path("/tmp/public"),
+                Path("/tmp/span-tls"), Path("/tmp/span-clients"), True,
+            )
+        self.assertEqual(result["DEVC2_SPAN_RELAY_TLS_DIR"], "/tmp/span-tls")
+        self.assertEqual(result["DEVC2_SPAN_CLIENT_DIR"], "/tmp/span-clients")
+        self.assertRegex(result["DEVC2_SPAN_VOLUME"], r"^devc2-[0-9a-f]{16}-span-sockets-v2$")
+        self.assertEqual(result["COMPOSE_PROFILES"], "spans")
+        for name in ambient:
+            self.assertNotIn(name, result)
 
-    def test_host_relay_uses_ambient_agent_and_mutual_tls(self):
-        process=mock.Mock(); process.poll.return_value=None
-        with tempfile.TemporaryDirectory() as td:
-            root=Path(td); port_file=root/"port"; port_file.write_text("49152")
-            with mock.patch.dict(os.environ,{"SSH_AUTH_SOCK":"/tmp/onepassword.sock"}), mock.patch.object(D.os,"stat",return_value=mock.Mock(st_mode=stat.S_IFSOCK)), mock.patch.object(D.subprocess,"Popen",return_value=process) as popen:
-                self.assertEqual(D.start_host_agent_relay(port_file,root/"tls",root/"key.pub"),(process,49152))
-        command=popen.call_args.args[0]
-        self.assertIn("/tmp/onepassword.sock",command)
-        self.assertIn("--relay-listen",command)
-        self.assertIn("--tls-ca",command)
-        self.assertIn("--tls-cert",command)
-        self.assertIn("--tls-key",command)
-        self.assertNotIn("secret", " ".join(command))
-        self.assertIn(str(root/"key.pub"),command)
+    def test_span_socket_volume_removal_is_exact_and_verified(self):
+        removed=subprocess.CompletedProcess([],0,"","")
+        absent=subprocess.CompletedProcess([],1,"","not found")
+        name="devc2-0123456789abcdef-span-sockets-v2"
+        with mock.patch.object(D,"run",side_effect=[removed,absent]) as run:
+            D.remove_span_volume(name)
+        self.assertEqual(run.call_args_list[0].args[0],["docker","volume","rm",name])
+        self.assertEqual(run.call_args_list[1].args[0],["docker","volume","inspect",name])
+        with self.assertRaisesRegex(RuntimeError,"could not remove"), mock.patch.object(D,"run",side_effect=[removed,removed]):
+            D.remove_span_volume(name)
 
 class CoexistenceTests(unittest.TestCase):
     def test_reset_project_is_v2_only(self):

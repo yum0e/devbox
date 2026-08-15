@@ -11,8 +11,8 @@ from pathlib import Path
 ROOT=Path(__file__).resolve().parent
 REPO=ROOT.parent
 DIST=REPO/"dist"
-INCLUDE=("Dockerfile","compose.yaml","README.md","install.sh","devbox","credential_proxy","launcher")
-EXECUTABLE={"install.sh","devbox/entrypoint.sh","devbox/tact-wrapper.sh","devbox/herdr-wrapper.py","launcher/devc2.py","launcher/dispatcher.py","credential_proxy/ssh_agent_proxy.py"}
+INCLUDE=("Dockerfile","compose.yaml","README.md","install.sh","devbox","credential_proxy","launcher","spans")
+EXECUTABLE={"install.sh","devbox/entrypoint.sh","devbox/tact-wrapper.sh","devbox/herdr-wrapper.py","launcher/devc2.py","launcher/dispatcher.py","launcher/command_projection.py","spans/openai/provider","spans/openai/client","spans/github/provider","spans/github/client","spans/ssh-agent/provider","spans/ssh-agent/client"}
 
 def files():
     result=[]

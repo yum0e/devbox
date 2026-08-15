@@ -72,7 +72,7 @@ def _snapshot_executable(raw: object, label: str, target: Path, maximum: int, fo
         if descriptor is not None: os.close(descriptor)
 
 
-def load_catalog(path: Path, names: tuple[str, ...], forbidden_root: Path, client_destination: Path, provider_destination: Path) -> list[Span]:
+def load_catalog(path: Path, names: tuple[str, ...], forbidden_root: Path, client_destination: Path, provider_destination: Path, builtin_root: Path | None = None, command_projection: Path | None = None) -> list[Span]:
     if len(names)>MAX_SPANS:
         raise RuntimeError(f"an Island may grant at most {MAX_SPANS} Spans")
     client_destination.mkdir(mode=0o700)
@@ -83,7 +83,39 @@ def load_catalog(path: Path, names: tuple[str, ...], forbidden_root: Path, clien
     for name in names:
         if not valid_name(name):
             raise RuntimeError(f"invalid Span name: {name!r}")
+    builtin_entries={}
+    if builtin_root is not None:
+        for name in names:
+            provider=builtin_root/name/"provider"
+            client=builtin_root/name/"client"
+            if provider.is_file() and client.is_file():
+                builtin_entries[name]={"provider":str(provider),"client":str(client)}
+    external_names=[name for name in names if name not in builtin_entries]
     forbidden_root=forbidden_root.resolve()
+    if not external_names:
+        entries={}
+    else:
+        entries=_read_catalog(path,forbidden_root)
+    entries={**entries,**builtin_entries}
+    result=[]
+    for name in names:
+        entry=entries.get(name)
+        if entry is None:
+            raise RuntimeError(f"Span {name!r} is unavailable")
+        if isinstance(entry,str):
+            if command_projection is None:
+                raise RuntimeError(f"Span {name!r} cannot be projected")
+            provider=_snapshot_executable(entry,f"{name!r} World",provider_destination/name,MAX_PROVIDER_BYTES,forbidden_root)
+            client=_snapshot_executable(str(command_projection),f"{name!r} command projection",client_destination/name,MAX_CLIENT_BYTES,None)
+        else:
+            provider=_snapshot_executable(entry["provider"],f"{name!r} provider",provider_destination/name,MAX_PROVIDER_BYTES,forbidden_root)
+            client=_snapshot_executable(entry["client"],f"{name!r} client",client_destination/name,MAX_CLIENT_BYTES,forbidden_root)
+        result.append(Span(name,client,provider))
+    client_destination.chmod(0o555)
+    return result
+
+
+def _read_catalog(path: Path, forbidden_root: Path) -> dict:
     if _inside(path.resolve(strict=False),forbidden_root):
         raise RuntimeError("Span catalog must live outside the mounted workspace")
     descriptor=None
@@ -116,20 +148,15 @@ def load_catalog(path: Path, names: tuple[str, ...], forbidden_root: Path, clien
     for catalog_name,entry in entries.items():
         if not isinstance(catalog_name,str) or not valid_name(catalog_name):
             raise RuntimeError("Span catalog contains an invalid name")
+        if isinstance(entry,str):
+            if not Path(entry).is_absolute():
+                raise RuntimeError(f"Span {catalog_name!r} has an invalid World path")
+            continue
         if not isinstance(entry,dict) or set(entry)!={"provider","client"}:
             raise RuntimeError(f"Span {catalog_name!r} has an invalid catalog entry")
         if not all(isinstance(entry[field],str) for field in ("provider","client")):
             raise RuntimeError(f"Span {catalog_name!r} has an invalid catalog path")
-    result=[]
-    for name in names:
-        entry=entries.get(name)
-        if entry is None:
-            raise RuntimeError(f"Span {name!r} is unavailable")
-        provider=_snapshot_executable(entry["provider"],f"{name!r} provider",provider_destination/name,MAX_PROVIDER_BYTES,forbidden_root)
-        client=_snapshot_executable(entry["client"],f"{name!r} client",client_destination/name,MAX_CLIENT_BYTES,forbidden_root)
-        result.append(Span(name,client,provider))
-    client_destination.chmod(0o555)
-    return result
+    return entries
 
 
 class Provider:

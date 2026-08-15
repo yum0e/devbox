@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Host provider for the deliberately narrow Herdr Span example."""
+"""Herdr World exporting one deliberately narrow command affordance."""
 from __future__ import annotations
 
+import argparse
 import base64
+import binascii
+import contextlib
 import hashlib
+import io
 import json
 import os
 import re
@@ -21,13 +25,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-MAX_REQUEST = 64 * 1024
-MAX_RESPONSE = 1024 * 1024
+MAX_REQUEST = 128 * 1024
+MAX_RESPONSE = 2 * 1024 * 1024
 MAX_TEXT = 64 * 1024
+MAX_OUTPUT = 1024 * 1024
 MAX_ARGV_BYTES = 16 * 1024
 MAX_JOBS = 16
 MAX_HANDLERS = 32
 HEADER = struct.Struct("!I")
+PARSE_LOCK = threading.Lock()
 NAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
 
@@ -48,7 +54,7 @@ def receive(connection: socket.socket, size: int) -> bytes:
 def send_frame(connection: socket.socket, document: dict) -> None:
     payload = json.dumps(document, separators=(",", ":")).encode()
     if len(payload) > MAX_RESPONSE:
-        payload = b'{"ok":false,"error":"response exceeds 1 MiB"}'
+        payload = b'{"ok":false,"error":"response exceeds 2 MiB"}'
     connection.sendall(HEADER.pack(len(payload)) + payload)
 
 
@@ -133,9 +139,14 @@ class Job:
     terminal_id: str
     marker: str
     exit_code: int | None = None
+    started: bool = False
 
 
-class Provider:
+def start_marker(marker: str) -> str:
+    return marker.replace("_EXIT_", "_START_", 1)
+
+
+class World:
     def __init__(self):
         required = ("DEVC2_ISLAND_ID", "DEVC2_WORKSPACE", "HERDR_SOCKET_PATH", "HERDR_PANE_ID")
         missing = [name for name in required if not os.environ.get(name)]
@@ -146,7 +157,7 @@ class Provider:
         self.anchor = bounded_string(os.environ["HERDR_PANE_ID"], "Herdr pane ID", 128)
         self.herdr = Herdr(safe_socket(os.environ["HERDR_SOCKET_PATH"]))
         self.docker = safe_executable("docker")
-        self.provider = str(Path(__file__).resolve(strict=True))
+        self.world_executable = str(Path(__file__).resolve(strict=True))
         self.jobs: dict[str, Job] = {}
         self.lock = threading.RLock()
         self.stopping = threading.Event()
@@ -224,22 +235,42 @@ class Provider:
             raise SpanError(f"worker {job.name!r} no longer owns its pane")
         return pane
 
-    def read_job(self, job: Job, lines: int = 1000) -> str:
+    def pane_output(self, job: Job) -> str:
         self.pane(job)
         result = self.herdr.call(
             "pane.read",
-            {"pane_id": job.pane_id, "source": "recent_unwrapped", "lines": lines, "strip_ansi": True},
+            {"pane_id": job.pane_id, "source": "recent_unwrapped", "lines": 1000, "strip_ansi": True},
         )
         read = result.get("read")
         if not isinstance(read, dict) or not isinstance(read.get("text"), str):
             raise SpanError("Herdr returned invalid pane output")
         return read["text"]
 
+    def read_job(self, job: Job, lines: int = 1000) -> str:
+        output = self.pane_output(job)
+        boundary = start_marker(job.marker)
+        start = output.find(boundary)
+        if start >= 0:
+            job.started = True
+            output = output[start + len(boundary):].lstrip("\r\n")
+        elif not job.started:
+            # Until the worker boundary appears, the pane contains only its
+            # host shell prompt and the private bootstrap invocation.
+            return ""
+        end = output.find(job.marker)
+        if end >= 0:
+            output = output[:end]
+        return "".join(output.splitlines(keepends=True)[-lines:])
+
     def refresh(self, job: Job) -> None:
         if job.exit_code is not None:
             return
-        match = re.search(re.escape(job.marker) + r"([0-9]{1,3})", self.read_job(job))
+        output = self.pane_output(job)
+        if start_marker(job.marker) in output:
+            job.started = True
+        match = re.search(re.escape(job.marker) + r"([0-9]{1,3})", output)
         if match:
+            job.started = True
             job.exit_code = int(match.group(1))
 
     def get_job(self, name: object) -> Job:
@@ -287,7 +318,7 @@ class Provider:
             ).decode()
             self.jobs[name] = job
             try:
-                command = f"exec {shlex.quote(self.provider)} worker {payload}"
+                command = f"exec {shlex.quote(self.world_executable)} worker {payload}"
                 self.herdr.call(
                     "pane.send_input", {"pane_id": job.pane_id, "text": command, "keys": ["Enter"]}
                 )
@@ -305,7 +336,7 @@ class Provider:
     def handle(self, request: dict) -> object:
         if not isinstance(request, dict) or not isinstance(request.get("op"), str):
             raise SpanError("request must contain an operation")
-        # Upstream health is a client-call concern, not Span startup readiness.
+        # Upstream health is a command-call concern, not World startup readiness.
         # Retrying every call also lets a restarted Herdr server recover naturally.
         self.check_anchor()
         operation = request["op"]
@@ -389,6 +420,108 @@ class Provider:
             thread.join(timeout=2)
 
 
+def command_parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(
+        prog="herdr",
+        description="Run and control host-visible workers inside this Island.",
+    )
+    commands = root.add_subparsers(dest="command", required=True)
+    spawn = commands.add_parser("spawn", help="create a Herdr pane running Island argv")
+    spawn.add_argument("name")
+    spawn.add_argument("argv", nargs=argparse.REMAINDER)
+    commands.add_parser("list", help="list workers created by this Island")
+    read = commands.add_parser("read", help="read recent worker output")
+    read.add_argument("name")
+    read.add_argument("--lines", type=int, default=200)
+    send = commands.add_parser("send", help="submit stdin and Enter to a running worker")
+    send.add_argument("name")
+    wait = commands.add_parser("wait", help="wait for a worker to exit")
+    wait.add_argument("name")
+    wait.add_argument("--timeout", type=float, default=300, metavar="SECONDS")
+    return root
+
+
+def invoke_command(world: World, request: object) -> dict:
+    if not isinstance(request, dict) or set(request) != {"v", "command", "argv", "stdin_b64"}:
+        raise SpanError("invalid command invocation")
+    if request["v"] != 1 or request["command"] != "herdr":
+        raise SpanError("command is not exported by this World")
+    argv = request["argv"]
+    if not isinstance(argv, list) or len(argv) > 64 or not all(isinstance(item, str) and "\0" not in item for item in argv):
+        raise SpanError("invalid command argv")
+    if sum(len(item.encode()) for item in argv) > MAX_ARGV_BYTES:
+        raise SpanError("command argv exceeds 16 KiB")
+    encoded = request["stdin_b64"]
+    if not isinstance(encoded, str):
+        raise SpanError("invalid command input")
+    try:
+        raw_input = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error) as error:
+        raise SpanError("invalid command input") from error
+    if len(raw_input) > MAX_TEXT:
+        raise SpanError("command input exceeds 64 KiB")
+
+    stdout, stderr = io.StringIO(), io.StringIO()
+    exit_code = 0
+    args = None
+    try:
+        # argparse writes through process-global stdout/stderr. Keep only that
+        # short, local parsing step serialized; World operations stay concurrent.
+        with PARSE_LOCK, contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                args = command_parser().parse_args(argv)
+            except SystemExit as error:
+                exit_code = error.code if isinstance(error.code, int) else 2
+        if args is not None:
+            if args.command != "send" and raw_input:
+                raise SpanError("only herdr send accepts stdin")
+            if args.command == "spawn":
+                command = args.argv[1:] if args.argv[:1] == ["--"] else args.argv
+                if not command:
+                    raise SpanError("spawn requires COMMAND [ARG...] after --")
+                stdout.write(f"{world.handle({'op': 'spawn', 'name': args.name, 'argv': command})}\n")
+            elif args.command == "list":
+                result = world.handle({"op": "list"})
+                if not isinstance(result, list):
+                    raise SpanError("invalid Herdr result")
+                for item in result:
+                    if not isinstance(item, dict) or not isinstance(item.get("name"), str) or not isinstance(item.get("state"), str):
+                        raise SpanError("invalid Herdr result")
+                    stdout.write(f"{item['name']}\t{item['state']}\n")
+            elif args.command == "read":
+                result = world.handle({"op": "read", "name": args.name, "lines": args.lines})
+                if not isinstance(result, str):
+                    raise SpanError("invalid Herdr result")
+                stdout.write(result)
+                if result and not result.endswith("\n"):
+                    stdout.write("\n")
+            elif args.command == "send":
+                text = raw_input.decode()
+                world.handle({"op": "send", "name": args.name, "text": text})
+            elif args.command == "wait":
+                if not 0 < args.timeout <= 3600:
+                    raise SpanError("timeout must be between 0 and 3600 seconds")
+                result = world.handle({"op": "wait", "name": args.name, "timeout_ms": max(1, int(args.timeout * 1000))})
+                if not isinstance(result, dict) or not isinstance(result.get("exit_code"), int):
+                    raise SpanError("invalid Herdr result")
+                exit_code = result["exit_code"]
+    except (SpanError, UnicodeDecodeError) as error:
+        stderr.write(f"herdr: {error}\n")
+        exit_code = 1
+
+    stdout_bytes, stderr_bytes = stdout.getvalue().encode(), stderr.getvalue().encode()
+    if len(stdout_bytes) + len(stderr_bytes) > MAX_OUTPUT:
+        raise SpanError("command output exceeds 1 MiB")
+    if not 0 <= exit_code <= 255:
+        exit_code = 255
+    return {
+        "ok": True,
+        "stdout_b64": base64.b64encode(stdout_bytes).decode("ascii"),
+        "stderr_b64": base64.b64encode(stderr_bytes).decode("ascii"),
+        "exit_code": exit_code,
+    }
+
+
 def decode_worker(raw: str) -> dict:
     if len(raw) > 64 * 1024 or not re.fullmatch(r"[A-Za-z0-9_=-]+", raw):
         raise SpanError("invalid worker payload")
@@ -417,7 +550,10 @@ def worker(raw: str) -> int:
         "--workdir", "/workspace", document["container"], *document["argv"],
     ]
     try:
-        completed = subprocess.run(command, check=False)
+        print(f"\r\n{start_marker(document['marker'])}", flush=True)
+        environment = os.environ.copy()
+        environment["DOCKER_CLI_HINTS"] = "false"
+        completed = subprocess.run(command, check=False, env=environment)
         code = completed.returncode if 0 <= completed.returncode <= 255 else 255
     except (OSError, subprocess.SubprocessError) as error:
         print(f"herdr-span worker: {error}", file=sys.stderr)
@@ -434,7 +570,7 @@ def serve() -> int:
     except (KeyError, ValueError):
         print("herdr-span: missing Span listener", file=sys.stderr)
         return 2
-    provider = Provider()
+    world = World()
     listener = socket.socket(fileno=descriptor)
     handlers = threading.BoundedSemaphore(MAX_HANDLERS)
 
@@ -461,10 +597,9 @@ def serve() -> int:
                         try:
                             size = HEADER.unpack(receive(stream, HEADER.size))[0]
                             if size > MAX_REQUEST:
-                                raise SpanError("request exceeds 64 KiB")
+                                raise SpanError("request exceeds 128 KiB")
                             request = json.loads(receive(stream, size))
-                            result = provider.handle(request)
-                            send_frame(stream, {"ok": True, "result": result})
+                            send_frame(stream, invoke_command(world, request))
                         except (OSError, SpanError, UnicodeDecodeError, json.JSONDecodeError, struct.error) as error:
                             try:
                                 send_frame(stream, {"ok": False, "error": str(error)[:4096]})
@@ -475,14 +610,14 @@ def serve() -> int:
 
             threading.Thread(target=handle, args=(connection,), daemon=True).start()
     finally:
-        provider.cleanup()
+        world.cleanup()
 
 
 def main() -> int:
     if len(sys.argv) == 3 and sys.argv[1] == "worker":
         return worker(sys.argv[2])
     if sys.argv[1:]:
-        print("herdr-span: provider accepts no devc2 arguments", file=sys.stderr)
+        print("herdr-span: World accepts no devc2 arguments", file=sys.stderr)
         return 2
     return serve()
 

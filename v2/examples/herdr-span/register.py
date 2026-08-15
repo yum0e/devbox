@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install one immutable Herdr Span generation and register it atomically."""
+"""Install one immutable Herdr World generation and register it atomically."""
 from __future__ import annotations
 
 import fcntl
@@ -40,19 +40,18 @@ def write_file(path: Path, payload: bytes) -> None:
     path.chmod(0o555)
 
 
-def install_generation(root: Path, provider: bytes, client: bytes) -> Path:
-    digest = hashlib.sha256(b"provider\0" + provider + b"client\0" + client).hexdigest()[:16]
+def install_generation(root: Path, world: bytes) -> Path:
+    digest = hashlib.sha256(b"world\0" + world).hexdigest()[:16]
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     root = root.resolve(strict=True)
     generation = root / digest
     if generation.exists():
-        if (generation / "provider").read_bytes() != provider or (generation / "client").read_bytes() != client:
+        if (generation / "world").read_bytes() != world:
             raise RuntimeError(f"existing Herdr generation is inconsistent: {generation}")
         return generation
     staging = Path(tempfile.mkdtemp(prefix=".herdr.", dir=root))
     try:
-        write_file(staging / "provider", provider)
-        write_file(staging / "client", client)
+        write_file(staging / "world", world)
         directory = os.open(staging, os.O_RDONLY)
         try:
             os.fsync(directory)
@@ -91,6 +90,10 @@ def read_catalog(path: Path) -> dict:
     for name, entry in document["spans"].items():
         if not isinstance(name, str) or not NAME.fullmatch(name):
             raise RuntimeError("Span catalog contains an invalid name")
+        if isinstance(entry, str):
+            if not Path(entry).is_absolute():
+                raise RuntimeError("Span catalog contains an invalid World path")
+            continue
         if not isinstance(entry, dict) or set(entry) != {"provider", "client"}:
             raise RuntimeError("Span catalog contains an invalid entry")
         if not all(isinstance(entry[field], str) and Path(entry[field]).is_absolute() for field in ("provider", "client")):
@@ -121,23 +124,23 @@ def write_catalog(path: Path, document: dict) -> None:
 
 
 def main() -> int:
-    if len(sys.argv) != 5:
-        print("usage: register.py CATALOG INSTALL_ROOT PROVIDER_SOURCE CLIENT_SOURCE", file=sys.stderr)
+    if len(sys.argv) != 4:
+        print("usage: register.py CATALOG INSTALL_ROOT WORLD_SOURCE", file=sys.stderr)
         return 2
-    catalog, install_root, provider_source, client_source = map(Path, sys.argv[1:])
-    generation = install_generation(install_root, read_file(provider_source), read_file(client_source))
+    catalog, install_root, world_source = map(Path, sys.argv[1:])
+    generation = install_generation(install_root, read_file(world_source))
     lock_path = catalog.with_suffix(".lock")
     lock = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0), 0o600)
     with os.fdopen(lock, "a+") as locked:
         os.fchmod(locked.fileno(), 0o600)
         fcntl.flock(locked, fcntl.LOCK_EX)
         document = read_catalog(catalog)
-        document["spans"]["herdr"] = {"provider": str(generation / "provider"), "client": str(generation / "client")}
+        document["spans"]["herdr"] = str(generation / "world")
         if len(document["spans"]) > 64:
             raise RuntimeError("Span catalog contains too many entries")
         write_catalog(catalog, document)
     print(f"installed immutable Herdr generation: {generation}")
-    print(f"registered Herdr Span: {catalog}")
+    print(f"registered Herdr command Link: {catalog}")
     return 0
 
 

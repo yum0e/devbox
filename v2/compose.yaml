@@ -9,32 +9,14 @@ services:
     init: true
     stdin_open: true
     tty: true
-    network_mode: service:credential-proxy
-    depends_on:
-      credential-proxy:
-        condition: service_started
-      ssh-proxy:
-        condition: service_started
     environment:
       HOME: /home/devbox
       TACT_HOME: /home/devbox/.local/share/tact
       TACT_CONFIG: /home/devbox/.local/share/tact/config.toml
       TACT_WORKSPACE: /workspace
-      TACT_AUTH: chatgpt
-      TACT_AUTH_FILE: /run/devc2-public/auth.json
-      CODEX_HOME: /run/devc2-public/codex
-      GH_CONFIG_DIR: /run/devc2-public/gh
-      SSH_AUTH_SOCK: /run/devc2-ssh/agent.sock
-      HTTP_PROXY: http://127.0.0.1:8080
-      HTTPS_PROXY: http://127.0.0.1:8080
-      http_proxy: http://127.0.0.1:8080
-      https_proxy: http://127.0.0.1:8080
-      NO_PROXY: localhost,127.0.0.1,::1,.internal
-      no_proxy: localhost,127.0.0.1,::1,.internal
       DB_HOST: ${DEVC2_DB_HOST:-postgres-primary.internal}
       DB_PORT: ${DEVC2_DB_PORT:-5432}
       DB_NAME: ${DEVC2_DB_NAME:-app}
-      TACT_PROXY_CA_FILE: /run/devc2-public/ca.crt
     volumes:
       - type: bind
         source: ${DEVC2_WORKSPACE:?set DEVC2_WORKSPACE}
@@ -46,9 +28,6 @@ services:
       - type: volume
         source: state-v2
         target: /home/devbox
-      - type: volume
-        source: ssh-socket-v2
-        target: /run/devc2-ssh
       - type: bind
         source: ${DEVC2_SPAN_CLIENT_DIR:?set DEVC2_SPAN_CLIENT_DIR}
         target: /run/devc2/bin
@@ -64,76 +43,6 @@ services:
     labels:
       dev.devbox.generation: "2"
       dev.devbox.workspace-hash: ${DEVC2_WORKSPACE_HASH:?set DEVC2_WORKSPACE_HASH}
-
-  credential-proxy:
-    user: "${DEVC2_UID:?set DEVC2_UID}:${DEVC2_GID:?set DEVC2_GID}"
-    image: ironsh/iron-proxy:0.49.0@sha256:c4628019c24f4cc8d77564a26b7c9cedb00accee6f93d06270e85fb8f9c6a7da
-    command: [--config, /run/devc2-private/proxy.yaml]
-    volumes:
-      - type: bind
-        source: ${DEVC2_PRIVATE_DIR:?set DEVC2_PRIVATE_DIR}
-        target: /run/devc2-private
-        read_only: true
-    init: true
-    read_only: true
-    tmpfs:
-      - /tmp:size=16m,mode=1777
-    mem_limit: 512m
-    cpus: 1
-    cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
-    pids_limit: 256
-    labels:
-      dev.devbox.generation: "2"
-
-  ssh-proxy:
-    user: "0:0"
-    build:
-      context: ${DEVC2_INSTALL_DIR:?set DEVC2_INSTALL_DIR}
-      dockerfile: credential_proxy/Dockerfile
-    command:
-      - --listen
-      - /run/devc2-ssh/agent.sock
-      - --drop-uid
-      - "1000"
-      - --drop-gid
-      - "1000"
-      - --upstream-tcp
-      - host.docker.internal:${DEVC2_SSH_RELAY_PORT:?set DEVC2_SSH_RELAY_PORT}
-      - --tls-ca
-      - /run/devc2-ssh-tls/ca.crt
-      - --tls-cert
-      - /run/devc2-ssh-tls/client.crt
-      - --tls-key
-      - /run/devc2-ssh-tls/client.key
-      - --tls-server-name
-      - host.docker.internal
-      - --allowed-key
-      - /run/devc2-public/ssh-allowed.pub
-    init: true
-    volumes:
-      - type: bind
-        source: ${DEVC2_SSH_RELAY_TLS_DIR:?set DEVC2_SSH_RELAY_TLS_DIR}
-        target: /run/devc2-ssh-tls
-        read_only: true
-      - type: bind
-        source: ${DEVC2_PUBLIC_DIR:?set DEVC2_PUBLIC_DIR}
-        target: /run/devc2-public
-        read_only: true
-      - type: volume
-        source: ssh-socket-v2
-        target: /run/devc2-ssh
-    read_only: true
-    tmpfs:
-      - /tmp:size=8m,mode=1777
-    mem_limit: 128m
-    cpus: 0.25
-    cap_drop: [ALL]
-    cap_add: [SETUID, SETGID]
-    security_opt: [no-new-privileges:true]
-    pids_limit: 64
-    labels:
-      dev.devbox.generation: "2"
 
   span-proxy:
     profiles: [spans]
@@ -155,14 +64,10 @@ services:
       - /run/devc2-span-tls/client.key
       - --ready-token-file
       - /run/devc2-public/span-ready
-    network_mode: service:credential-proxy
-    depends_on:
-      credential-proxy:
-        condition: service_started
     init: true
     volumes:
       - type: bind
-        source: ${DEVC2_SSH_RELAY_TLS_DIR:?set DEVC2_SSH_RELAY_TLS_DIR}
+        source: ${DEVC2_SPAN_RELAY_TLS_DIR:?set DEVC2_SPAN_RELAY_TLS_DIR}
         target: /run/devc2-span-tls
         read_only: true
       - type: bind
@@ -188,9 +93,7 @@ volumes:
     labels:
       dev.devbox.generation: "2"
       dev.devbox.workspace-hash: ${DEVC2_WORKSPACE_HASH:?set DEVC2_WORKSPACE_HASH}
-  ssh-socket-v2:
-    labels:
-      dev.devbox.generation: "2"
   span-sockets-v2:
+    name: ${DEVC2_SPAN_VOLUME:?set DEVC2_SPAN_VOLUME}
     labels:
       dev.devbox.generation: "2"

@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""Projected client for the GitHub Span."""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import signal
+import socket
+import ssl
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import urllib.parse
+
+
+DEFAULT_SOCKET = "/run/devc2/spans/github.sock"
+PLACEHOLDER = "[REDACTED]"
+MAX_CA = 1024 * 1024
+MAX_SYSTEM_CA = 16 * 1024 * 1024
+MAX_HANDLERS = 16
+LENGTH = struct.Struct("!I")
+TARGETS = {b"api.github.com:443", b"uploads.github.com:443"}
+USAGE = "usage: github run -- COMMAND [ARG...]"
+
+
+class ClientError(RuntimeError):
+    pass
+
+
+def receive(connection: socket.socket, size: int) -> bytes:
+    result = bytearray()
+    while len(result) < size:
+        block = connection.recv(size - len(result))
+        if not block:
+            raise ClientError("Span response ended early")
+        result.extend(block)
+    return bytes(result)
+
+
+def receive_ca(socket_path: str) -> bytes:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(30)
+        connection.connect(socket_path)
+        connection.sendall(b"C")
+        size = LENGTH.unpack(receive(connection, LENGTH.size))[0]
+        if not 0 < size <= MAX_CA:
+            raise ClientError("Span CA has an invalid size")
+        certificate = receive(connection, size)
+    try:
+        text = certificate.decode("ascii")
+        ssl.create_default_context(cadata=text)
+    except (UnicodeDecodeError, ssl.SSLError) as error:
+        raise ClientError("Span returned an invalid PEM CA") from error
+    if "-----BEGIN CERTIFICATE-----" not in text or "-----END CERTIFICATE-----" not in text or "PRIVATE KEY" in text:
+        raise ClientError("Span returned an invalid PEM CA")
+    return certificate
+
+
+def system_ca() -> bytes:
+    paths = ssl.get_default_verify_paths()
+    for raw in (paths.cafile, paths.openssl_cafile):
+        if not raw:
+            continue
+        path = Path(raw)
+        try:
+            metadata = path.stat()
+            if not path.is_file() or not 0 < metadata.st_size <= MAX_SYSTEM_CA:
+                continue
+            data = path.read_bytes()
+        except OSError:
+            continue
+        if b"-----BEGIN CERTIFICATE-----" in data:
+            return data
+    raise ClientError("system CA bundle is unavailable")
+
+
+def private_write(path: Path, data: bytes) -> None:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(descriptor, view):]
+    finally:
+        os.close(descriptor)
+
+
+class Adapter:
+    def __init__(self, span_path: str, fallback_proxy: str | None):
+        self.span_path = span_path
+        self.fallback = self._fallback(fallback_proxy)
+        self.stopping = threading.Event()
+        self.slots = threading.BoundedSemaphore(MAX_HANDLERS)
+        self.lock = threading.Lock()
+        self.connections: set[socket.socket] = set()
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server.bind(("127.0.0.1", 0))
+        self.server.listen(MAX_HANDLERS)
+        self.server.settimeout(.5)
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    @staticmethod
+    def _fallback(raw: str | None) -> tuple[str, int] | None:
+        if not raw:
+            return None
+        parsed = urllib.parse.urlsplit(raw)
+        try:
+            port = parsed.port
+        except ValueError as error:
+            raise ClientError("inherited proxy URL is invalid") from error
+        if (parsed.scheme != "http" or not parsed.hostname or port is None
+                or parsed.username is not None or parsed.password is not None
+                or parsed.path not in ("", "/") or parsed.query or parsed.fragment):
+            raise ClientError("inherited proxy URL is invalid")
+        return parsed.hostname, port
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.server.getsockname()[1]}"
+
+    @staticmethod
+    def _direct(target: bytes | None) -> tuple[str, int]:
+        if target is None:
+            raise ClientError("unsupported proxy request")
+        try:
+            parsed = urllib.parse.urlsplit("//" + target.decode("ascii"))
+            port = parsed.port
+        except (UnicodeError, ValueError) as error:
+            raise ClientError("proxy target is invalid") from error
+        if (not parsed.hostname or port != 443 or parsed.username is not None
+                or parsed.password is not None or parsed.path or parsed.query or parsed.fragment):
+            raise ClientError("proxy target is invalid")
+        return parsed.hostname, port
+
+    def _serve(self) -> None:
+        while not self.stopping.is_set():
+            try:
+                client, _address = self.server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            if not self.slots.acquire(blocking=False):
+                client.close()
+                continue
+            threading.Thread(target=self._handle, args=(client,), daemon=True).start()
+
+    def _handle(self, client: socket.socket) -> None:
+        upstream = None
+        with self.lock:
+            self.connections.add(client)
+        try:
+            client.settimeout(10)
+            initial = bytearray()
+            while b"\r\n\r\n" not in initial:
+                if len(initial) >= 16 * 1024:
+                    raise ClientError("proxy request headers exceed 16 KiB")
+                block = client.recv(min(4096, 16 * 1024 - len(initial)))
+                if not block:
+                    raise ClientError("proxy request ended early")
+                initial.extend(block)
+            first = bytes(initial).split(b"\r\n", 1)[0].split(b" ")
+            target = first[1] if len(first) == 3 and first[0] == b"CONNECT" and first[2] in (b"HTTP/1.0", b"HTTP/1.1") else None
+            if target in TARGETS:
+                upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                upstream.settimeout(30)
+                upstream.connect(self.span_path)
+                upstream.sendall(b"T")
+            elif self.fallback is not None:
+                upstream = socket.create_connection(self.fallback, timeout=10)
+            else:
+                # Keep normal HTTPS usable without giving the host provider any
+                # destination or credential authority beyond GitHub API hosts.
+                upstream = socket.create_connection(self._direct(target), timeout=10)
+            with self.lock:
+                self.connections.add(upstream)
+            upstream.sendall(initial)
+            client.settimeout(None)
+            upstream.settimeout(None)
+            reverse = threading.Thread(target=self._pump, args=(upstream, client), daemon=True)
+            reverse.start()
+            self._pump(client, upstream)
+            reverse.join()
+        except (OSError, ClientError):
+            pass
+        finally:
+            with self.lock:
+                self.connections.discard(client)
+                if upstream is not None:
+                    self.connections.discard(upstream)
+            client.close()
+            if upstream is not None:
+                upstream.close()
+            self.slots.release()
+
+    @staticmethod
+    def _pump(source: socket.socket, destination: socket.socket) -> None:
+        try:
+            while block := source.recv(64 * 1024):
+                destination.sendall(block)
+        except OSError:
+            pass
+        try:
+            destination.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+    def stop(self) -> None:
+        self.stopping.set()
+        self.server.close()
+        with self.lock:
+            connections = list(self.connections)
+        for connection in connections:
+            try:
+                connection.close()
+            except OSError:
+                pass
+        self.thread.join(timeout=2)
+
+
+def child_environment(ca: Path, config: Path, proxy: str) -> dict[str, str]:
+    environment = dict(os.environ)
+    environment.pop("GITHUB_TOKEN", None)
+    environment.update({
+        "GH_TOKEN": PLACEHOLDER,
+        "GH_CONFIG_DIR": str(config),
+        "HTTP_PROXY": proxy, "HTTPS_PROXY": proxy, "http_proxy": proxy, "https_proxy": proxy,
+        "SSL_CERT_FILE": str(ca), "REQUESTS_CA_BUNDLE": str(ca), "CURL_CA_BUNDLE": str(ca),
+        "GIT_SSL_CAINFO": str(ca), "NODE_EXTRA_CA_CERTS": str(ca),
+    })
+    return environment
+
+
+def run(command: list[str]) -> int:
+    span_path = os.environ.get("DEVC2_GITHUB_SOCKET", DEFAULT_SOCKET)
+    certificate = receive_ca(span_path)
+    bundle = system_ca().rstrip(b"\n") + b"\n" + certificate.rstrip(b"\n") + b"\n"
+    return_code = 1
+    with tempfile.TemporaryDirectory(prefix="devc2-github-") as raw:
+        root = Path(raw)
+        os.chmod(root, 0o700)
+        ca = root / "ca.pem"
+        config = root / "gh"
+        config.mkdir(mode=0o700)
+        private_write(ca, bundle)
+        private_write(config / "hosts.yml", (
+            "github.com:\n  git_protocol: ssh\n  oauth_token: " + PLACEHOLDER + "\n  user: devc2\n"
+        ).encode())
+        fallback = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+        adapter = Adapter(span_path, fallback)
+        child = None
+        pending = None
+        previous = {}
+        def forward(signum, _frame):
+            nonlocal pending
+            if child is None:
+                pending = signum
+            elif child.poll() is None:
+                try:
+                    os.killpg(child.pid, signum)
+                except ProcessLookupError:
+                    pass
+        try:
+            for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+                previous[signum] = signal.signal(signum, forward)
+            child = subprocess.Popen(command, env=child_environment(ca, config, adapter.url), start_new_session=True)
+            if pending is not None:
+                try:
+                    os.killpg(child.pid, pending)
+                except ProcessLookupError:
+                    pass
+            return_code = child.wait()
+        finally:
+            for signum, handler in previous.items():
+                signal.signal(signum, handler)
+            if child is not None and child.poll() is None:
+                try:
+                    os.killpg(child.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    child.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    child.wait()
+            adapter.stop()
+    if return_code < 0:
+        signum = -return_code
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+    return return_code
+
+
+def main(arguments: list[str]) -> int:
+    if arguments in (["-h"], ["--help"]):
+        print(USAGE)
+        return 0
+    if len(arguments) < 3 or arguments[0:2] != ["run", "--"]:
+        print(USAGE, file=sys.stderr)
+        return 2
+    return run(arguments[2:])
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except (OSError, ClientError, subprocess.SubprocessError) as error:
+        print(f"github: {error}", file=sys.stderr)
+        raise SystemExit(1)

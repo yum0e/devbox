@@ -18,7 +18,6 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = ROOT / "examples" / "herdr-span"
 PROVIDER_PATH = EXAMPLE / "herdr-span"
-CLIENT_PATH = EXAMPLE / "herdr"
 REGISTER = EXAMPLE / "register.py"
 
 
@@ -52,14 +51,14 @@ class FakeHerdr:
         return {"type": "ok"}
 
 
-def provider() -> H.Provider:
-    item = H.Provider.__new__(H.Provider)
+def provider() -> H.World:
+    item = H.World.__new__(H.World)
     item.island_id = "island-one"
     item.workspace = Path("/workspace")
     item.anchor = "w1:p1"
     item.herdr = FakeHerdr()
     item.docker = "/bin/true"
-    item.provider = "/trusted/herdr-span"
+    item.world_executable = "/trusted/herdr-span"
     item.jobs = {}
     item.lock = threading.RLock()
     item.stopping = threading.Event()
@@ -67,7 +66,7 @@ def provider() -> H.Provider:
     return item
 
 
-class ProviderTests(unittest.TestCase):
+class WorldAuthorityTests(unittest.TestCase):
     def test_herdr_socket_address_is_compatible_with_host_python_39(self):
         self.assertEqual(H.Herdr(Path("/host/herdr.sock")).path, "/host/herdr.sock")
 
@@ -84,8 +83,8 @@ class ProviderTests(unittest.TestCase):
              mock.patch.object(H, "safe_socket", return_value=Path("/host/herdr.sock")), \
              mock.patch.object(H, "safe_executable", return_value="/bin/true"), \
              mock.patch.object(H.Herdr, "call", side_effect=responses) as call:
-            item = H.Provider()
-            self.assertEqual(call.call_count, 0, "provider startup must not contact semantic upstreams")
+            item = H.World()
+            self.assertEqual(call.call_count, 0, "World startup must not contact semantic upstreams")
             with self.assertRaisesRegex(H.SpanError, "offline"):
                 item.handle({"op": "list"})
             self.assertEqual(item.handle({"op": "list"}), [])
@@ -155,6 +154,20 @@ class ProviderTests(unittest.TestCase):
         item.jobs["tests"] = H.Job("tests", "w1:p2", "terminal-new", marker)
         item.herdr.output = f"some output\n{marker}17\n"
         self.assertEqual(item.handle({"op": "wait", "name": "tests", "timeout_ms": 1000}), {"exit_code": 17})
+
+    def test_read_returns_only_worker_output(self):
+        item = provider()
+        marker = "__DEVC2_HERDR_" + "5" * 32 + "_EXIT_"
+        item.jobs["clean"] = H.Job("clean", "w1:p2", "terminal-new", marker)
+        item.herdr.output = (
+            "exec /private/host/herdr worker PRIVATE_PAYLOAD\n"
+            "devbox ➜ exec /private/host/herdr worker PRIVATE_PAYLOAD\n"
+            f"{H.start_marker(marker)}\n"
+            "worker output\n"
+            f"{marker}0\n"
+        )
+        self.assertEqual(item.handle({"op": "read", "name": "clean", "lines": 10}), "worker output\n")
+        self.assertNotIn("PRIVATE_PAYLOAD", item.handle({"op": "read", "name": "clean", "lines": 10}))
 
     def test_finished_worker_rejects_input(self):
         item = provider()
@@ -262,7 +275,8 @@ class ProviderTests(unittest.TestCase):
             "marker": "__DEVC2_HERDR_" + "3" * 32 + "_EXIT_",
         }
         raw = base64.urlsafe_b64encode(json.dumps(task).encode()).decode()
-        with mock.patch.object(H.subprocess, "run", return_value=mock.Mock(returncode=23)) as run, \
+        with mock.patch.dict(H.os.environ, {"REQUIRED_HOST_SETTING": "yes"}, clear=True), \
+             mock.patch.object(H.subprocess, "run", return_value=mock.Mock(returncode=23)) as run, \
              mock.patch.object(H.signal, "signal"), \
              mock.patch.object(H.time, "sleep", side_effect=RuntimeError("parked")), \
              self.assertRaisesRegex(RuntimeError, "parked"):
@@ -270,7 +284,7 @@ class ProviderTests(unittest.TestCase):
         run.assert_called_once_with([
             "/bin/true", "exec", "--interactive", "--tty", "--user", "1000:1000",
             "--workdir", "/workspace", "b" * 64, "sh", "-lc", "echo $HOME; $(id)",
-        ], check=False)
+        ], check=False, env={"REQUIRED_HOST_SETTING": "yes", "DOCKER_CLI_HINTS": "false"})
 
 
 class InstallerTests(unittest.TestCase):
@@ -283,24 +297,76 @@ class InstallerTests(unittest.TestCase):
             catalog.write_text(json.dumps({"spans": {"other": {"provider": "/opt/p", "client": "/opt/c"}}}))
             catalog.chmod(0o600)
             completed = subprocess.run(
-                [sys.executable, str(REGISTER), str(catalog), str(root / "spans"), str(PROVIDER_PATH), str(CLIENT_PATH)],
+                [sys.executable, str(REGISTER), str(catalog), str(root / "spans"), str(PROVIDER_PATH)],
                 text=True, capture_output=True, check=True,
             )
-            self.assertIn("registered Herdr Span", completed.stdout)
+            self.assertIn("registered Herdr command Link", completed.stdout)
             document = json.loads(catalog.read_text())
             self.assertIn("other", document["spans"])
-            for field in ("provider", "client"):
-                path = Path(document["spans"]["herdr"][field])
-                self.assertTrue(path.is_file())
-                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o555)
+            world = Path(document["spans"]["herdr"])
+            self.assertTrue(world.is_file())
+            self.assertEqual(stat.S_IMODE(world.stat().st_mode), 0o555)
+            self.assertEqual(set(world.parent.iterdir()), {world})
 
 
-class ClientTests(unittest.TestCase):
-    def test_help_is_discoverable_without_a_provider(self):
-        completed = subprocess.run([sys.executable, str(CLIENT_PATH), "--help"], text=True, capture_output=True)
-        self.assertEqual(completed.returncode, 0)
+class CommandAffordanceTests(unittest.TestCase):
+    def invoke(self, item, argv, stdin=b""):
+        return H.invoke_command(item, {
+            "v": 1,
+            "command": "herdr",
+            "argv": argv,
+            "stdin_b64": base64.b64encode(stdin).decode(),
+        })
+
+    def output(self, response, name):
+        return base64.b64decode(response[name]).decode()
+
+    def test_help_is_exported_by_the_world_without_contacting_herdr(self):
+        item = provider()
+        response = self.invoke(item, ["--help"])
+        self.assertEqual(response["exit_code"], 0)
+        self.assertFalse(item.herdr.calls)
+        output = self.output(response, "stdout_b64")
         for command in ("spawn", "list", "read", "send", "wait"):
-            self.assertIn(command, completed.stdout)
+            self.assertIn(command, output)
+
+    def test_world_owns_cli_semantics_and_exit_status(self):
+        item = provider()
+        listed = self.invoke(item, ["list"])
+        self.assertEqual(listed["exit_code"], 0)
+        self.assertEqual(self.output(listed, "stdout_b64"), "")
+        marker = "__DEVC2_HERDR_" + "9" * 32 + "_EXIT_"
+        item.jobs["done"] = H.Job("done", "w1:p2", "terminal-new", marker, exit_code=23)
+        waited = self.invoke(item, ["wait", "done"])
+        self.assertEqual(waited["exit_code"], 23)
+
+    def test_world_returns_normal_command_output_through_the_link(self):
+        item = provider()
+
+        def handle(request):
+            if request["op"] == "spawn":
+                return "w1:p2"
+            if request["op"] == "list":
+                return [{"name": "worker", "state": "running"}]
+            if request["op"] == "read":
+                return "worker output"
+            self.fail(f"unexpected operation: {request['op']}")
+
+        item.handle = mock.Mock(side_effect=handle)
+        spawned = self.invoke(item, ["spawn", "worker", "--", "true"])
+        listed = self.invoke(item, ["list"])
+        read = self.invoke(item, ["read", "worker"])
+        self.assertEqual(self.output(spawned, "stdout_b64"), "w1:p2\n")
+        self.assertEqual(self.output(listed, "stdout_b64"), "worker\trunning\n")
+        self.assertEqual(self.output(read, "stdout_b64"), "worker output\n")
+
+    def test_world_rejects_other_commands_and_hidden_stdin(self):
+        item = provider()
+        with self.assertRaisesRegex(H.SpanError, "not exported"):
+            H.invoke_command(item, {"v": 1, "command": "bash", "argv": [], "stdin_b64": ""})
+        response = self.invoke(item, ["list"], b"hidden")
+        self.assertEqual(response["exit_code"], 1)
+        self.assertIn("only herdr send", self.output(response, "stderr_b64"))
 
 
 if __name__ == "__main__":

@@ -18,9 +18,9 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = ROOT / "examples" / "openai-span"
-PROVIDER_PATH = EXAMPLE / "openai-provider"
-CLIENT_PATH = EXAMPLE / "openai"
-REGISTER = EXAMPLE / "register.py"
+PRODUCTION = ROOT / "spans" / "openai"
+PROVIDER_PATH = PRODUCTION / "provider"
+CLIENT_PATH = PRODUCTION / "client"
 
 
 def load(path: Path, name: str):
@@ -37,6 +37,16 @@ C = load(CLIENT_PATH, "openai_span_client")
 
 
 class ProviderTests(unittest.TestCase):
+    def test_stale_private_roots_are_removed_only_when_safe(self):
+        with tempfile.TemporaryDirectory() as raw:
+            temporary = Path(raw)
+            stale = temporary / "devc2-openai-deadbeef-generation"
+            stale.mkdir(mode=0o700)
+            (stale / "access-token").write_text("secret")
+            with mock.patch.object(P.tempfile, "gettempdir", return_value=raw):
+                P.cleanup_stale_roots("devc2-openai-deadbeef-")
+            self.assertFalse(stale.exists())
+
     def valid_auth(self) -> dict:
         return {
             "tokens": {
@@ -82,6 +92,26 @@ class ProviderTests(unittest.TestCase):
                 with mock.patch.dict(P.os.environ, {"DEVC2_OPENAI_AUTH_FILE": str(auth)}, clear=True), \
                      self.assertRaises(P.ProviderError):
                     P.read_auth()
+
+    def test_docker_subprocess_environment_excludes_host_credentials(self):
+        inherited = {
+            "PATH": "/trusted/bin",
+            "HOME": "/host/home",
+            "DOCKER_HOST": "unix:///trusted/docker.sock",
+            "XDG_RUNTIME_DIR": "/trusted/runtime",
+            "SSH_AUTH_SOCK": "/host/agent.sock",
+            "GH_TOKEN": "github-secret",
+            "OPENAI_API_KEY": "openai-secret",
+            "AWS_SECRET_ACCESS_KEY": "aws-secret",
+        }
+        with mock.patch.dict(P.os.environ, inherited, clear=True):
+            environment = P.docker_environment()
+        self.assertEqual(environment, {
+            "PATH": "/trusted/bin",
+            "HOME": "/host/home",
+            "DOCKER_HOST": "unix:///trusted/docker.sock",
+            "XDG_RUNTIME_DIR": "/trusted/runtime",
+        })
 
     def test_connect_scope_is_exact_and_rejects_header_ambiguity(self):
         accepted = b"CONNECT chatgpt.com:443 HTTP/1.1\r\nHost: chatgpt.com:443\r\n\r\nopaque"
@@ -150,6 +180,7 @@ class ProviderTests(unittest.TestCase):
                 remove.return_value = True
                 proxy.stop()
             remove.assert_called_once_with("c" * 64)
+            self.assertFalse(root.exists())
 
     def test_helper_identity_and_secret_state_are_retained_when_cleanup_cannot_be_verified(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -192,13 +223,17 @@ class ProviderTests(unittest.TestCase):
             size = P.LENGTH.unpack(C.receive(right, P.LENGTH.size))[0]
             result = C.receive(right, size)
         thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
         self.assertEqual(result, certificate)
         self.assertNotIn(b"PRIVATE KEY", result)
 
 
 class ClientTests(unittest.TestCase):
     def test_help_needs_no_provider(self):
-        result = subprocess.run([str(CLIENT_PATH), "--help"], text=True, capture_output=True, check=False)
+        result = subprocess.run(
+            [sys.executable, str(CLIENT_PATH), "--help"],
+            text=True, capture_output=True, check=False,
+        )
         self.assertEqual(result.returncode, 0)
         self.assertIn("openai run --", result.stdout)
 
@@ -314,28 +349,11 @@ class ClientTests(unittest.TestCase):
         thread.join(timeout=2)
         self.assertEqual(observed["request"], request)
 
-
-class InstallerTests(unittest.TestCase):
-    def test_installer_preserves_catalog_and_installs_immutable_generation(self):
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            catalog = root / "config" / "spans.json"
-            catalog.parent.mkdir()
-            catalog.write_text(json.dumps({"spans": {"other": {"provider": "/p", "client": "/c"}}}))
-            catalog.chmod(0o600)
-            install_root = root / "installed"
-            result = subprocess.run(
-                [sys.executable, str(REGISTER), str(catalog), str(install_root), str(PROVIDER_PATH), str(CLIENT_PATH)],
-                text=True, capture_output=True, check=False,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            document = json.loads(catalog.read_text())
-            self.assertIn("other", document["spans"])
-            entry = document["spans"]["openai"]
-            for field in ("provider", "client"):
-                path = Path(entry[field])
-                self.assertTrue(path.is_file())
-                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o555)
+    def test_direct_fallback_accepts_only_uncredentialed_https_connect(self):
+        self.assertEqual(C.Adapter._direct_address(b"CONNECT example.com:443 HTTP/1.1"), ("example.com", 443))
+        for line in (b"GET / HTTP/1.1", b"CONNECT example.com:80 HTTP/1.1", b"CONNECT user@example.com:443 HTTP/1.1"):
+            with self.subTest(line=line), self.assertRaises(C.OpenAIError):
+                C.Adapter._direct_address(line)
 
 
 if __name__ == "__main__":

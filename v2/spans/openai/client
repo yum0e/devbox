@@ -160,6 +160,21 @@ class Adapter:
             raise OpenAIError("inherited proxy URL is invalid")
         return parsed.hostname, port
 
+    @staticmethod
+    def _direct_address(first_line: bytes) -> tuple[str, int]:
+        fields = first_line.split(b" ")
+        if len(fields) != 3 or fields[0] != b"CONNECT" or fields[2] not in (b"HTTP/1.0", b"HTTP/1.1"):
+            raise OpenAIError("unsupported proxy request")
+        try:
+            parsed = urllib.parse.urlsplit("//" + fields[1].decode("ascii"))
+            port = parsed.port
+        except (UnicodeError, ValueError) as error:
+            raise OpenAIError("proxy target is invalid") from error
+        if (not parsed.hostname or port != 443 or parsed.username is not None
+                or parsed.password is not None or parsed.path or parsed.query or parsed.fragment):
+            raise OpenAIError("proxy target is invalid")
+        return parsed.hostname, port
+
     @property
     def url(self) -> str:
         return f"http://127.0.0.1:{self.server.getsockname()[1]}"
@@ -214,7 +229,9 @@ class Adapter:
             elif self.fallback is not None:
                 upstream = socket.create_connection(self.fallback, timeout=10)
             else:
-                raise OpenAIError("no inherited proxy is available for this destination")
+                # The Island already has unrestricted egress. Preserve ordinary
+                # child HTTPS without widening the credential-bearing provider.
+                upstream = socket.create_connection(self._direct_address(first_line), timeout=10)
             upstream.sendall(initial)
         except (OSError, OpenAIError):
             self._forget(client)
