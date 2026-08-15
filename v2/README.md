@@ -133,6 +133,13 @@ security boundary, manual proof, and intentionally omitted features are
 documented in the example README. It is likewise not part of the Island image or
 devc2 release assets.
 
+`examples/openai-span/` experiments with moving authenticated ChatGPT/Codex
+transport out of the Island bootstrap. Its child-scoped `openai run -- …`
+client receives only a public CA and fake auth; a host provider retains the real
+credential and permits only the exact Codex host, paths, and methods. The
+existing built-in credential path remains in place until this additive example
+passes its live proof.
+
 The catalog/no-argument contract replaces the earlier experimental
 `<name>-span describe|serve` prototype. Re-run the probe installer after updating.
 Other prototype providers should install immutable provider/client files outside
