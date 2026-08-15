@@ -253,13 +253,24 @@ class World:
                 while not self.stopping.is_set():
                     try:
                         request = read_packet(connection, self.agent_filter.config.max_message)
-                    except (OSError, ProtocolError):
+                    except OSError as error:
+                        LOG.warning(
+                            "Link request failed (%s)",
+                            type(error).__name__,
+                        )
+                        return
+                    except ProtocolError:
+                        LOG.warning("Link sent an invalid SSH-agent packet")
                         return
                     if request is None:
                         return
                     try:
                         write_packet(connection, self.agent_filter.handle(request))
-                    except OSError:
+                    except OSError as error:
+                        LOG.warning(
+                            "Link response failed (%s)",
+                            type(error).__name__,
+                        )
                         return
         finally:
             with self.lock:

@@ -5,6 +5,7 @@ import os
 import socket
 import ssl
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -35,7 +36,10 @@ P = W
 
 
 def key_blob(label: bytes) -> bytes:
-    return P.pack_string(b"ssh-ed25519") + label.ljust(32, b"x")[:32]
+    return (
+        P.pack_string(b"ssh-ed25519")
+        + P.pack_string(label.ljust(32, b"x")[:32])
+    )
 
 
 def public_line(blob: bytes, comment: str = "test") -> str:
@@ -204,6 +208,15 @@ class WorldTests(unittest.TestCase):
             )
             bridge.start()
             try:
+                completed = subprocess.run(
+                    ["ssh-add", "-L"],
+                    env={**os.environ, "SSH_AUTH_SOCK": str(socket_dir / "ssh-agent.sock")},
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(completed.stdout.strip(), public_line(allowed, "selected"))
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as projected:
                     projected.settimeout(5)
                     projected.connect(str(socket_dir / "ssh-agent.sock"))

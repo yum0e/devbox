@@ -266,8 +266,9 @@ class Provider:
 class OpaqueRelay:
     """Mutually authenticated TCP ingress; bytes are otherwise untouched."""
 
-    def __init__(self, upstream: tuple[str, int], tls_directory: Path):
+    def __init__(self, upstream: tuple[str, int], tls_directory: Path, name: str = "unknown"):
         self.upstream = upstream
+        self.name = name
         self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self.context.minimum_version = ssl.TLSVersion.TLSv1_2
         self.context.options |= ssl.OP_NO_COMPRESSION
@@ -316,6 +317,7 @@ class OpaqueRelay:
 
     def _connection(self, raw: socket.socket) -> None:
         tracked: socket.socket = raw
+        stage = "TLS handshake"
         with self.connections_lock:
             self.connections.add(raw)
         try:
@@ -326,10 +328,18 @@ class OpaqueRelay:
                     self.connections.discard(raw)
                     self.connections.add(incoming)
                 incoming.settimeout(None)
+                stage = "World connection"
                 with socket.create_connection(self.upstream, timeout=10) as upstream:
+                    stage = "stream relay"
                     duplex_stream(incoming, upstream, self.stopping)
-        except (OSError, ssl.SSLError, RuntimeError):
-            pass
+        except (OSError, ssl.SSLError, RuntimeError) as error:
+            if not self.stopping.is_set():
+                print(
+                    f"devc2: Span {self.name!r} host relay failed during {stage} "
+                    f"({type(error).__name__})",
+                    file=sys.stderr,
+                    flush=True,
+                )
         finally:
             with self.connections_lock:
                 self.connections.discard(raw)
@@ -363,7 +373,7 @@ class SpanRuntime:
                 provider = Provider(span, workspace, instance_id)
                 self.providers.append(provider)
                 provider.check_started()
-                relay = OpaqueRelay(provider.address, tls_directory)
+                relay = OpaqueRelay(provider.address, tls_directory, span.name)
                 self.relays.append(relay)
                 self.ports[span.name] = relay.port
         except Exception:

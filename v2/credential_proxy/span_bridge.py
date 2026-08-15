@@ -73,20 +73,29 @@ class Bridge:
 
     def _connection(self, client: socket.socket) -> None:
         tracked: list[socket.socket] = [client]
+        stage = "host connection"
         with self.connections_lock:
             self.connections.add(client)
         try:
             with client:
                 try:
                     with socket.create_connection((self.host, self.port), timeout=10) as raw:
+                        stage = "TLS handshake"
                         with self.context.wrap_socket(raw, server_hostname=self.host) as remote:
                             tracked.append(remote)
                             with self.connections_lock:
                                 self.connections.add(remote)
                             client.settimeout(None)
                             remote.settimeout(None)
+                            stage = "stream relay"
                             duplex_stream(client, remote, self.stopping)
-                except (OSError, ssl.SSLError, RuntimeError):
+                except (OSError, ssl.SSLError, RuntimeError) as error:
+                    if not self.stopping.is_set():
+                        print(
+                            f"span-bridge: Span {self.name!r} failed during {stage} "
+                            f"({type(error).__name__})",
+                            flush=True,
+                        )
                     return
         finally:
             with self.connections_lock:
