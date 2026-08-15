@@ -218,6 +218,43 @@ class ProviderTests(unittest.TestCase):
         with mock.patch.object(H.subprocess, "run", side_effect=responses), self.assertRaisesRegex(H.SpanError, "metadata"):
             item.island_container()
 
+    def test_container_selection_accepts_only_exact_docker_desktop_workspace_encoding(self):
+        item = provider()
+        labels = {
+            "dev.devbox.generation": "2",
+            "dev.devbox.workspace-hash": item.workspace_hash,
+            "com.docker.compose.project": f"devc2-{item.workspace_hash}",
+            "com.docker.compose.service": "devbox",
+            "com.docker.compose.oneoff": "True",
+        }
+        inspect = [{
+            "Id": "d" * 64,
+            "State": {"Running": True},
+            "Config": {"Labels": labels},
+            "Mounts": [{
+                "Destination": "/workspace", "Type": "bind", "RW": True,
+                "Source": "/host_mnt/workspace",
+            }],
+        }]
+        responses = (
+            subprocess.CompletedProcess([], 0, stdout="short-id\n", stderr=""),
+            subprocess.CompletedProcess([], 0, stdout=json.dumps(inspect), stderr=""),
+        )
+        del item.island_container
+        with mock.patch.object(H.sys, "platform", "darwin"), \
+             mock.patch.object(H.subprocess, "run", side_effect=responses):
+            self.assertEqual(item.island_container(), "d" * 64)
+
+        inspect[0]["Mounts"][0]["Source"] = "/host_mnt/other"
+        responses = (
+            subprocess.CompletedProcess([], 0, stdout="short-id\n", stderr=""),
+            subprocess.CompletedProcess([], 0, stdout=json.dumps(inspect), stderr=""),
+        )
+        with mock.patch.object(H.sys, "platform", "darwin"), \
+             mock.patch.object(H.subprocess, "run", side_effect=responses), \
+             self.assertRaisesRegex(H.SpanError, "metadata"):
+            item.island_container()
+
     def test_worker_uses_fixed_docker_options_and_parks(self):
         task = {
             "docker": "/bin/true", "container": "b" * 64,

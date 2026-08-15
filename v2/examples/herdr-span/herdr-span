@@ -201,13 +201,15 @@ class Provider:
             "com.docker.compose.service": "devbox",
             "com.docker.compose.oneoff": "True",
         }
+        workspace_sources = {os.fspath(self.workspace)}
+        if sys.platform == "darwin":
+            workspace_sources.add("/host_mnt" + os.fspath(self.workspace))
         workspace_mounts = [
             item for item in mounts
             if item.get("Destination") == "/workspace"
             and item.get("Type") == "bind"
             and item.get("RW") is True
-            and isinstance(item.get("Source"), str)
-            and Path(item["Source"]).resolve() == self.workspace
+            and item.get("Source") in workspace_sources
         ]
         if inspected.returncode or not running or not isinstance(labels, dict) or any(labels.get(k) != v for k, v in expected.items()):
             raise SpanError("Docker container is not the granted Island")
