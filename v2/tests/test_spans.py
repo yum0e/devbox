@@ -426,6 +426,35 @@ class ProviderLifecycleTests(unittest.TestCase):
                 relay.stop()
                 provider.stop()
 
+    def test_duplex_relay_propagates_delayed_half_closes(self):
+        island, relay_left = socket.socketpair()
+        relay_right, world = socket.socketpair()
+        stopping = threading.Event()
+        thread = threading.Thread(
+            target=span_runtime.OpaqueRelay._duplex,
+            args=(relay_left, relay_right, stopping),
+            daemon=True,
+        )
+        thread.start()
+        try:
+            island.sendall(b"request")
+            self.assertEqual(world.recv(7), b"request")
+            island.shutdown(socket.SHUT_WR)
+            world.settimeout(2)
+            self.assertEqual(world.recv(1), b"")
+            world.sendall(b"response")
+            world.shutdown(socket.SHUT_WR)
+            island.settimeout(2)
+            self.assertEqual(island.recv(8), b"response")
+            self.assertEqual(island.recv(1), b"")
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+        finally:
+            stopping.set()
+            for connection in (island, relay_left, relay_right, world):
+                connection.close()
+            thread.join(2)
+
 
 class BridgeConfigTests(unittest.TestCase):
     def test_bridge_config_knows_only_names_and_ports(self):

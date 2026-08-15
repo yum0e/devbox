@@ -169,14 +169,21 @@ class AgentFilter:
                 raise ProtocolError("upstream agent closed without a response")
             return response
 
+    def selected_identity(self) -> tuple[bytes, bytes] | None:
+        request = bytes([SSH2_AGENTC_REQUEST_IDENTITIES])
+        identities = parse_identities(self._round_trip(request))
+        return next(
+            (item for item in identities if item[0] == self.config.allowed_key_blob),
+            None,
+        )
+
     def handle(self, request: bytes) -> bytes:
         if request == bytes([SSH2_AGENTC_REQUEST_IDENTITIES]):
             try:
-                identities = parse_identities(self._round_trip(request))
+                match = self.selected_identity()
             except (OSError, ProtocolError):
                 LOG.warning("upstream identities request failed", exc_info=True)
                 return bytes([SSH_AGENT_FAILURE])
-            match = next((item for item in identities if item[0] == self.config.allowed_key_blob), None)
             if match is None:
                 return bytes([SSH2_AGENT_IDENTITIES_ANSWER]) + pack_u32(0)
             comment = match[1] or self.config.allowed_comment
@@ -301,7 +308,16 @@ def configured_world() -> World:
     except RuntimeError as error:
         listener.close()
         raise RuntimeError(f"selected SSH public key is unavailable: {key_path}") from error
-    return World(listener, AgentFilter(FilterConfig(upstream_path, blob, comment)))
+    agent_filter = AgentFilter(FilterConfig(upstream_path, blob, comment))
+    try:
+        selected = agent_filter.selected_identity()
+    except (OSError, ProtocolError) as error:
+        listener.close()
+        raise RuntimeError("host SSH agent did not answer the readiness check") from error
+    if selected is None:
+        listener.close()
+        raise RuntimeError("selected SSH identity is absent from the host agent")
+    return World(listener, agent_filter)
 
 
 def main() -> int:
@@ -312,7 +328,7 @@ def main() -> int:
     try:
         world = configured_world()
     except RuntimeError as error:
-        print(f"ssh-agent-span: {error}", file=sys.stderr)
+        print(f"ssh-agent-world: {error}", file=sys.stderr)
         return 2
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, lambda _signum, _frame: world.shutdown())

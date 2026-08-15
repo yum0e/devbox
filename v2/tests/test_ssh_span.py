@@ -3,6 +3,7 @@ import importlib.machinery
 import importlib.util
 import os
 import socket
+import ssl
 import struct
 import sys
 import tempfile
@@ -11,6 +12,10 @@ import time
 import unittest
 from pathlib import Path
 from unittest import mock
+
+from credential_proxy import span_bridge
+from launcher import devc2
+from launcher import span_runtime
 
 
 ROOT = Path(__file__).parents[1]
@@ -170,6 +175,65 @@ class WorldTests(unittest.TestCase):
             left.close()
             right.close()
 
+    def test_selected_identity_crosses_the_complete_generic_stream_link(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            allowed = key_blob(b"allowed")
+            upstream = FakeAgent(root / "agent.sock", [(allowed, b"selected")]).start()
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            world = P.World(
+                listener,
+                P.AgentFilter(P.FilterConfig(str(upstream.path), allowed, b"selected")),
+            )
+            world_thread = threading.Thread(target=world.serve_forever, daemon=True)
+            world_thread.start()
+            server_tls, client_tls = devc2.generate_relay_pki(root / "pki")
+            relay = span_runtime.OpaqueRelay(listener.getsockname(), server_tls)
+            context = ssl.create_default_context(
+                ssl.Purpose.SERVER_AUTH,
+                cafile=str(client_tls / "ca.crt"),
+            )
+            context.check_hostname = False
+            context.load_cert_chain(client_tls / "client.crt", client_tls / "client.key")
+            socket_dir = root / "projected"
+            socket_dir.mkdir()
+            bridge = span_bridge.Bridge(
+                "ssh-agent", relay.port, socket_dir, "127.0.0.1", context,
+            )
+            bridge.start()
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as projected:
+                    projected.settimeout(5)
+                    projected.connect(str(socket_dir / "ssh-agent.sock"))
+                    P.write_packet(projected, bytes([P.SSH2_AGENTC_REQUEST_IDENTITIES]))
+                    try:
+                        response = P.read_packet(projected)
+                    except TimeoutError:
+                        self.fail(
+                            "generic stream timed out after %d upstream request(s)"
+                            % len(upstream.requests)
+                        )
+                    self.assertEqual(P.parse_identities(response), [(allowed, b"selected")])
+                    sign = (
+                        bytes([P.SSH2_AGENTC_SIGN_REQUEST])
+                        + P.pack_string(allowed)
+                        + P.pack_string(b"payload")
+                        + P.pack_u32(0)
+                    )
+                    P.write_packet(projected, sign)
+                    self.assertEqual(
+                        P.read_packet(projected)[0],
+                        P.SSH2_AGENT_SIGN_RESPONSE,
+                    )
+            finally:
+                bridge.stop()
+                relay.stop()
+                world.shutdown()
+                world_thread.join(2)
+                upstream.close()
+
     def test_configured_world_requires_runtime_socket_agent_and_saved_key(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -192,11 +256,44 @@ class WorldTests(unittest.TestCase):
             listener.close()
             agent.close()
             self.assertEqual(provider.agent_filter.config.allowed_key_blob, allowed)
+            self.assertEqual(
+                agent.requests,
+                [bytes([P.SSH2_AGENTC_REQUEST_IDENTITIES])],
+            )
 
     def test_configured_world_rejects_missing_agent(self):
         with mock.patch.dict(os.environ, {"DEVC2_SPAN_SOCKET_FD": "3"}, clear=True):
             with self.assertRaisesRegex(RuntimeError, "missing SSH Span runtime environment"):
                 P.configured_world()
+
+    def test_configured_world_rejects_an_absent_selected_identity(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            config = root / ".config" / "devc2"
+            config.mkdir(parents=True)
+            selected = key_blob(b"selected")
+            (config / "ssh-key.pub").write_text(public_line(selected))
+            agent = FakeAgent(
+                root / "agent.sock",
+                [(key_blob(b"other"), b"other")],
+            ).start()
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            descriptor = os.dup(listener.fileno())
+            try:
+                with mock.patch.dict(os.environ, {
+                    "HOME": str(root),
+                    "SSH_AUTH_SOCK": str(agent.path),
+                    "DEVC2_SPAN_SOCKET_FD": str(descriptor),
+                }, clear=True), self.assertRaisesRegex(
+                    RuntimeError,
+                    "selected SSH identity is absent",
+                ):
+                    P.configured_world()
+            finally:
+                listener.close()
+                agent.close()
 
 
 class FileContractTests(unittest.TestCase):
