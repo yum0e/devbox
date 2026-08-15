@@ -1,0 +1,627 @@
+#!/usr/bin/env python3
+"""Host-side OpenAI World: subscription authority and request policy."""
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from typing import Optional
+import uuid
+
+
+IRON = "ironsh/iron-proxy:0.49.0@sha256:c4628019c24f4cc8d77564a26b7c9cedb00accee6f93d06270e85fb8f9c6a7da"
+FAKE_ACCOUNT = "00000000-0000-0000-0000-000000000000"
+MAX_AUTH = 1024 * 1024
+MAX_CA = 1024 * 1024
+MAX_CONNECT = 16 * 1024
+MAX_HANDLERS = 16
+MAX_BOOTSTRAP = 2 * 1024 * 1024
+LENGTH = struct.Struct("!I")
+CONNECT_LINE = re.compile(rb"CONNECT chatgpt\.com:443 HTTP/1\.[01]")
+HEADER_NAME = re.compile(rb"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+
+
+class ProviderError(Exception):
+    pass
+
+
+def jwt(claims: dict) -> str:
+    def encode(value: dict) -> str:
+        return base64.urlsafe_b64encode(
+            json.dumps(value, separators=(",", ":")).encode("ascii")
+        ).decode("ascii").rstrip("=")
+
+    return "%s.%s.signature" % (
+        encode({"alg": "none", "typ": "JWT"}),
+        encode(claims),
+    )
+
+
+FAKE_ACCESS = jwt({
+    "aud": ["https://api.openai.com/v1", "https://chatgpt.com/backend-api"],
+    "exp": 4102444800,
+    "sub": "devc2",
+})
+
+
+def fake_auth() -> bytes:
+    identity = jwt({
+        "exp": 4102444800,
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": FAKE_ACCOUNT,
+            "chatgpt_plan_type": "plus",
+        },
+        "sub": "devc2",
+    })
+    document = {
+        "OPENAI_API_KEY": None,
+        "auth_mode": "chatgpt",
+        "tokens": {
+            "id_token": identity,
+            "access_token": FAKE_ACCESS,
+            "refresh_token": "not-a-real-refresh-token",
+            "account_id": FAKE_ACCOUNT,
+        },
+        "last_refresh": "2025-01-01T00:00:00.000Z",
+    }
+    return json.dumps(document, separators=(",", ":")).encode()
+
+
+def bootstrap(certificate: bytes) -> bytes:
+    auth = base64.b64encode(fake_auth()).decode("ascii")
+    document = {
+        "v": 1,
+        "ca_b64": base64.b64encode(certificate).decode("ascii"),
+        "files": [
+            {"name": "auth.json", "contents_b64": auth},
+            {"name": "codex/auth.json", "contents_b64": auth},
+        ],
+        "environment": {
+            "HTTP_PROXY": "${PROXY}",
+            "http_proxy": "${PROXY}",
+            "HTTPS_PROXY": "${PROXY}",
+            "https_proxy": "${PROXY}",
+            "NO_PROXY": "localhost,127.0.0.1,::1,.internal",
+            "no_proxy": "localhost,127.0.0.1,::1,.internal",
+            "SSL_CERT_FILE": "${CA}",
+            "REQUESTS_CA_BUNDLE": "${CA}",
+            "CURL_CA_BUNDLE": "${CA}",
+            "GIT_SSL_CAINFO": "${CA}",
+            "CARGO_HTTP_CAINFO": "${CA}",
+            "NODE_EXTRA_CA_CERTS": "${CA}",
+            "TACT_AUTH": "chatgpt",
+            "TACT_AUTH_FILE": "${ROOT}/auth.json",
+            "CODEX_HOME": "${ROOT}/codex",
+        },
+        "routes": ["chatgpt.com:443"],
+    }
+    payload = json.dumps(document, separators=(",", ":")).encode()
+    if len(payload) > MAX_BOOTSTRAP:
+        raise ProviderError("OpenAI bootstrap exceeds 2 MiB")
+    return payload
+
+
+def auth_path() -> Path:
+    override = os.environ.get("DEVC2_OPENAI_AUTH_FILE")
+    if override:
+        return Path(override).expanduser()
+    config = os.environ.get("XDG_CONFIG_HOME")
+    root = Path(config).expanduser() if config else Path.home() / ".config"
+    return root / "devc2" / "auth" / "codex" / "auth.json"
+
+
+def read_auth() -> tuple[str, str]:
+    path = auth_path()
+    descriptor = -1
+    try:
+        flags = (os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                 | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        descriptor = os.open(str(path), flags)
+        metadata = os.fstat(descriptor)
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+                or metadata.st_mode & 0o022 or metadata.st_size > MAX_AUTH):
+            raise ProviderError("managed ChatGPT auth is not a bounded regular file")
+        contents = bytearray()
+        while len(contents) <= MAX_AUTH:
+            block = os.read(descriptor, min(64 * 1024, MAX_AUTH + 1 - len(contents)))
+            if not block:
+                break
+            contents.extend(block)
+        if len(contents) > MAX_AUTH:
+            raise ProviderError("managed ChatGPT auth is not a bounded regular file")
+        document = json.loads(bytes(contents).decode("utf-8"))
+    except ProviderError:
+        raise
+    except (OSError, UnicodeError, ValueError, TypeError) as error:
+        raise ProviderError("managed ChatGPT auth is unavailable or invalid") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+    if not isinstance(document, dict):
+        raise ProviderError("managed ChatGPT auth is invalid")
+    tokens = document.get("tokens", document)
+    if not isinstance(tokens, dict):
+        raise ProviderError("managed ChatGPT auth is invalid")
+    access = tokens.get("access_token")
+    account = tokens.get("account_id")
+    if (not isinstance(access, str) or not access or len(access) > MAX_AUTH
+            or any(character.isspace() or character == "\0" for character in access)
+            or not isinstance(account, str) or not account or len(account) > 4096
+            or any(character.isspace() or character == "\0" for character in account)):
+        raise ProviderError("managed ChatGPT auth lacks required credentials")
+    try:
+        fields = access.split(".")
+        if len(fields) != 3 or not fields[1]:
+            raise ValueError
+        payload = fields[1] + "=" * (-len(fields[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
+        expiry = claims["exp"]
+        if isinstance(expiry, bool) or not isinstance(expiry, (int, float)):
+            raise ValueError
+    except (KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError) as error:
+        raise ProviderError("managed ChatGPT access token is malformed") from error
+    if not math.isfinite(expiry) or expiry < time.time() + 3600:
+        raise ProviderError("managed ChatGPT access token expires within one hour")
+    return access, account
+
+
+def private_write(path: Path, data: bytes) -> None:
+    descriptor = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        view = memoryview(data)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+    finally:
+        os.close(descriptor)
+
+
+def docker_environment() -> dict[str, str]:
+    allowed = {
+        "PATH", "HOME", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG",
+        "XDG_RUNTIME_DIR",
+    }
+    return {key: value for key, value in os.environ.items() if key in allowed}
+
+
+def docker_executable() -> str:
+    found = shutil.which("docker")
+    if not found:
+        raise ProviderError("Docker is unavailable")
+    try:
+        resolved = Path(found).resolve(strict=True)
+        metadata = resolved.stat()
+    except OSError as error:
+        raise ProviderError("Docker is unavailable") from error
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid not in (0, os.getuid())
+            or metadata.st_mode & 0o022 or not os.access(resolved, os.X_OK)):
+        raise ProviderError("Docker executable is unsafe")
+    return os.fspath(resolved)
+
+
+def run_docker(arguments: list[str], timeout: float = 120) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            [docker_executable()] + arguments,
+            env=docker_environment(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ProviderError("Docker operation failed") from error
+
+
+def remove_container(identifier: Optional[str]) -> bool:
+    if not identifier or re.fullmatch(r"[0-9a-f]{64}", identifier) is None:
+        return False
+    for _attempt in range(3):
+        try:
+            run_docker(["rm", "--force", identifier], 15)
+            remaining = run_docker([
+                "ps", "--all", "--quiet", "--no-trunc", "--filter", "id=" + identifier,
+            ], 15)
+        except ProviderError:
+            continue
+        if remaining.returncode == 0 and not remaining.stdout.split():
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def remove_named_container(name: str) -> bool:
+    if re.fullmatch(r"devc2-openai-(?:ca|proxy)-[0-9a-f]{32}", name) is None:
+        return False
+    for _attempt in range(3):
+        try:
+            run_docker(["rm", "--force", name], 15)
+            remaining = run_docker([
+                "ps", "--all", "--quiet", "--no-trunc", "--filter", "name=^/" + name + "$",
+            ], 15)
+        except ProviderError:
+            continue
+        if remaining.returncode == 0 and not remaining.stdout.split():
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def cleanup_stale_roots(prefix: str) -> None:
+    temporary = Path(tempfile.gettempdir()).resolve()
+    for candidate in temporary.glob(prefix + "*"):
+        try:
+            metadata = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        if (candidate.parent.resolve() != temporary or stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid()
+                or metadata.st_mode & 0o077):
+            raise ProviderError("stale OpenAI credential directory is unsafe")
+        shutil.rmtree(candidate)
+
+
+def proxy_config() -> dict:
+    def secret(filename: str, placeholder: str, header: str) -> dict:
+        return {
+            "source": {"type": "file", "path": "/run/devc2-private/" + filename},
+            "replace": {
+                "proxy_value": placeholder,
+                "match_headers": [header],
+                "require": True,
+            },
+            "rules": [{
+                "host": "chatgpt.com",
+                "methods": ["GET", "POST"],
+                "paths": ["/backend-api/codex", "/backend-api/codex/*"],
+            }],
+        }
+
+    return {
+        "dns": {"enabled": False},
+        "proxy": {
+            # Docker publishes this listener on host loopback only; the
+            # container-side listener must be reachable through its bridge NIC.
+            "tunnel_listen": "0.0.0.0:8080",
+            "http_listen": "127.0.0.1:0",
+            "https_listen": "127.0.0.1:0",
+        },
+        "metrics": {"listen": "127.0.0.1:0"},
+        "tls": {
+            "mode": "mitm",
+            "ca_cert": "/run/devc2-private/ca.crt",
+            "ca_key": "/run/devc2-private/ca.key",
+        },
+        "transforms": [{
+            "name": "secrets",
+            "config": {"secrets": [
+                secret("access-token", FAKE_ACCESS, "Authorization"),
+                secret("account-id", FAKE_ACCOUNT, "chatgpt-account-id"),
+            ]},
+        }],
+        "log": {"level": "warn"},
+    }
+
+
+class Proxy:
+    def __init__(self, root: Path, container: str, port: int, certificate: bytes):
+        self.root = root
+        self.container = container
+        self.port = port
+        self.certificate = certificate
+
+    def stop(self) -> None:
+        if not remove_container(self.container):
+            raise ProviderError("credential proxy cleanup could not be verified")
+        remove_private_root(self.root)
+
+
+def remove_private_root(root: Path) -> None:
+    try:
+        shutil.rmtree(str(root))
+    except OSError as error:
+        raise ProviderError("OpenAI credential cleanup failed") from error
+    if root.exists():
+        raise ProviderError("OpenAI credential cleanup could not be verified")
+
+
+class ProxyManager:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.proxy: Optional[Proxy] = None
+
+    @staticmethod
+    def workspace_tag() -> str:
+        raw = os.environ.get("DEVC2_WORKSPACE", "")
+        if not raw:
+            raise ProviderError("OpenAI Span is missing its workspace identity")
+        return hashlib.sha256(os.fsencode(Path(raw).resolve())).hexdigest()[:16]
+
+    def _remove_stale(self, tag: str) -> None:
+        found = run_docker([
+            "ps", "--all", "--quiet", "--no-trunc", "--filter",
+            "label=dev.devbox.openai-span.workspace-hash=" + tag,
+        ], 15)
+        if found.returncode != 0:
+            raise ProviderError("Docker could not inspect stale credential proxies")
+        identifiers = found.stdout.split()
+        if len(identifiers) > 8 or any(re.fullmatch(r"[0-9a-f]{64}", item) is None for item in identifiers):
+            raise ProviderError("Docker returned invalid stale helper identities")
+        for identifier in identifiers:
+            if not remove_container(identifier):
+                raise ProviderError("stale credential proxy cleanup failed")
+        cleanup_stale_roots("devc2-openai-" + tag + "-")
+
+    def _running(self, proxy: Proxy) -> bool:
+        result = run_docker(["inspect", "--format", "{{.State.Running}}", proxy.container], 15)
+        return result.returncode == 0 and result.stdout.strip() == "true"
+
+    def get(self) -> Proxy:
+        with self.lock:
+            if self.proxy is not None and self._running(self.proxy):
+                return self.proxy
+            if self.proxy is not None:
+                self.proxy.stop()
+                self.proxy = None
+            # A failed attempt leaves no retained state, so the next request retries lazily.
+            candidate = self._start()
+            self.proxy = candidate
+            return candidate
+
+    def _start(self) -> Proxy:
+        tag = self.workspace_tag()
+        self._remove_stale(tag)
+        root = Path(tempfile.mkdtemp(prefix="devc2-openai-" + tag + "-"))
+        os.chmod(str(root), 0o700)
+        container_id = None
+        proxy_name = None
+        try:
+            access, account = read_auth()
+            ca_name = "devc2-openai-ca-" + uuid.uuid4().hex
+            try:
+                generated = run_docker([
+                    "run", "--pull", "never", "--name", ca_name, "--rm", "--network", "none",
+                    "--label", "dev.devbox.openai-span.workspace-hash=" + tag,
+                    "--user", "%d:%d" % (os.getuid(), os.getgid()),
+                    "--volume", "%s:/out" % root,
+                    IRON, "generate-ca", "-outdir", "/out", "-alg", "ed25519",
+                    "-name", "devc2 OpenAI Span",
+                ])
+                if generated.returncode != 0:
+                    raise ProviderError("ephemeral CA generation failed")
+            finally:
+                if not remove_named_container(ca_name):
+                    raise ProviderError("CA helper cleanup could not be verified")
+
+            for filename in ("ca.crt", "ca.key"):
+                path = root / filename
+                metadata = path.lstat()
+                if (not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
+                        or metadata.st_size > MAX_CA):
+                    raise ProviderError("ephemeral CA output is invalid")
+                os.chmod(str(path), 0o600)
+            certificate = (root / "ca.crt").read_bytes()
+            if (not certificate or len(certificate) > MAX_CA
+                    or b"-----BEGIN CERTIFICATE-----" not in certificate
+                    or b"-----END CERTIFICATE-----" not in certificate
+                    or b"PRIVATE KEY" in certificate):
+                raise ProviderError("ephemeral CA certificate is invalid")
+
+            private_write(root / "access-token", access.encode("utf-8"))
+            private_write(root / "account-id", account.encode("utf-8"))
+            private_write(
+                root / "proxy.yaml",
+                json.dumps(proxy_config(), separators=(",", ":")).encode("utf-8"),
+            )
+
+            name = "devc2-openai-proxy-" + uuid.uuid4().hex
+            proxy_name = name
+            launched = run_docker([
+                "run", "--pull", "never", "--detach", "--rm", "--name", name,
+                "--label", "dev.devbox.openai-span.workspace-hash=" + tag,
+                "--user", "%d:%d" % (os.getuid(), os.getgid()),
+                "--read-only", "--tmpfs", "/tmp:size=16m,mode=1777",
+                "--memory", "512m", "--cpus", "1", "--pids-limit", "256",
+                "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
+                "--init", "--log-driver", "none",
+                "--publish", "127.0.0.1::8080",
+                "--volume", "%s:/run/devc2-private:ro" % root,
+                IRON, "--config", "/run/devc2-private/proxy.yaml",
+            ])
+            candidate_id = launched.stdout.strip()
+            if launched.returncode != 0 or not re.fullmatch(r"[0-9a-f]{64}", candidate_id):
+                remove_named_container(name)
+                raise ProviderError("credential proxy failed to start")
+            container_id = candidate_id
+
+            deadline = time.monotonic() + 15
+            port = 0
+            while time.monotonic() < deadline:
+                result = run_docker(["port", container_id, "8080/tcp"], 15)
+                if result.returncode == 0:
+                    match = re.fullmatch(r"127\.0\.0\.1:(\d+)", result.stdout.strip())
+                    if match and 1 <= int(match.group(1)) <= 65535:
+                        port = int(match.group(1))
+                        try:
+                            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                                break
+                        except OSError:
+                            port = 0
+                time.sleep(0.05)
+            if not port:
+                raise ProviderError("credential proxy did not publish a loopback port")
+            return Proxy(root, container_id, port, certificate)
+        except Exception:
+            removed = True
+            if container_id is not None:
+                removed = remove_container(container_id)
+            elif proxy_name is not None:
+                removed = remove_named_container(proxy_name)
+            if removed:
+                remove_private_root(root)
+            raise
+
+    def stop(self) -> None:
+        with self.lock:
+            if self.proxy is not None:
+                self.proxy.stop()
+                self.proxy = None
+
+
+def read_connect(connection: socket.socket) -> tuple[bytes, bytes]:
+    data = bytearray()
+    marker = -1
+    while marker < 0:
+        if len(data) >= MAX_CONNECT:
+            raise ProviderError("CONNECT request is too large")
+        chunk = connection.recv(min(4096, MAX_CONNECT - len(data)))
+        if not chunk:
+            raise ProviderError("CONNECT request ended early")
+        data.extend(chunk)
+        marker = data.find(b"\r\n\r\n")
+    end = marker + 4
+    request = bytes(data[:end])
+    lines = request[:-4].split(b"\r\n")
+    if not lines or CONNECT_LINE.fullmatch(lines[0]) is None:
+        raise ProviderError("CONNECT target or version is not allowed")
+    host_headers = 0
+    for line in lines[1:]:
+        if not line or line[:1] in (b" ", b"\t") or b":" not in line:
+            raise ProviderError("CONNECT contains an invalid header")
+        name, value = line.split(b":", 1)
+        if (HEADER_NAME.fullmatch(name) is None
+                or any((byte < 32 and byte != 9) or byte == 127 for byte in value)):
+            raise ProviderError("CONNECT contains an invalid header")
+        if name.lower() == b"host":
+            host_headers += 1
+            if host_headers > 1 or value.strip(b" \t") != b"chatgpt.com:443":
+                raise ProviderError("CONNECT Host does not match its target")
+    return request, bytes(data[end:])
+
+
+def pump(source: socket.socket, destination: socket.socket) -> None:
+    try:
+        while True:
+            block = source.recv(64 * 1024)
+            if not block:
+                break
+            destination.sendall(block)
+    except OSError:
+        pass
+    finally:
+        try:
+            destination.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+
+def relay(client: socket.socket, upstream: socket.socket) -> None:
+    reverse = threading.Thread(target=pump, args=(upstream, client), daemon=True)
+    reverse.start()
+    pump(client, upstream)
+    reverse.join()
+
+
+def handle(connection: socket.socket, manager: ProxyManager) -> None:
+    with connection:
+        connection.settimeout(10)
+        operation = connection.recv(1)
+        if operation == b"B":
+            payload = bootstrap(manager.get().certificate)
+            connection.sendall(LENGTH.pack(len(payload)) + payload)
+            return
+        if operation != b"T":
+            return
+        request, trailing = read_connect(connection)
+        proxy = manager.get()
+        with socket.create_connection(("127.0.0.1", proxy.port), timeout=10) as upstream:
+            upstream.sendall(request)
+            if trailing:
+                upstream.sendall(trailing)
+            connection.settimeout(None)
+            upstream.settimeout(None)
+            relay(connection, upstream)
+
+
+def serve() -> int:
+    try:
+        descriptor = int(os.environ["DEVC2_SPAN_SOCKET_FD"])
+    except (KeyError, ValueError):
+        print("openai-world: missing Link listener", file=sys.stderr)
+        return 2
+    listener = socket.socket(fileno=descriptor)
+    manager = ProxyManager()
+    slots = threading.BoundedSemaphore(MAX_HANDLERS)
+    stopping = threading.Event()
+
+    def stop(_signum: int, _frame: object) -> None:
+        stopping.set()
+        try:
+            listener.close()
+        except OSError:
+            pass
+
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, stop)
+    try:
+        while not stopping.is_set():
+            try:
+                connection, _address = listener.accept()
+            except InterruptedError:
+                continue
+            except OSError:
+                if stopping.is_set():
+                    break
+                raise
+            if not slots.acquire(blocking=False):
+                connection.close()
+                continue
+
+            def run_handler(stream: socket.socket) -> None:
+                try:
+                    try:
+                        handle(stream, manager)
+                    except (OSError, ProviderError, subprocess.SubprocessError):
+                        pass
+                finally:
+                    slots.release()
+
+            threading.Thread(target=run_handler, args=(connection,), daemon=True).start()
+    finally:
+        try:
+            listener.close()
+        except OSError:
+            pass
+        manager.stop()
+    return 0
+
+
+def main() -> int:
+    if sys.argv[1:]:
+        print("openai-world: World accepts no arguments", file=sys.stderr)
+        return 2
+    return serve()
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, ProviderError, subprocess.SubprocessError):
+        print("openai-world: World failed", file=sys.stderr)
+        raise SystemExit(1)

@@ -126,7 +126,7 @@ def source_version(source):
     return match.group(1)
 
 def validate_asset_tree(source,strict=False):
-    required=("Dockerfile","compose.yaml","devbox/entrypoint.sh","devbox/tact-wrapper.sh","launcher/devc2.py","launcher/span_runtime.py","launcher/span_supervisor.py","launcher/dispatcher.py","launcher/command_projection.py","credential_proxy/span_bridge.py","spans/openai/provider","spans/openai/client","spans/github/provider","spans/github/client","spans/ssh-agent/provider","spans/ssh-agent/client")
+    required=("Dockerfile","compose.yaml","devbox/entrypoint.sh","devbox/tact-wrapper.sh","launcher/devc2.py","launcher/span_runtime.py","launcher/span_supervisor.py","launcher/dispatcher.py","launcher/command_projection.py","launcher/scoped_exec_projection.py","credential_proxy/span_bridge.py","spans/openai/world","spans/github/provider","spans/github/client","spans/ssh-agent/provider","spans/ssh-agent/client")
     if not source.is_dir() or source.is_symlink(): raise RuntimeError("release asset root must be a directory")
     total=0; count=0; allowed={"Dockerfile","compose.yaml","README.md","install.sh","devbox","credential_proxy","launcher","spans"}
     for path in source.rglob("*"):
@@ -185,14 +185,14 @@ def copy_release_assets(source,destination):
     for path in destination.rglob("*"):
         if path.is_dir(): path.chmod(0o755)
         elif path.is_file(): path.chmod(0o644)
-    for relative in ("launcher/devc2.py","launcher/dispatcher.py","launcher/command_projection.py","devbox/entrypoint.sh","devbox/tact-wrapper.sh","devbox/herdr-wrapper.py","spans/openai/provider","spans/openai/client","spans/github/provider","spans/github/client","spans/ssh-agent/provider","spans/ssh-agent/client"):
+    for relative in ("launcher/devc2.py","launcher/dispatcher.py","launcher/command_projection.py","launcher/scoped_exec_projection.py","devbox/entrypoint.sh","devbox/tact-wrapper.sh","devbox/herdr-wrapper.py","spans/openai/world","spans/github/provider","spans/github/client","spans/ssh-agent/provider","spans/ssh-agent/client"):
         (destination/relative).chmod(0o755)
 
 def freeze_asset_tree(destination):
     for path in destination.rglob("*"):
         if path.is_dir(): path.chmod(0o555)
         elif path.is_file(): path.chmod(0o444)
-    for relative in ("launcher/devc2.py","launcher/dispatcher.py","launcher/command_projection.py","devbox/entrypoint.sh","devbox/tact-wrapper.sh","devbox/herdr-wrapper.py","spans/openai/provider","spans/openai/client","spans/github/provider","spans/github/client","spans/ssh-agent/provider","spans/ssh-agent/client"):
+    for relative in ("launcher/devc2.py","launcher/dispatcher.py","launcher/command_projection.py","launcher/scoped_exec_projection.py","devbox/entrypoint.sh","devbox/tact-wrapper.sh","devbox/herdr-wrapper.py","spans/openai/world","spans/github/provider","spans/github/client","spans/ssh-agent/provider","spans/ssh-agent/client"):
         (destination/relative).chmod(0o555)
     destination.chmod(0o555)
 
@@ -714,7 +714,7 @@ def _start_unlocked(repo, runtime_doctor=False, span_names=()):
         with tempfile.TemporaryDirectory(prefix='devc2-') as raw:
             temp=Path(raw); temp.chmod(0o700)
             span_clients=temp/'span-clients'; span_providers=temp/'span-providers'
-            granted_spans=span_runtime.load_catalog(SPAN_CATALOG,span_names,repo,span_clients,span_providers,ROOT/'spans',ROOT/'launcher'/'command_projection.py')
+            granted_spans=span_runtime.load_catalog(SPAN_CATALOG,span_names,repo,span_clients,span_providers,ROOT/'spans',ROOT/'launcher'/'command_projection.py',ROOT/'launcher'/'scoped_exec_projection.py')
             empty=temp/'empty'; empty.mkdir(0o700)
             # A killed launcher may have left sidecars behind. Stop the old
             # project before projecting this launch's explicit grant set.

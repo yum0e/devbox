@@ -15,9 +15,10 @@ has limits of 16 GiB memory, 8 CPUs, and 4096 PIDs. The Docker socket, host home
 raw OAuth credentials, raw SSH-agent socket, and Span transport keys are never
 mounted into the Island.
 
-The first-party OpenAI and GitHub providers retain bearer credentials on the
-host and inject them only into narrowly allowed HTTPS requests. Their clients
-create child-scoped fake authentication and proxy state, then remove it. The
+The first-party OpenAI World and GitHub provider retain bearer credentials on
+the host and inject them only into narrowly allowed HTTPS requests. OpenAI
+exports a bounded manifest to devc2's generic scoped-exec Link; GitHub retains
+its transitional client. Both create child-scoped fake authentication and proxy state, then remove it. The
 SSH-agent provider accepts only identity queries and signing requests for one
 host-selected public key; every other agent operation and key is rejected before
 reaching the host agent. These boundaries prevent credential extraction, not
@@ -73,7 +74,7 @@ approval and makes authenticated read-only requests.
 It never mounts a real checkout and removes its project volumes during teardown.
 
 The image installs a trusted `tact` wrapper ahead of the persistent home PATH.
-It delegates authenticated runs to the projected OpenAI client without modifying
+It delegates authenticated runs to devc2's projected generic scoped-exec Link without modifying
 shell startup files or retaining authentication state.
 
 ## Span contract
@@ -105,7 +106,10 @@ hard-linked. `devc2` snapshots its exact bytes without running it and projects
 its own generic shim read-only as `/run/devc2/bin/<name>`. The World supplies no
 client artifact. The host resolves the granted name to this World and supplies
 the generic Link shim. Legacy exact `provider`/`client` entries remain temporarily
-accepted while OpenAI and the other working Spans migrate one at a time.
+accepted while the other working Spans migrate one at a time. First-party OpenAI
+uses a second host-owned generic Link shape: scoped execution with bounded public
+bootstrap material and declared CONNECT routes. The OpenAI World supplies no
+Island executable.
 
 The World (or a legacy provider) is executed directly with no devc2-defined arguments.
 `DEVC2_SPAN_SOCKET_FD` names an inherited listening socket.
@@ -117,8 +121,8 @@ and every other semantic decision belong to the World.
 
 World/provider startup is structural, not a semantic health check: devc2 verifies that
 the configured executable starts and does not exit immediately, but it does not
-ask whether Herdr, Slack, or another provider-specific upstream is ready. Clients
-surface those failures normally and providers may retry or recover without a new
+ask whether Herdr, Slack, or another World-specific upstream is ready. Links
+surface those failures normally and Worlds may retry or recover without a new
 Island launch.
 
 On Docker Desktop, the private Unix endpoint cannot cross directly from macOS

@@ -25,6 +25,7 @@ from launcher import span_runtime
 
 V2_ROOT = Path(__file__).parents[1]
 COMMAND_PROJECTION = V2_ROOT / "launcher" / "command_projection.py"
+SCOPED_EXEC_PROJECTION = V2_ROOT / "launcher" / "scoped_exec_projection.py"
 
 
 class SpanCatalogTests(unittest.TestCase):
@@ -131,10 +132,30 @@ class SpanCatalogTests(unittest.TestCase):
     def test_builtin_span_needs_no_external_catalog_and_cannot_be_shadowed(self):
         with tempfile.TemporaryDirectory() as raw:
             root=Path(raw); builtin=root/"builtins"/"openai"; builtin.mkdir(parents=True)
-            provider,client=self.files(builtin)
+            world=builtin/"world"; world.write_text("#!/bin/sh\nexit 0\n"); world.chmod(0o444)
+            link=root/"scoped-link"; link.write_bytes(SCOPED_EXEC_PROJECTION.read_bytes()); link.chmod(0o444)
             destination=root/"snapshot"; destination.mkdir()
-            spans=span_runtime.load_catalog(root/"missing.json",("openai",),root/"workspace",destination/"clients",destination/"providers",root/"builtins")
-            self.assertEqual([(item.name,item.provider.read_bytes(),item.client.read_bytes()) for item in spans],[('openai',provider.read_bytes(),client.read_bytes())])
+            spans=span_runtime.load_catalog(
+                root/"missing.json",("openai",),root/"workspace",destination/"clients",destination/"worlds",
+                root/"builtins",scoped_exec_projection=link,
+            )
+            self.assertEqual(
+                [(item.name,item.provider.read_bytes(),item.client.read_bytes()) for item in spans],
+                [('openai',world.read_bytes(),link.read_bytes())],
+            )
+            self.assertEqual(stat.S_IMODE(spans[0].provider.stat().st_mode),0o555)
+            self.assertEqual(stat.S_IMODE(spans[0].client.stat().st_mode),0o555)
+            self.assertNotIn(b"openai",link.read_bytes().lower())
+
+    def test_actual_openai_world_and_link_are_executable_source_assets(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root=Path(raw); destination=root/"snapshot"; destination.mkdir()
+            item=span_runtime.load_catalog(
+                root/"missing.json",("openai",),root/"workspace",destination/"links",destination/"worlds",
+                V2_ROOT/"spans",scoped_exec_projection=SCOPED_EXEC_PROJECTION,
+            )[0]
+            self.assertEqual(item.provider.read_bytes(),(V2_ROOT/"spans"/"openai"/"world").read_bytes())
+            self.assertEqual(item.client.read_bytes(),SCOPED_EXEC_PROJECTION.read_bytes())
 
     def test_command_link_snapshots_one_world_and_the_generic_projection(self):
         with tempfile.TemporaryDirectory() as raw:

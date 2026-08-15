@@ -6,6 +6,7 @@ import io
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -32,6 +33,9 @@ class UpdateTests(unittest.TestCase):
         )
         for relative in legacy_required:
             self.assertTrue((ROOT/relative).is_file(),relative)
+        for relative in ("spans/openai/provider", "spans/openai/client"):
+            self.assertTrue((ROOT/relative).is_file(), relative)
+            self.assertEqual(stat.S_IMODE((ROOT/relative).stat().st_mode), 0o644, relative)
         self.assertNotIn("herdr-wrapper.py",(ROOT/"Dockerfile").read_text())
 
     def test_versioned_install_and_rollback_preserve_configuration(self):
