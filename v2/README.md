@@ -105,6 +105,13 @@ endpoints but cannot replace them. The provider process and transport stop when
 the Island exits. Different Islands receive different provider processes,
 instance IDs, endpoints, and transport credentials.
 
+A deliberately narrow, checkout-only reference implementation lives in
+`examples/probe-span/`; it is not packaged into devc2 or its Island image. It
+reports its scoped launch identity and echoes bounded opaque bytes, but cannot
+execute commands or read arbitrary host files. Use it to validate installation
+versus grant, client projection, transport, and lifecycle before integrating a
+real capability.
+
 
 ## Safe installation and updates
 
@@ -139,6 +146,10 @@ re-import its current assets directly, so rerunning `install.sh` is unnecessary.
 The command does not fetch or modify the checkout; update it with your normal Git
 workflow first. For a release installation, `devc2 update` retains the verified
 latest-stable-release download path.
+
+Checkout builds display their full content identity, for example
+`0.2.0+local.0123456789ab`, during installation, update, `--version`, and
+rollback. Tagged releases retain their semantic version such as `0.2.0`.
 
 Program assets are installed into immutable, versioned directories. A stable
 dispatcher takes a shared lock before selecting one runtime, and that process

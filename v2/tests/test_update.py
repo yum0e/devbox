@@ -44,19 +44,35 @@ class UpdateTests(unittest.TestCase):
             shutil.copytree(ROOT,source2,ignore=shutil.ignore_patterns("__pycache__"))
             (source2/"README.md").write_text((source2/"README.md").read_text()+"\nsecond build\n")
             bin_dir=root/"bin"; share=root/"share"
-            with mock.patch.dict(os.environ,{"DEVC2_BIN_DIR":str(bin_dir),"DEVC2_DATA_DIR":str(share)},clear=False), contextlib.redirect_stdout(io.StringIO()):
+            output=io.StringIO()
+            with mock.patch.dict(os.environ,{"DEVC2_BIN_DIR":str(bin_dir),"DEVC2_DATA_DIR":str(share)},clear=False), contextlib.redirect_stdout(output):
                 self.assertEqual(D.install_from_directory(source1,bin_dir,share),0)
                 first=(share/"current").resolve()
+                first_version=first.name
                 self.assertEqual(D.install_from_directory(source2,bin_dir,share),0)
                 second=(share/"current").resolve()
+                second_version=second.name
                 self.assertNotEqual(first,second)
+                self.assertRegex(first_version,r"^0\.2\.0\+local\.[0-9a-f]{12}$")
+                self.assertRegex(second_version,r"^0\.2\.0\+local\.[0-9a-f]{12}$")
+                self.assertIn(f"installed devc2 {second_version}",output.getvalue())
                 self.assertEqual((share/"previous").resolve(),first)
                 installed=json.loads(D.INSTALL_STATE.read_text())
+                self.assertEqual(installed["version"],second_version)
+                self.assertEqual(installed["previous_version"],first_version)
                 self.assertEqual(installed["install_kind"],"checkout")
                 self.assertEqual(installed["previous_install_kind"],"checkout")
                 environment={**os.environ,"DEVC2_DATA_DIR":str(share),"XDG_STATE_HOME":str(root/"dispatcher-state")}
+                version=subprocess.run([str(bin_dir/"devc2"),"--version"],env=environment,text=True,capture_output=True)
+                self.assertEqual(version.stdout.strip(),f"devc2 {second_version}")
                 completed=subprocess.run([sys.executable,str(share/"bootstrap"/"dispatcher.py"),"rollback"],env=environment,text=True,capture_output=True)
                 self.assertEqual(completed.returncode,0,completed.stderr)
+                self.assertIn(f"rolled back devc2 to {first_version}",completed.stdout)
+                version=subprocess.run([str(bin_dir/"devc2"),"--version"],env=environment,text=True,capture_output=True)
+                self.assertEqual(version.stdout.strip(),f"devc2 {first_version}")
+                rollback_state=json.loads((root/"dispatcher-state"/"devc2"/"installation.json").read_text())
+                self.assertEqual(rollback_state["version"],first_version)
+                self.assertEqual(rollback_state["previous_version"],second_version)
             self.assertEqual((share/"current").resolve(),first)
             self.assertEqual((share/"previous").resolve(),second)
             self.assertEqual((share/"manager").resolve(),second)

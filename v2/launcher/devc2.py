@@ -234,6 +234,14 @@ def asset_digest(source):
         digest.update(len(content).to_bytes(8,"big")); digest.update(content)
     return digest.hexdigest()
 
+def installed_version(root):
+    """Return a verified immutable install ID, or the embedded base version."""
+    base=source_version(root)
+    if root.parent.name=="versions":
+        local=f"{base}+local.{asset_digest(root)[:12]}"
+        if root.name in {base,local}: return root.name
+    return base
+
 def _activate_assets(source,bin_dir,share_dir,release=False):
     version=validate_asset_tree(source)
     bin_dir=bin_dir.expanduser().absolute(); share_dir=share_dir.expanduser().absolute()
@@ -279,7 +287,7 @@ def _activate_assets(source,bin_dir,share_dir,release=False):
         except OSError: previous_root=None
     previous_version=None
     if previous_root:
-        try: previous_version=source_version(previous_root)
+        try: previous_version=installed_version(previous_root)
         except RuntimeError: pass
     if old_root==target:
         previous_install_kind=existing_state.get("previous_install_kind")
@@ -464,13 +472,15 @@ def rollback_installation():
         if not current_link.is_symlink() or not previous_link.is_symlink(): raise RuntimeError("no previous devc2 installation is available")
         try: current=current_link.resolve(strict=True); previous=previous_link.resolve(strict=True)
         except OSError as error: raise RuntimeError("saved rollback installation is unavailable") from error
-        previous_version=validate_asset_tree(previous,previous.parent.name=="versions")
+        validate_asset_tree(previous,previous.parent.name=="versions")
+        previous_version=installed_version(previous)
+        current_version=installed_version(current)
         replace_symlink(current_link,previous)
         try: replace_symlink(previous_link,current)
         except Exception:
             replace_symlink(current_link,current)
             raise
-        metadata={"schema":1,"version":state.get("previous_version") or previous_version,"current":str(previous),"previous":str(current),"previous_version":state.get("version"),"bin_dir":str(bin_dir),"share_dir":str(share_dir),"install_kind":state.get("previous_install_kind"),"source_dir":state.get("previous_source_dir"),"previous_install_kind":state.get("install_kind"),"previous_source_dir":state.get("source_dir"),"installed_at":int(time.time())}
+        metadata={"schema":1,"version":previous_version,"current":str(previous),"previous":str(current),"previous_version":current_version,"bin_dir":str(bin_dir),"share_dir":str(share_dir),"install_kind":state.get("previous_install_kind"),"source_dir":state.get("previous_source_dir"),"previous_install_kind":state.get("install_kind"),"previous_source_dir":state.get("source_dir"),"installed_at":int(time.time())}
         atomic_write(INSTALL_STATE,json.dumps(metadata,sort_keys=True,indent=2)+"\n")
         print(f"rolled back devc2 to {metadata['version']}")
         return 0
@@ -970,7 +980,7 @@ def usage_parser():
         description="Open a hardened, credential-isolated development environment.",
         epilog="commands: devc2 run <repo> [--span NAME] | devc2 <repo> | devc2 auth | devc2 doctor [--runtime] | devc2 update | devc2 rollback | devc2 reset <repo> [--yes]",
     )
-    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {installed_version(ROOT)}")
     return parser
 
 
@@ -980,7 +990,7 @@ def parse_cli(argv):
         usage_parser().print_help()
         raise SystemExit(0 if argv else 2)
     if argv[0] == "--version":
-        print(f"devc2 {VERSION}")
+        print(f"devc2 {installed_version(ROOT)}")
         raise SystemExit(0)
     if argv[0] == "auth":
         if len(argv) != 1: raise RuntimeError("auth accepts no arguments")
