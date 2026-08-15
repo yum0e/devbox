@@ -12,6 +12,7 @@ import ssl
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +26,7 @@ MAX_CONNECTIONS = 64
 MAX_SPANS = 16
 SCOPED_EXEC_BUILTINS = {"github", "openai"}
 STREAM_BUILTINS = {"ssh-agent"}
+COMMAND_BUILTINS = {"diagnostics"}
 SUPERVISOR = Path(__file__).with_name("span_supervisor.py")
 
 from credential_proxy.stream_relay import duplex_stream
@@ -99,6 +101,10 @@ def load_catalog(path: Path, names: tuple[str, ...], forbidden_root: Path, clien
                 builtin_entries[name]=(world,scoped_exec_projection)
             elif world.is_file() and name in STREAM_BUILTINS:
                 builtin_entries[name]=(world,None)
+            elif world.is_file() and name in COMMAND_BUILTINS:
+                if command_projection is None:
+                    raise RuntimeError(f"Span {name!r} cannot be projected")
+                builtin_entries[name]=(world,command_projection)
             elif provider.is_file() and client.is_file():
                 builtin_entries[name]={"provider":str(provider),"client":str(client)}
     external_names=[name for name in names if name not in builtin_entries]
@@ -179,7 +185,7 @@ def _read_catalog(path: Path, forbidden_root: Path) -> dict:
 
 
 class Provider:
-    def __init__(self, span: Span, workspace: Path, instance_id: str):
+    def __init__(self, span: Span, workspace: Path, instance_id: str, diagnostics_path: Path | None = None):
         self.span = span
         self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -194,6 +200,8 @@ class Provider:
             "DEVC2_ISLAND_ID": instance_id,
             "DEVC2_WORKSPACE": str(workspace),
         })
+        if diagnostics_path is not None and span.name == "diagnostics":
+            environment["DEVC2_DIAGNOSTICS_FILE"] = str(diagnostics_path)
         try:
             self.process = subprocess.Popen(
                 [
@@ -263,12 +271,109 @@ class Provider:
                 self.process.wait(timeout=5)
 
 
+class DiagnosticsState:
+    """Bounded, launch-local transport state readable only by its World."""
+
+    def __init__(self, path: Path, names: list[str]):
+        self.path = path
+        self.lock = threading.Lock()
+        self.sequence = 0
+        self.links = {
+            name: {
+                "startup": "passed",
+                "accepted": 0,
+                "active": 0,
+                "completed": 0,
+                "failed": 0,
+                "rejected": 0,
+                "last_stage": "startup",
+                "last_result": "ready",
+                "last_error": None,
+            }
+            for name in names
+        }
+        self._write()
+
+    def _persist(self) -> None:
+        try:
+            self._write()
+        except OSError:
+            # Observation must never become a dependency of the observed Link.
+            pass
+
+    def _write(self) -> None:
+        document = {
+            "v": 1,
+            "sequence": self.sequence,
+            "links": [dict(name=name, **state) for name, state in self.links.items()],
+        }
+        payload = json.dumps(document, separators=(",", ":"), sort_keys=True).encode()
+        descriptor, raw = tempfile.mkstemp(prefix=".diagnostics.", dir=self.path.parent)
+        temporary = Path(raw)
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(payload)
+            os.replace(temporary, self.path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def update(self, name: str, **changes: object) -> None:
+        with self.lock:
+            self.links[name].update(changes)
+            self.sequence += 1
+            self._persist()
+
+    def accepted(self, name: str) -> None:
+        with self.lock:
+            state = self.links[name]
+            state.update(
+                accepted=state["accepted"] + 1,
+                active=state["active"] + 1,
+                last_stage="TLS handshake",
+                last_result="active",
+                last_error=None,
+            )
+            self.sequence += 1
+            self._persist()
+
+    def rejected(self, name: str) -> None:
+        with self.lock:
+            state = self.links[name]
+            state.update(
+                rejected=state["rejected"] + 1,
+                last_stage="accept",
+                last_result="rejected",
+                last_error="connection limit",
+            )
+            self.sequence += 1
+            self._persist()
+
+    def finished(self, name: str, stage: str, error: Exception | None) -> None:
+        with self.lock:
+            state = self.links[name]
+            changes = {
+                "active": max(0, state["active"] - 1),
+                "last_stage": stage,
+                "last_result": "failed" if error is not None else "completed",
+                "last_error": type(error).__name__ if error is not None else None,
+            }
+            if error is None:
+                changes["completed"] = state["completed"] + 1
+            else:
+                changes["failed"] = state["failed"] + 1
+            state.update(changes)
+            self.sequence += 1
+            self._persist()
+
+
 class OpaqueRelay:
     """Mutually authenticated TCP ingress; bytes are otherwise untouched."""
 
-    def __init__(self, upstream: tuple[str, int], tls_directory: Path, name: str = "unknown"):
+    def __init__(self, upstream: tuple[str, int], tls_directory: Path, name: str = "unknown", diagnostics: DiagnosticsState | None = None):
         self.upstream = upstream
         self.name = name
+        self.diagnostics = diagnostics
         self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self.context.minimum_version = ssl.TLSVersion.TLSv1_2
         self.context.options |= ssl.OP_NO_COMPRESSION
@@ -305,12 +410,18 @@ class OpaqueRelay:
                     return
                 raise
             if not self.slots.acquire(blocking=False):
+                if self.diagnostics is not None:
+                    self.diagnostics.rejected(self.name)
                 connection.close()
                 continue
+            if self.diagnostics is not None:
+                self.diagnostics.accepted(self.name)
             thread = threading.Thread(target=self._connection, args=(connection,), daemon=True)
             try:
                 thread.start()
             except RuntimeError:
+                if self.diagnostics is not None:
+                    self.diagnostics.finished(self.name, "worker start", RuntimeError())
                 connection.close()
                 self.slots.release()
 
@@ -318,6 +429,7 @@ class OpaqueRelay:
     def _connection(self, raw: socket.socket) -> None:
         tracked: socket.socket = raw
         stage = "TLS handshake"
+        failure = None
         with self.connections_lock:
             self.connections.add(raw)
         try:
@@ -329,10 +441,15 @@ class OpaqueRelay:
                     self.connections.add(incoming)
                 incoming.settimeout(None)
                 stage = "World connection"
+                if self.diagnostics is not None:
+                    self.diagnostics.update(self.name, last_stage=stage)
                 with socket.create_connection(self.upstream, timeout=10) as upstream:
                     stage = "stream relay"
+                    if self.diagnostics is not None:
+                        self.diagnostics.update(self.name, last_stage=stage)
                     duplex_stream(incoming, upstream, self.stopping)
         except (OSError, ssl.SSLError, RuntimeError) as error:
+            failure = error
             if not self.stopping.is_set():
                 print(
                     f"devc2: Span {self.name!r} host relay failed during {stage} "
@@ -341,6 +458,8 @@ class OpaqueRelay:
                     flush=True,
                 )
         finally:
+            if self.diagnostics is not None:
+                self.diagnostics.finished(self.name, stage, failure)
             with self.connections_lock:
                 self.connections.discard(raw)
                 self.connections.discard(tracked)
@@ -368,12 +487,18 @@ class SpanRuntime:
         self.providers: list[Provider] = []
         self.relays: list[OpaqueRelay] = []
         self.ports: dict[str, int] = {}
+        self.diagnostics = None
         try:
+            if any(span.name == "diagnostics" for span in spans):
+                self.diagnostics = DiagnosticsState(tls_directory.parent / "diagnostics.json", [span.name for span in spans])
             for span in spans:
-                provider = Provider(span, workspace, instance_id)
+                provider = Provider(
+                    span, workspace, instance_id,
+                    self.diagnostics.path if self.diagnostics is not None else None,
+                )
                 self.providers.append(provider)
                 provider.check_started()
-                relay = OpaqueRelay(provider.address, tls_directory, span.name)
+                relay = OpaqueRelay(provider.address, tls_directory, span.name, self.diagnostics)
                 self.relays.append(relay)
                 self.ports[span.name] = relay.port
         except Exception:

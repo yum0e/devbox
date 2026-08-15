@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""Read-only World for one launch's sanitized transport state."""
+from __future__ import annotations
+
+import base64
+import json
+import os
+import signal
+import socket
+import stat
+import struct
+import threading
+from pathlib import Path
+
+
+HEADER = struct.Struct("!I")
+MAX_REQUEST = 128 * 1024
+MAX_STATE = 256 * 1024
+MAX_CONNECTIONS = 16
+
+
+def receive(connection: socket.socket, size: int) -> bytes:
+    result = bytearray()
+    while len(result) < size:
+        block = connection.recv(size - len(result))
+        if not block:
+            raise RuntimeError("request ended early")
+        result.extend(block)
+    return bytes(result)
+
+
+def read_state(path: Path) -> dict:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(descriptor, "rb") as source:
+        metadata = os.fstat(source.fileno())
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+                or metadata.st_mode & 0o077 or metadata.st_size > MAX_STATE):
+            raise RuntimeError("diagnostics state is unavailable")
+        payload = source.read(MAX_STATE + 1)
+    if len(payload) > MAX_STATE:
+        raise RuntimeError("diagnostics state is unavailable")
+    document = json.loads(payload)
+    if (not isinstance(document, dict) or set(document) != {"v", "sequence", "links"}
+            or document["v"] != 1 or not isinstance(document["sequence"], int)
+            or not isinstance(document["links"], list)):
+        raise RuntimeError("diagnostics state is invalid")
+    return document
+
+
+def response(stdout: bytes = b"", stderr: bytes = b"", exit_code: int = 0) -> bytes:
+    return json.dumps({
+        "ok": True,
+        "stdout_b64": base64.b64encode(stdout).decode("ascii"),
+        "stderr_b64": base64.b64encode(stderr).decode("ascii"),
+        "exit_code": exit_code,
+    }, separators=(",", ":")).encode()
+
+
+def handle(connection: socket.socket, state_path: Path) -> None:
+    size = HEADER.unpack(receive(connection, HEADER.size))[0]
+    if size > MAX_REQUEST:
+        raise RuntimeError("request exceeds its size limit")
+    request = json.loads(receive(connection, size))
+    if (not isinstance(request, dict)
+            or set(request) != {"v", "command", "argv", "stdin_b64"}
+            or request["v"] != 1 or request["command"] != "diagnostics"
+            or not isinstance(request["argv"], list)
+            or request["stdin_b64"] != ""):
+        raise RuntimeError("invalid diagnostics request")
+    argv = request["argv"]
+    if argv in ([], ["report"]):
+        output = (json.dumps(read_state(state_path), indent=2, sort_keys=True) + "\n").encode()
+        payload = response(output)
+    elif argv == ["help"]:
+        payload = response(b"usage: diagnostics [report|help]\n")
+    else:
+        payload = response(stderr=b"diagnostics: only report and help are supported\n", exit_code=2)
+    connection.sendall(HEADER.pack(len(payload)) + payload)
+
+
+def main() -> int:
+    raw_path = os.environ.get("DEVC2_DIAGNOSTICS_FILE", "")
+    if not raw_path or not Path(raw_path).is_absolute():
+        raise RuntimeError("diagnostics state is unavailable")
+    listener = socket.socket(fileno=int(os.environ["DEVC2_SPAN_SOCKET_FD"]))
+    stopping = threading.Event()
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, lambda *_args: stopping.set())
+    listener.settimeout(0.5)
+    slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+    while not stopping.is_set():
+        try:
+            connection, _address = listener.accept()
+        except socket.timeout:
+            continue
+        if not slots.acquire(blocking=False):
+            connection.close()
+            continue
+        def serve(client=connection):
+            try:
+                with client:
+                    handle(client, Path(raw_path))
+            except (OSError, RuntimeError, ValueError, json.JSONDecodeError, struct.error):
+                pass
+            finally:
+                slots.release()
+        threading.Thread(target=serve, daemon=True).start()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -39,6 +39,7 @@ devc2 update             # atomically update from the install source
 devc2 rollback           # atomically return to the retained previous runtime
 devc2 run /path/to/repository
 devc2 run /path/to/repository --span openai --span github --span ssh-agent
+devc2 run /path/to/repository --span diagnostics
 devc2 run /path/to/repository --span herdr
 devc2 /path/to/repository       # retained shorthand, with no Spans
 devc2 reset /path/to/repository
@@ -56,7 +57,7 @@ Island, the projected command and its private endpoint are `/run/devc2/bin/herdr
 `reset` removes only that checkout's v2 Compose resources and state. It never
 removes the checkout or v1 resources.
 
-The first-party `openai`, `github`, and `ssh-agent` Spans ship with devc2 but are
+The first-party `openai`, `github`, `ssh-agent`, and `diagnostics` Spans ship with devc2 but are
 still inert until named. `tact` automatically runs authenticated operations
 through `openai`; local commands such as `tact config` and `tact --version` need
 no grant. `github run -- gh …` scopes GitHub authentication to one child command.
@@ -66,6 +67,15 @@ credential path. When `ssh-agent` is present, the Island configures Git and
 Jujutsu signing with its single exposed identity.
 
 ### Runtime diagnostics
+
+Grant `--span diagnostics` to inspect one running Island from inside itself.
+`diagnostics report` returns sanitized per-Link lifecycle stages, connection
+counters, and the last exception class. Its World can read only a bounded
+launch-local snapshot: it has no Docker access, host command execution, host
+paths, traffic contents, credentials, process environment, mutation commands,
+or visibility into other Islands. Other Worlds are not told where its snapshot
+lives. This makes transport failures self-observable without adding debugging
+tools or host authority to the Island.
 
 `devc2 doctor --runtime` creates a disposable temporary checkout and validates
 the real Docker Desktop path through all three first-party Spans: OpenAI
