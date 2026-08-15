@@ -120,6 +120,13 @@ execute commands or read arbitrary host files. Use it to validate installation
 versus grant, client projection, transport, and lifecycle before integrating a
 real capability.
 
+`examples/herdr-span/` is the first real capability experiment. When devc2 is
+launched from a host Herdr pane, it can create host-visible panes whose fixed
+worker shim executes argv only inside that same Island. Its five-command client,
+security boundary, manual proof, and intentionally omitted features are
+documented in the example README. It is likewise not part of the Island image or
+devc2 release assets.
+
 The catalog/no-argument contract replaces the earlier experimental
 `<name>-span describe|serve` prototype. Re-run the probe installer after updating.
 Other prototype providers should install immutable provider/client files outside

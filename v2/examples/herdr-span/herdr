@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""Projected Island client for the narrow Herdr Span example."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import struct
+import sys
+
+
+SOCKET = os.environ.get("DEVC2_HERDR_SOCKET", "/run/devc2/spans/herdr.sock")
+MAX_REQUEST = 64 * 1024
+MAX_RESPONSE = 1024 * 1024
+MAX_TEXT = 64 * 1024
+HEADER = struct.Struct("!I")
+
+
+def receive(connection: socket.socket, size: int) -> bytes:
+    chunks = bytearray()
+    while len(chunks) < size:
+        chunk = connection.recv(size - len(chunks))
+        if not chunk:
+            raise RuntimeError("provider response ended early")
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+
+def request(document: dict, timeout: float = 10) -> object:
+    payload = json.dumps(document, separators=(",", ":")).encode()
+    if len(payload) > MAX_REQUEST:
+        raise RuntimeError("request exceeds 64 KiB")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(timeout)
+        connection.connect(SOCKET)
+        connection.sendall(HEADER.pack(len(payload)) + payload)
+        size = HEADER.unpack(receive(connection, HEADER.size))[0]
+        if size > MAX_RESPONSE:
+            raise RuntimeError("provider response exceeds 1 MiB")
+        response = json.loads(receive(connection, size))
+    if not isinstance(response, dict) or response.get("ok") is not True:
+        message = response.get("error") if isinstance(response, dict) else None
+        raise RuntimeError(message if isinstance(message, str) else "invalid provider response")
+    return response.get("result")
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(
+        prog="herdr",
+        description="Run and control host-visible workers inside this Island.",
+    )
+    commands = root.add_subparsers(dest="command", required=True)
+    spawn = commands.add_parser("spawn", help="create a Herdr pane running Island argv")
+    spawn.add_argument("name")
+    spawn.add_argument("argv", nargs=argparse.REMAINDER)
+    commands.add_parser("list", help="list workers created by this Island")
+    read = commands.add_parser("read", help="read recent worker output")
+    read.add_argument("name")
+    read.add_argument("--lines", type=int, default=200)
+    send = commands.add_parser("send", help="submit stdin and Enter to a running worker")
+    send.add_argument("name")
+    wait = commands.add_parser("wait", help="wait for a worker to exit")
+    wait.add_argument("name")
+    wait.add_argument("--timeout", type=float, default=300, metavar="SECONDS")
+    return root
+
+
+def main() -> int:
+    args = parser().parse_args()
+    if args.command == "spawn":
+        argv = args.argv[1:] if args.argv[:1] == ["--"] else args.argv
+        if not argv:
+            raise RuntimeError("spawn requires COMMAND [ARG...] after --")
+        print(request({"op": "spawn", "name": args.name, "argv": argv}))
+    elif args.command == "list":
+        result = request({"op": "list"})
+        if not isinstance(result, list):
+            raise RuntimeError("invalid provider response")
+        for item in result:
+            print(f"{item['name']}\t{item['state']}")
+    elif args.command == "read":
+        result = request({"op": "read", "name": args.name, "lines": args.lines})
+        if not isinstance(result, str):
+            raise RuntimeError("invalid provider response")
+        sys.stdout.write(result)
+        if result and not result.endswith("\n"):
+            sys.stdout.write("\n")
+    elif args.command == "send":
+        raw = sys.stdin.buffer.read(MAX_TEXT + 1)
+        if len(raw) > MAX_TEXT:
+            raise RuntimeError("input exceeds 64 KiB")
+        text = raw.decode()
+        request({"op": "send", "name": args.name, "text": text})
+    elif args.command == "wait":
+        if not 0 < args.timeout <= 3600:
+            raise RuntimeError("timeout must be between 0 and 3600 seconds")
+        timeout_ms = max(1, int(args.timeout * 1000))
+        result = request({"op": "wait", "name": args.name, "timeout_ms": timeout_ms}, args.timeout + 10)
+        if not isinstance(result, dict) or not isinstance(result.get("exit_code"), int):
+            raise RuntimeError("invalid provider response")
+        return result["exit_code"]
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, RuntimeError, UnicodeDecodeError, json.JSONDecodeError, struct.error) as error:
+        print(f"herdr: {error}", file=sys.stderr)
+        raise SystemExit(1)

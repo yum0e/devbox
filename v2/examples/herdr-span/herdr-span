@@ -1,0 +1,484 @@
+#!/usr/bin/env python3
+"""Host provider for the deliberately narrow Herdr Span example."""
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+
+MAX_REQUEST = 64 * 1024
+MAX_RESPONSE = 1024 * 1024
+MAX_TEXT = 64 * 1024
+MAX_ARGV_BYTES = 16 * 1024
+MAX_JOBS = 16
+MAX_HANDLERS = 32
+HEADER = struct.Struct("!I")
+NAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+
+
+class SpanError(RuntimeError):
+    pass
+
+
+def receive(connection: socket.socket, size: int) -> bytes:
+    chunks = bytearray()
+    while len(chunks) < size:
+        chunk = connection.recv(size - len(chunks))
+        if not chunk:
+            raise SpanError("stream ended early")
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+
+def send_frame(connection: socket.socket, document: dict) -> None:
+    payload = json.dumps(document, separators=(",", ":")).encode()
+    if len(payload) > MAX_RESPONSE:
+        payload = b'{"ok":false,"error":"response exceeds 1 MiB"}'
+    connection.sendall(HEADER.pack(len(payload)) + payload)
+
+
+def bounded_string(value: object, label: str, maximum: int = MAX_TEXT) -> str:
+    if not isinstance(value, str) or not value or len(value.encode()) > maximum or "\0" in value:
+        raise SpanError(f"invalid {label}")
+    return value
+
+
+def bounded_input(value: object) -> str:
+    text = bounded_string(value, "input")
+    if any(ord(character) < 32 and character not in "\n\t" or ord(character) == 127 for character in text):
+        raise SpanError("input contains terminal control characters")
+    return text
+
+
+def safe_socket(path: str) -> Path:
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        raise SpanError("HERDR_SOCKET_PATH must be absolute")
+    metadata = candidate.lstat()
+    if not stat.S_ISSOCK(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o022:
+        raise SpanError("Herdr socket must be current-user-owned and not group/world-writable")
+    return candidate
+
+
+def safe_executable(name: str) -> str:
+    found = shutil.which(name)
+    if not found:
+        raise SpanError(f"required host executable is unavailable: {name}")
+    resolved = Path(found).resolve(strict=True)
+    metadata = resolved.stat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid not in (0, os.getuid()):
+        raise SpanError(f"unsafe host executable: {name}")
+    if metadata.st_mode & 0o022 or not os.access(resolved, os.X_OK):
+        raise SpanError(f"unsafe host executable: {name}")
+    return str(resolved)
+
+
+class Herdr:
+    def __init__(self, path: Path):
+        self.path = path
+        self.sequence = 0
+        self.lock = threading.Lock()
+
+    def call(self, method: str, params: dict, timeout: float = 10) -> dict:
+        with self.lock:
+            self.sequence += 1
+            request_id = f"devc2-herdr-{self.sequence}"
+        request = json.dumps({"id": request_id, "method": method, "params": params}, separators=(",", ":"))
+        if len(request.encode()) > MAX_REQUEST:
+            raise SpanError("Herdr request is too large")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(timeout)
+            connection.connect(self.path)
+            connection.sendall(request.encode() + b"\n")
+            stream = connection.makefile("rb")
+            raw = stream.readline(MAX_RESPONSE + 1)
+        if not raw or len(raw) > MAX_RESPONSE or not raw.endswith(b"\n"):
+            raise SpanError("invalid response from Herdr")
+        try:
+            response = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise SpanError("invalid JSON from Herdr") from error
+        if not isinstance(response, dict) or response.get("id") != request_id:
+            raise SpanError("mismatched response from Herdr")
+        if "error" in response:
+            error = response["error"]
+            message = error.get("message") if isinstance(error, dict) else None
+            raise SpanError(message if isinstance(message, str) else "Herdr rejected the request")
+        result = response.get("result")
+        if not isinstance(result, dict):
+            raise SpanError("invalid result from Herdr")
+        return result
+
+
+@dataclass
+class Job:
+    name: str
+    pane_id: str
+    terminal_id: str
+    marker: str
+    exit_code: int | None = None
+
+
+class Provider:
+    def __init__(self):
+        required = ("DEVC2_ISLAND_ID", "DEVC2_WORKSPACE", "HERDR_SOCKET_PATH", "HERDR_PANE_ID")
+        missing = [name for name in required if not os.environ.get(name)]
+        if os.environ.get("HERDR_ENV") != "1" or missing:
+            raise SpanError("launch devc2 --span herdr from inside a host Herdr pane")
+        self.island_id = bounded_string(os.environ["DEVC2_ISLAND_ID"], "Island ID", 128)
+        self.workspace = Path(os.environ["DEVC2_WORKSPACE"]).resolve(strict=True)
+        self.anchor = bounded_string(os.environ["HERDR_PANE_ID"], "Herdr pane ID", 128)
+        self.herdr = Herdr(safe_socket(os.environ["HERDR_SOCKET_PATH"]))
+        self.docker = safe_executable("docker")
+        self.provider = str(Path(__file__).resolve(strict=True))
+        self.jobs: dict[str, Job] = {}
+        self.lock = threading.RLock()
+        self.stopping = threading.Event()
+        self.herdr.call("pane.get", {"pane_id": self.anchor})
+
+    @property
+    def workspace_hash(self) -> str:
+        return hashlib.sha256(os.fsencode(self.workspace)).hexdigest()[:16]
+
+    def island_container(self) -> str:
+        filters = (
+            f"label=dev.devbox.generation=2",
+            f"label=dev.devbox.workspace-hash={self.workspace_hash}",
+            f"label=com.docker.compose.project=devc2-{self.workspace_hash}",
+            "label=com.docker.compose.service=devbox",
+            "label=com.docker.compose.oneoff=True",
+        )
+        command = [self.docker, "ps"]
+        for item in filters:
+            command.extend(("--filter", item))
+        command.extend(("--format", "{{.ID}}"))
+        try:
+            completed = subprocess.run(command, text=True, capture_output=True, timeout=10, check=False)
+        except subprocess.SubprocessError as error:
+            raise SpanError("Docker did not identify the Island") from error
+        identifiers = completed.stdout.split() if completed.returncode == 0 else []
+        if len(identifiers) != 1:
+            raise SpanError("could not identify exactly one running Island container")
+        try:
+            inspected = subprocess.run(
+                [self.docker, "inspect", identifiers[0]], text=True, capture_output=True, timeout=10, check=False
+            )
+        except subprocess.SubprocessError as error:
+            raise SpanError("Docker did not inspect the Island") from error
+        try:
+            document = json.loads(inspected.stdout)[0]
+            labels = document["Config"]["Labels"]
+            mounts = document["Mounts"]
+            identifier = document["Id"]
+            running = document["State"]["Running"]
+        except (IndexError, KeyError, TypeError, json.JSONDecodeError) as error:
+            raise SpanError("Docker returned invalid Island metadata") from error
+        expected = {
+            "dev.devbox.generation": "2",
+            "dev.devbox.workspace-hash": self.workspace_hash,
+            "com.docker.compose.project": f"devc2-{self.workspace_hash}",
+            "com.docker.compose.service": "devbox",
+            "com.docker.compose.oneoff": "True",
+        }
+        workspace_mounts = [
+            item for item in mounts
+            if item.get("Destination") == "/workspace"
+            and item.get("Type") == "bind"
+            and item.get("RW") is True
+            and isinstance(item.get("Source"), str)
+            and Path(item["Source"]).resolve() == self.workspace
+        ]
+        if inspected.returncode or not running or not isinstance(labels, dict) or any(labels.get(k) != v for k, v in expected.items()):
+            raise SpanError("Docker container is not the granted Island")
+        if len(workspace_mounts) != 1 or not isinstance(identifier, str) or not re.fullmatch(r"[0-9a-f]{64}", identifier):
+            raise SpanError("Docker container has invalid Island metadata")
+        return identifier
+
+    def pane(self, job: Job) -> dict:
+        result = self.herdr.call("pane.get", {"pane_id": job.pane_id})
+        pane = result.get("pane")
+        if not isinstance(pane, dict) or pane.get("terminal_id") != job.terminal_id:
+            raise SpanError(f"worker {job.name!r} no longer owns its pane")
+        return pane
+
+    def read_job(self, job: Job, lines: int = 1000) -> str:
+        self.pane(job)
+        result = self.herdr.call(
+            "pane.read",
+            {"pane_id": job.pane_id, "source": "recent_unwrapped", "lines": lines, "strip_ansi": True},
+        )
+        read = result.get("read")
+        if not isinstance(read, dict) or not isinstance(read.get("text"), str):
+            raise SpanError("Herdr returned invalid pane output")
+        return read["text"]
+
+    def refresh(self, job: Job) -> None:
+        if job.exit_code is not None:
+            return
+        match = re.search(re.escape(job.marker) + r"([0-9]{1,3})", self.read_job(job))
+        if match:
+            job.exit_code = int(match.group(1))
+
+    def get_job(self, name: object) -> Job:
+        if not isinstance(name, str) or not NAME.fullmatch(name):
+            raise SpanError("invalid worker name")
+        with self.lock:
+            job = self.jobs.get(name)
+        if job is None:
+            raise SpanError(f"unknown worker: {name}")
+        self.pane(job)
+        return job
+
+    def spawn(self, request: dict) -> str:
+        if set(request) != {"op", "name", "argv"}:
+            raise SpanError("spawn accepts only name and argv")
+        name = request["name"]
+        argv = request["argv"]
+        if not isinstance(name, str) or not NAME.fullmatch(name):
+            raise SpanError("worker name must match [a-z][a-z0-9_-]{0,31}")
+        if not isinstance(argv, list) or not argv or len(argv) > 64:
+            raise SpanError("spawn requires 1 to 64 argv values")
+        if not all(isinstance(item, str) and "\0" not in item for item in argv):
+            raise SpanError("invalid worker argv")
+        if sum(len(item.encode()) for item in argv) > MAX_ARGV_BYTES:
+            raise SpanError("worker argv exceeds 16 KiB")
+        with self.lock:
+            if self.stopping.is_set():
+                raise SpanError("Herdr Span is stopping")
+            if name in self.jobs:
+                raise SpanError(f"worker already exists: {name}")
+            if len(self.jobs) >= MAX_JOBS:
+                raise SpanError(f"an Island may create at most {MAX_JOBS} Herdr workers")
+            container = self.island_container()
+            split = self.herdr.call(
+                "pane.split",
+                {"target_pane_id": self.anchor, "direction": "right", "focus": False},
+            )
+            pane = split.get("pane")
+            if not isinstance(pane, dict) or not isinstance(pane.get("pane_id"), str) or not isinstance(pane.get("terminal_id"), str):
+                raise SpanError("Herdr returned an invalid new pane")
+            marker = f"__DEVC2_HERDR_{os.urandom(16).hex()}_EXIT_"
+            job = Job(name, pane["pane_id"], pane["terminal_id"], marker)
+            payload = base64.urlsafe_b64encode(
+                json.dumps({"docker": self.docker, "container": container, "argv": argv, "marker": marker}, separators=(",", ":")).encode()
+            ).decode()
+            self.jobs[name] = job
+            try:
+                command = f"exec {shlex.quote(self.provider)} worker {payload}"
+                self.herdr.call(
+                    "pane.send_input", {"pane_id": job.pane_id, "text": command, "keys": ["Enter"]}
+                )
+                self.herdr.call("pane.rename", {"pane_id": job.pane_id, "label": name})
+            except Exception:
+                try:
+                    self.herdr.call("pane.close", {"pane_id": job.pane_id})
+                except Exception:
+                    raise
+                else:
+                    self.jobs.pop(name, None)
+                raise
+        return name
+
+    def handle(self, request: dict) -> object:
+        if not isinstance(request, dict) or not isinstance(request.get("op"), str):
+            raise SpanError("request must contain an operation")
+        operation = request["op"]
+        if operation == "spawn":
+            return self.spawn(request)
+        if operation == "list":
+            if set(request) != {"op"}:
+                raise SpanError("list accepts no arguments")
+            with self.lock:
+                jobs = list(self.jobs.values())
+            result = []
+            for job in jobs:
+                try:
+                    self.refresh(job)
+                    state = "running" if job.exit_code is None else f"exited:{job.exit_code}"
+                except SpanError:
+                    state = "gone"
+                result.append({"name": job.name, "state": state})
+            return result
+        if operation == "read":
+            if set(request) != {"op", "name", "lines"} or not isinstance(request["lines"], int) or not 1 <= request["lines"] <= 1000:
+                raise SpanError("read requires 1 to 1000 lines")
+            return self.read_job(self.get_job(request["name"]), request["lines"])
+        if operation == "send":
+            if set(request) != {"op", "name", "text"}:
+                raise SpanError("send accepts only name and text")
+            text = bounded_input(request["text"])
+            job = self.get_job(request["name"])
+            self.refresh(job)
+            if job.exit_code is not None:
+                raise SpanError(f"worker {job.name!r} has exited")
+            self.herdr.call("pane.send_input", {"pane_id": job.pane_id, "text": text, "keys": ["Enter"]})
+            return None
+        if operation == "wait":
+            if set(request) != {"op", "name", "timeout_ms"}:
+                raise SpanError("wait accepts only name and timeout_ms")
+            timeout_ms = request["timeout_ms"]
+            if not isinstance(timeout_ms, int) or not 1 <= timeout_ms <= 3_600_000:
+                raise SpanError("wait timeout must be between 1 ms and 1 hour")
+            job = self.get_job(request["name"])
+            self.refresh(job)
+            if job.exit_code is None:
+                self.herdr.call(
+                    "pane.wait_for_output",
+                    {
+                        "pane_id": job.pane_id,
+                        "source": "recent_unwrapped",
+                        "lines": 1000,
+                        "match": {"type": "substring", "value": job.marker},
+                        "timeout_ms": timeout_ms,
+                    },
+                    timeout=timeout_ms / 1000 + 5,
+                )
+                self.refresh(job)
+            if job.exit_code is None:
+                raise SpanError("worker completion marker was not found")
+            return {"exit_code": job.exit_code}
+        raise SpanError("unknown operation")
+
+    def cleanup(self) -> None:
+        self.stopping.set()
+        with self.lock:
+            jobs = list(self.jobs.values())
+
+        def close(job: Job) -> None:
+            for _attempt in range(2):
+                try:
+                    result = self.herdr.call("pane.get", {"pane_id": job.pane_id}, timeout=0.5)
+                    pane = result.get("pane")
+                    if not isinstance(pane, dict) or pane.get("terminal_id") != job.terminal_id:
+                        return
+                    self.herdr.call("pane.close", {"pane_id": job.pane_id}, timeout=0.5)
+                    return
+                except Exception:
+                    continue
+
+        threads = [threading.Thread(target=close, args=(job,)) for job in jobs]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+
+
+def decode_worker(raw: str) -> dict:
+    if len(raw) > 64 * 1024 or not re.fullmatch(r"[A-Za-z0-9_=-]+", raw):
+        raise SpanError("invalid worker payload")
+    try:
+        document = json.loads(base64.urlsafe_b64decode(raw.encode()))
+    except (ValueError, json.JSONDecodeError) as error:
+        raise SpanError("invalid worker payload") from error
+    if not isinstance(document, dict) or set(document) != {"docker", "container", "argv", "marker"}:
+        raise SpanError("invalid worker payload")
+    docker, container, argv, marker = (document[key] for key in ("docker", "container", "argv", "marker"))
+    if not isinstance(docker, str) or not Path(docker).is_absolute() or not os.access(docker, os.X_OK):
+        raise SpanError("invalid worker Docker path")
+    if not isinstance(container, str) or not re.fullmatch(r"[0-9a-f]{64}", container):
+        raise SpanError("invalid worker container")
+    if not isinstance(argv, list) or not argv or len(argv) > 64 or not all(isinstance(item, str) and "\0" not in item for item in argv):
+        raise SpanError("invalid worker argv")
+    if not isinstance(marker, str) or not re.fullmatch(r"__DEVC2_HERDR_[0-9a-f]{32}_EXIT_", marker):
+        raise SpanError("invalid worker marker")
+    return document
+
+
+def worker(raw: str) -> int:
+    document = decode_worker(raw)
+    command = [
+        document["docker"], "exec", "--interactive", "--tty", "--user", "1000:1000",
+        "--workdir", "/workspace", document["container"], *document["argv"],
+    ]
+    try:
+        completed = subprocess.run(command, check=False)
+        code = completed.returncode if 0 <= completed.returncode <= 255 else 255
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"herdr-span worker: {error}", file=sys.stderr)
+        code = 125
+    print(f"\r\n{document['marker']}{code}", flush=True)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    while True:
+        time.sleep(3600)
+
+
+def serve() -> int:
+    try:
+        descriptor = int(os.environ["DEVC2_SPAN_SOCKET_FD"])
+    except (KeyError, ValueError):
+        print("herdr-span: missing Span listener", file=sys.stderr)
+        return 2
+    provider = Provider()
+    listener = socket.socket(fileno=descriptor)
+    handlers = threading.BoundedSemaphore(MAX_HANDLERS)
+
+    def stop(_signum, _frame):
+        raise SystemExit(0)
+
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, stop)
+    try:
+        while True:
+            connection, _address = listener.accept()
+            if not handlers.acquire(blocking=False):
+                with connection:
+                    try:
+                        send_frame(connection, {"ok": False, "error": "too many concurrent Herdr requests"})
+                    except OSError:
+                        pass
+                continue
+
+            def handle(stream: socket.socket) -> None:
+                try:
+                    with stream:
+                        stream.settimeout(10)
+                        try:
+                            size = HEADER.unpack(receive(stream, HEADER.size))[0]
+                            if size > MAX_REQUEST:
+                                raise SpanError("request exceeds 64 KiB")
+                            request = json.loads(receive(stream, size))
+                            result = provider.handle(request)
+                            send_frame(stream, {"ok": True, "result": result})
+                        except (OSError, SpanError, UnicodeDecodeError, json.JSONDecodeError, struct.error) as error:
+                            try:
+                                send_frame(stream, {"ok": False, "error": str(error)[:4096]})
+                            except OSError:
+                                pass
+                finally:
+                    handlers.release()
+
+            threading.Thread(target=handle, args=(connection,), daemon=True).start()
+    finally:
+        provider.cleanup()
+
+
+def main() -> int:
+    if len(sys.argv) == 3 and sys.argv[1] == "worker":
+        return worker(sys.argv[2])
+    if sys.argv[1:]:
+        print("herdr-span: provider accepts no devc2 arguments", file=sys.stderr)
+        return 2
+    return serve()
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, SpanError, subprocess.SubprocessError) as error:
+        print(f"herdr-span: {error}", file=sys.stderr)
+        raise SystemExit(1)
