@@ -4,6 +4,9 @@ from __future__ import annotations
 import argparse, base64, contextlib, fcntl, gzip, hashlib, json, os, platform, secrets, shlex, shutil, signal, stat, subprocess, sys, tarfile, tempfile, time, unicodedata, urllib.error, urllib.parse, urllib.request
 from pathlib import Path, PurePosixPath
 
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+import span_runtime
+
 VERSION="0.2.0"
 IRON="ironsh/iron-proxy:0.49.0@sha256:c4628019c24f4cc8d77564a26b7c9cedb00accee6f93d06270e85fb8f9c6a7da"
 GH_PLACEHOLDER="devc2-github-placeholder-token"
@@ -126,7 +129,7 @@ def source_version(source):
     return match.group(1)
 
 def validate_asset_tree(source,strict=False):
-    required=("Dockerfile","compose.yaml","devbox/entrypoint.sh","devbox/tact-wrapper.sh","devbox/herdr-wrapper.py","launcher/devc2.py","launcher/dispatcher.py","credential_proxy/ssh_agent_proxy.py")
+    required=("Dockerfile","compose.yaml","devbox/entrypoint.sh","devbox/tact-wrapper.sh","launcher/devc2.py","launcher/span_runtime.py","launcher/span_supervisor.py","launcher/dispatcher.py","credential_proxy/ssh_agent_proxy.py","credential_proxy/span_bridge.py")
     if not source.is_dir() or source.is_symlink(): raise RuntimeError("release asset root must be a directory")
     total=0; count=0; allowed={"Dockerfile","compose.yaml","README.md","install.sh","devbox","credential_proxy","launcher"}
     for path in source.rglob("*"):
@@ -691,11 +694,13 @@ def generate_relay_pki(root):
     for path in client.iterdir(): path.chmod(0o444)
     return server,client
 
-def compose_env(repo,private,public,relay_port=None,relay_tls_dir=None):
+def compose_env(repo,private,public,relay_port=None,relay_tls_dir=None,span_client_dir=None,spans=False):
     digest,project=identity(repo)
     values={'DEVC2_PROJECT_NAME':project,'DEVC2_WORKSPACE':str(repo),'DEVC2_WORKSPACE_HASH':digest,'DEVC2_PRIVATE_DIR':str(private),'DEVC2_PUBLIC_DIR':str(public),'DEVC2_INSTALL_DIR':str(ROOT),'DEVC2_IMAGE':f'devc2:{VERSION}','DEVC2_UID':str(os.getuid()),'DEVC2_GID':str(os.getgid())}
     values['DEVC2_SSH_RELAY_PORT']=str(relay_port or 1)
     values['DEVC2_SSH_RELAY_TLS_DIR']=str(relay_tls_dir or '/dev/null')
+    values['DEVC2_SPAN_CLIENT_DIR']=str(span_client_dir or public)
+    if spans: values['COMPOSE_PROFILES']='spans'
     return docker_env(values)
 
 def start_host_agent_relay(port_file, tls_dir, allowed_key_file):
@@ -761,19 +766,39 @@ def ensure_v1_not_running(repo):
         raise RuntimeError("v1 is already running for this checkout; stop it before starting devc2")
 
 
-def _start_unlocked(repo, runtime_doctor=False):
+def _start_unlocked(repo, runtime_doctor=False, span_names=()):
     require_docker()
     ensure_v1_not_running(repo)
     ensure_tact_config()
     digest, _project = identity(repo)
+    descriptions=[span_runtime.describe(name) for name in span_names]
     with repository_lock(repo):
         with tempfile.TemporaryDirectory(prefix='devc2-') as raw:
-            temp=Path(raw); temp.chmod(0o700); private,public=prepare(repo,temp)
+            temp=Path(raw); temp.chmod(0o700)
+            empty=temp/'empty'; empty.mkdir(0o700)
+            # A killed launcher may have left sidecars behind. Stop the old
+            # project before projecting this launch's explicit grant set.
+            cleanup_env=compose_env(repo,empty,empty,span_client_dir=empty,spans=True)
+            compose(repo,cleanup_env,'down','--remove-orphans',check=False)
+            private,public=prepare(repo,temp)
+            span_clients=temp/'span-clients'
+            span_runtime.project_clients(descriptions,span_clients)
             relay_server_dir,relay_client_dir=generate_relay_pki(temp/'ssh-relay-pki')
             host_agent_relay,relay_port=start_host_agent_relay(temp/'ssh-relay-port',relay_server_dir,public/'ssh-allowed.pub')
+            spans=None
             try:
-                env=compose_env(repo,private,public,relay_port,relay_client_dir)
+                if descriptions:
+                    spans=span_runtime.SpanRuntime(descriptions,repo,f'{digest}-{secrets.token_hex(8)}',relay_server_dir)
+                if descriptions:
+                    (public/'span-ready').write_text(secrets.token_hex(16))
+                    (public/'span-ready').chmod(0o444)
+                    (public/'spans.json').write_text(json.dumps([
+                        {'name':item.name,'port':spans.ports[item.name]} for item in descriptions
+                    ],separators=(',',':')))
+                    (public/'spans.json').chmod(0o444)
+                env=compose_env(repo,private,public,relay_port,relay_client_dir,span_clients,bool(descriptions))
             except Exception:
+                if spans is not None: spans.stop()
                 stop_process(host_agent_relay)
                 raise
             stopping = False
@@ -785,12 +810,17 @@ def _start_unlocked(repo, runtime_doctor=False):
             for signum in (signal.SIGINT, signal.SIGTERM):
                 previous[signum] = signal.signal(signum, terminate)
             try:
-                compose(repo,env,'build','devbox','ssh-proxy')
+                build_services=['devbox','ssh-proxy']
+                if descriptions: build_services.append('span-proxy')
+                compose(repo,env,'build',*build_services)
                 try:
-                    compose(repo,env,'up','-d','credential-proxy','ssh-proxy')
+                    services=['credential-proxy','ssh-proxy']
+                    if descriptions: services.append('span-proxy')
+                    compose(repo,env,'up','-d',*services)
                 except RuntimeError:
                     print("devc2: sanitized startup diagnostics:",file=sys.stderr)
                     compose(repo,env,'logs','--no-color','--tail','100','ssh-proxy',capture=False,check=False)
+                    if descriptions: compose(repo,env,'logs','--no-color','--tail','100','span-proxy',capture=False,check=False)
                     raise
                 command=['docker','compose','--project-name',identity(repo)[1],'-f',str(ROOT/'compose.yaml'),'run','--rm','--no-deps']
                 if runtime_doctor: command.extend(['--env','DEVC2_RUNTIME_DOCTOR=1'])
@@ -799,6 +829,7 @@ def _start_unlocked(repo, runtime_doctor=False):
                 if result:
                     print("devc2: sanitized SSH proxy diagnostics:",file=sys.stderr)
                     compose(repo,env,'logs','--no-color','--tail','100','ssh-proxy',capture=False,check=False)
+                    if descriptions: compose(repo,env,'logs','--no-color','--tail','100','span-proxy',capture=False,check=False)
                 return result
             except KeyboardInterrupt:
                 return 130 if stopping else 1
@@ -806,6 +837,7 @@ def _start_unlocked(repo, runtime_doctor=False):
                 for signum, handler in previous.items():
                     signal.signal(signum, handler)
                 stop_process(host_agent_relay)
+                if spans is not None: spans.stop()
                 try:
                     down_args=['down','--remove-orphans']
                     if runtime_doctor: down_args.append('--volumes')
@@ -813,9 +845,9 @@ def _start_unlocked(repo, runtime_doctor=False):
                 finally:
                     pass
 
-def start(repo,runtime_doctor=False):
+def start(repo,runtime_doctor=False,span_names=()):
     with lifecycle_lock(False):
-        return _start_unlocked(repo,runtime_doctor)
+        return _start_unlocked(repo,runtime_doctor,span_names)
 
 def _reset_unlocked(repo,yes):
     if not yes:
@@ -935,8 +967,8 @@ def doctor(runtime=False):
 def usage_parser():
     parser = argparse.ArgumentParser(
         prog="devc2",
-        description="Open Herdr in a hardened, credential-isolated devbox.",
-        epilog="commands: devc2 <repo> | devc2 auth | devc2 doctor [--runtime] | devc2 update | devc2 rollback | devc2 reset <repo> [--yes]",
+        description="Open a hardened, credential-isolated development environment.",
+        epilog="commands: devc2 run <repo> [--span NAME] | devc2 <repo> | devc2 auth | devc2 doctor [--runtime] | devc2 update | devc2 rollback | devc2 reset <repo> [--yes]",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     return parser
@@ -952,24 +984,29 @@ def parse_cli(argv):
         raise SystemExit(0)
     if argv[0] == "auth":
         if len(argv) != 1: raise RuntimeError("auth accepts no arguments")
-        return "auth", None, False
+        return "auth", None, False, ()
     if argv[0] in {"update","rollback"}:
         if len(argv)!=1: raise RuntimeError(f"{argv[0]} accepts no arguments")
-        return argv[0],None,False
+        return argv[0],None,False,()
     if argv[0] == "doctor":
         parser=argparse.ArgumentParser(prog="devc2 doctor")
         parser.add_argument("--runtime",action="store_true",help="run disposable end-to-end Docker checks")
         args=parser.parse_args(argv[1:])
-        return "doctor-runtime" if args.runtime else "doctor", None, False
+        return "doctor-runtime" if args.runtime else "doctor", None, False, ()
     if argv[0] == "reset":
         parser = argparse.ArgumentParser(prog="devc2 reset")
         parser.add_argument("repo")
         parser.add_argument("--yes", action="store_true")
         args = parser.parse_args(argv[1:])
-        return "reset", args.repo, args.yes
-    if argv[0].startswith("-") or len(argv) != 1:
-        raise RuntimeError("usage: devc2 <repo> | devc2 auth | devc2 doctor [--runtime] | devc2 update | devc2 rollback | devc2 reset <repo> [--yes]")
-    return "start", argv[0], False
+        return "reset", args.repo, args.yes, ()
+    explicit_run=argv[0]=="run" and len(argv)>1
+    parser=argparse.ArgumentParser(prog="devc2 run" if explicit_run else "devc2")
+    parser.add_argument("repo")
+    parser.add_argument("--span",action="append",default=[],metavar="NAME")
+    args=parser.parse_args(argv[1:] if explicit_run else argv)
+    if len(set(args.span)) != len(args.span): raise RuntimeError("each Span may be granted only once")
+    if len(args.span)>span_runtime.MAX_SPANS: raise RuntimeError(f"at most {span_runtime.MAX_SPANS} Spans may be granted")
+    return "start",args.repo,False,tuple(args.span)
 
 
 def main(argv=None):
@@ -980,7 +1017,7 @@ def main(argv=None):
             parser.add_argument("--source",required=True); parser.add_argument("--bin-dir",required=True); parser.add_argument("--share-dir",required=True); parser.add_argument("--release",action="store_true")
             args=parser.parse_args(arguments[1:])
             return install_from_directory(Path(args.source),Path(args.bin_dir),Path(args.share_dir),args.release)
-        command, raw_repo, yes = parse_cli(arguments)
+        command, raw_repo, yes, spans = parse_cli(arguments)
         if command in {"doctor","doctor-runtime"}:
             with lifecycle_lock(False): return doctor(runtime=command=="doctor-runtime")
         if command == "auth":
@@ -989,7 +1026,7 @@ def main(argv=None):
         if command == "rollback": return rollback_installation()
         repo = canonical_repo(raw_repo)
         if command == "reset": return reset(repo, yes)
-        return start(repo)
+        return start(repo,span_names=spans)
     except RuntimeError as error:
         print(f"devc2: error: {error}", file=sys.stderr)
         return 1

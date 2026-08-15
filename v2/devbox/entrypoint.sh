@@ -106,6 +106,16 @@ if [[ -e /run/devc2-ssh-tls ]]; then
   echo "tact-dev: SSH relay credentials were exposed inside the devbox" >&2
   exit 1
 fi
+if [[ -e /run/devc2-public/spans.json ]]; then
+  for _attempt in $(seq 1 100); do
+    cmp -s /run/devc2-public/span-ready /run/devc2/spans/.ready && break
+    sleep 0.1
+  done
+  if ! cmp -s /run/devc2-public/span-ready /run/devc2/spans/.ready; then
+    echo "tact-dev: Span projection did not become ready" >&2
+    exit 1
+  fi
+fi
 signature_probe="$(mktemp /tmp/devc2-signing-probe.XXXXXX)"
 printf 'devc2 signing readiness probe' >"$signature_probe"
 if ! ssh-keygen -Y sign -f /run/devc2-public/ssh-allowed.pub -n git "$signature_probe" >/dev/null 2>&1; then
@@ -148,7 +158,11 @@ if [[ "${DEVC2_RUNTIME_DOCTOR:-}" == "1" ]]; then
   tact config show >/dev/null
   echo "✓ Tact configuration: valid and atomically replaceable"
   echo "✓ Tact binary: $(tact --version)"
-  echo "✓ Herdr binary: $(herdr --version)"
+  if command -v herdr >/dev/null 2>&1; then
+    echo "tact-dev: Herdr must not be bundled in an ungranted Island" >&2
+    exit 1
+  fi
+  echo "✓ no ungranted Herdr capability is present"
   echo "✓ PostgreSQL client: $(psql --version)"
   echo "✓ PostgreSQL server: $(postgres --version)"
   echo "✓ Node runtime: $(node --version)"
@@ -206,8 +220,7 @@ if [[ "${DEVC2_RUNTIME_DOCTOR:-}" == "1" ]]; then
   exit 0
 fi
 
-if [[ "${TACT_DEV_SHELL:-}" == "1" ]]; then
-  exec /bin/bash
+if (( $# )); then
+  exec "$@"
 fi
-
-exec herdr "$@"
+exec /bin/zsh

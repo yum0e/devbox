@@ -2,7 +2,6 @@
 ARG TACT_VERSION=0.5.3
 FROM ghcr.io/clabby/tact:${TACT_VERSION}@sha256:ef44abc4d69b27f3c13526717ac0258e2bb88497611449d5b02e935630d074c5 AS tact
 FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
-ARG HERDR_VERSION=0.8.0
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
@@ -79,25 +78,12 @@ RUN set -eux; \
     rm /tmp/jj /tmp/jj.tar.gz; \
     jj --version
 
-RUN set -eux; \
-    case "$TARGETARCH" in \
-      amd64) herdr_asset=herdr-linux-x86_64; herdr_sha256=b872ea7e40fa2cb17e857ac9b62b1bf26db7b403c622f5d2f3f5b35f6e9acd28 ;; \
-      arm64) herdr_asset=herdr-linux-aarch64; herdr_sha256=f647ac66468d9efbc642fe534fb284468f0aea60641606fc008dfc0d82a3ca87 ;; \
-      *) exit 1 ;; \
-    esac; \
-    curl -fsSL "https://github.com/herdrdev/herdr/releases/download/v${HERDR_VERSION#v}/${herdr_asset}" -o /tmp/herdr; \
-    echo "$herdr_sha256  /tmp/herdr" | sha256sum -c -; \
-    install -m 0755 /tmp/herdr /usr/local/libexec/devc2/herdr-upstream; \
-    rm /tmp/herdr; \
-    /usr/local/libexec/devc2/herdr-upstream --version
-
-COPY devbox/herdr-wrapper.py /usr/local/bin/herdr
 COPY devbox/entrypoint.sh /usr/local/bin/devc2-entrypoint
-RUN chmod 0755 /usr/local/bin/devc2-entrypoint /usr/local/bin/herdr /usr/local/bin/tact /usr/local/libexec/devc2/herdr-upstream /usr/local/libexec/devc2/tact-upstream \
+RUN chmod 0755 /usr/local/bin/devc2-entrypoint /usr/local/bin/tact /usr/local/libexec/devc2/tact-upstream \
  && groupadd --gid 1000 devbox \
  && useradd --uid 1000 --gid devbox --create-home --shell /bin/zsh devbox \
  && mkdir -p /workspace /home/devbox/.cache /home/devbox/.local/share/tact \
-      /run/devc2-public /run/devc2-ssh \
+      /run/devc2-public /run/devc2-ssh /run/devc2/spans \
  && chown -R devbox:devbox /workspace /home/devbox \
  && chmod 0777 /home/devbox
 
@@ -113,7 +99,7 @@ ENV HOME=/home/devbox \
     FOUNDRY_DIR=/usr/local/share/foundry \
     UV_PYTHON_INSTALL_DIR=/usr/local/share/uv/python \
     UV_PYTHON_BIN_DIR=/usr/local/bin \
-    PATH=/usr/local/share/foundry/bin:/usr/local/share/pnpm/bin:/usr/lib/postgresql/17/bin:/usr/local/sbin:/usr/local/bin:/home/devbox/.local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    PATH=/usr/local/share/foundry/bin:/usr/local/share/pnpm/bin:/usr/lib/postgresql/17/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/run/devc2/bin:/home/devbox/.local/bin
 
 USER devbox
 WORKDIR /workspace

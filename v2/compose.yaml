@@ -49,6 +49,13 @@ services:
       - type: volume
         source: ssh-socket-v2
         target: /run/devc2-ssh
+      - type: bind
+        source: ${DEVC2_SPAN_CLIENT_DIR:?set DEVC2_SPAN_CLIENT_DIR}
+        target: /run/devc2/bin
+        read_only: true
+      - type: volume
+        source: span-sockets-v2
+        target: /run/devc2/spans
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     pids_limit: 4096
@@ -128,11 +135,62 @@ services:
     labels:
       dev.devbox.generation: "2"
 
+  span-proxy:
+    profiles: [spans]
+    user: "0:0"
+    build:
+      context: ${DEVC2_INSTALL_DIR:?set DEVC2_INSTALL_DIR}
+      dockerfile: credential_proxy/Dockerfile
+    entrypoint: [python, -m, credential_proxy.span_bridge]
+    command:
+      - --config
+      - /run/devc2-public/spans.json
+      - --socket-dir
+      - /run/devc2/spans
+      - --tls-ca
+      - /run/devc2-span-tls/ca.crt
+      - --tls-cert
+      - /run/devc2-span-tls/client.crt
+      - --tls-key
+      - /run/devc2-span-tls/client.key
+      - --ready-token-file
+      - /run/devc2-public/span-ready
+    network_mode: service:credential-proxy
+    depends_on:
+      credential-proxy:
+        condition: service_started
+    init: true
+    volumes:
+      - type: bind
+        source: ${DEVC2_SSH_RELAY_TLS_DIR:?set DEVC2_SSH_RELAY_TLS_DIR}
+        target: /run/devc2-span-tls
+        read_only: true
+      - type: bind
+        source: ${DEVC2_PUBLIC_DIR:?set DEVC2_PUBLIC_DIR}
+        target: /run/devc2-public
+        read_only: true
+      - type: volume
+        source: span-sockets-v2
+        target: /run/devc2/spans
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+    mem_limit: 128m
+    cpus: 0.25
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    labels:
+      dev.devbox.generation: "2"
+
 volumes:
   state-v2:
     labels:
       dev.devbox.generation: "2"
       dev.devbox.workspace-hash: ${DEVC2_WORKSPACE_HASH:?set DEVC2_WORKSPACE_HASH}
   ssh-socket-v2:
+    labels:
+      dev.devbox.generation: "2"
+  span-sockets-v2:
     labels:
       dev.devbox.generation: "2"

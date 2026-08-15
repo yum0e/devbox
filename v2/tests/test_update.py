@@ -23,6 +23,17 @@ class UpdateTests(unittest.TestCase):
     def runtime(self,root):
         D.STATE=root/"state"; D.INSTALL_LOCK=D.STATE/"install.lock"; D.UPDATE_LOCK=D.STATE/"update.lock"; D.INSTALL_STATE=D.STATE/"installation.json"
 
+    def test_current_tree_satisfies_previous_updater_asset_contract(self):
+        legacy_required=(
+            "Dockerfile", "compose.yaml", "devbox/entrypoint.sh",
+            "devbox/tact-wrapper.sh", "devbox/herdr-wrapper.py",
+            "launcher/devc2.py", "launcher/dispatcher.py",
+            "credential_proxy/ssh_agent_proxy.py",
+        )
+        for relative in legacy_required:
+            self.assertTrue((ROOT/relative).is_file(),relative)
+        self.assertNotIn("herdr-wrapper.py",(ROOT/"Dockerfile").read_text())
+
     def test_versioned_install_and_rollback_preserve_configuration(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); self.runtime(root)

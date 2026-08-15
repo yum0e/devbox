@@ -8,14 +8,18 @@ spec=importlib.util.spec_from_file_location("devc2",PATH); D=importlib.util.modu
 
 class CliTests(unittest.TestCase):
     def test_cli(self):
-        self.assertEqual(D.parse_cli(["repo"]),("start","repo",False))
-        self.assertEqual(D.parse_cli(["doctor"]),("doctor",None,False))
-        self.assertEqual(D.parse_cli(["doctor","--runtime"]),("doctor-runtime",None,False))
-        self.assertEqual(D.parse_cli(["auth"]),("auth",None,False))
-        self.assertEqual(D.parse_cli(["update"]),("update",None,False))
-        self.assertEqual(D.parse_cli(["rollback"]),("rollback",None,False))
-        self.assertEqual(D.parse_cli(["reset","repo","--yes"]),("reset","repo",True))
-        with self.assertRaises(RuntimeError): D.parse_cli(["a","b"])
+        self.assertEqual(D.parse_cli(["repo"]),("start","repo",False,()))
+        self.assertEqual(D.parse_cli(["run"]),("start","run",False,()))
+        self.assertEqual(D.parse_cli(["run","repo","--span","herdr"]),("start","repo",False,("herdr",)))
+        self.assertEqual(D.parse_cli(["repo","--span","herdr"]),("start","repo",False,("herdr",)))
+        self.assertEqual(D.parse_cli(["doctor"]),("doctor",None,False,()))
+        self.assertEqual(D.parse_cli(["doctor","--runtime"]),("doctor-runtime",None,False,()))
+        self.assertEqual(D.parse_cli(["auth"]),("auth",None,False,()))
+        self.assertEqual(D.parse_cli(["update"]),("update",None,False,()))
+        self.assertEqual(D.parse_cli(["rollback"]),("rollback",None,False,()))
+        self.assertEqual(D.parse_cli(["reset","repo","--yes"]),("reset","repo",True,()))
+        with self.assertRaises(RuntimeError): D.parse_cli(["run","repo","--span","herdr","--span","herdr"])
+        with self.assertRaises(RuntimeError): D.parse_cli(["run","repo",*sum((["--span",f"s{i}"] for i in range(17)),[])])
     def test_help_has_no_subprocess(self):
         with mock.patch.object(D.subprocess,"run") as run, contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as exit:
             D.parse_cli(["--help"])
@@ -110,20 +114,6 @@ class CliTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 17)
             self.assertEqual(result.read_text().splitlines(), ["/run/devc2-ssh/agent.sock", "config", "show"])
 
-    def test_herdr_wrapper_normalizes_only_clean_server_shutdown(self):
-        source=(PATH.parents[1]/"devbox"/"herdr-wrapper.py").read_text()
-        with tempfile.TemporaryDirectory() as td:
-            root=Path(td); upstream=root/"herdr-upstream"; wrapper=root/"herdr"; wrapper.write_text(source.replace("/usr/local/libexec/devc2/herdr-upstream",str(upstream)))
-            cases=(("herdr: server shut down: server is shutting down",1,0),("herdr: unexpected crash",1,1),("herdr: server shut down: server is shutting down",2,2))
-            for message,status,expected in cases:
-                upstream.write_text(f"#!/bin/sh\nprintf '%s\n' '{message}' >&2\nexit {status}\n"); upstream.chmod(0o755)
-                result=subprocess.run([sys.executable,str(wrapper)],text=True,capture_output=True)
-                self.assertEqual(result.returncode,expected,result.stderr)
-                self.assertIn(message,result.stderr)
-        dockerfile=(PATH.parents[1]/"Dockerfile").read_text()
-        self.assertIn("/usr/local/libexec/devc2/herdr-upstream",dockerfile)
-        self.assertIn("COPY devbox/herdr-wrapper.py /usr/local/bin/herdr",dockerfile)
-
     def test_external_build_images_are_content_pinned(self):
         dockerfile = (PATH.parents[1] / "Dockerfile").read_text()
         proxy_dockerfile = (PATH.parents[1] / "credential_proxy" / "Dockerfile").read_text()
@@ -166,14 +156,18 @@ class CliTests(unittest.TestCase):
         ):
             self.assertIn(probe, entrypoint)
 
-    def test_herdr_is_pinned_and_is_the_default_environment(self):
+    def test_herdr_is_not_bundled_and_shell_is_the_default_environment(self):
         dockerfile = (PATH.parents[1] / "Dockerfile").read_text()
         entrypoint = (PATH.parents[1] / "devbox" / "entrypoint.sh").read_text()
-        self.assertIn("ARG HERDR_VERSION=0.8.0", dockerfile)
-        self.assertIn("herdr-linux-x86_64", dockerfile)
-        self.assertIn("herdr-linux-aarch64", dockerfile)
-        self.assertTrue(entrypoint.rstrip().endswith('exec herdr "$@"'))
-        self.assertNotIn('exec tact "$@"', entrypoint)
+        legacy_marker = (PATH.parents[1] / "devbox" / "herdr-wrapper.py").read_text()
+        self.assertNotIn("HERDR_VERSION", dockerfile)
+        self.assertNotIn("herdr-linux-", dockerfile)
+        self.assertNotIn("herdr-wrapper", dockerfile)
+        self.assertIn("Legacy release marker", legacy_marker)
+        self.assertIn("explicitly grant a Herdr Span", legacy_marker)
+        self.assertTrue(entrypoint.rstrip().endswith('exec /bin/zsh'))
+        runtime_path=dockerfile.split("ENV HOME=",1)[1]
+        self.assertIn(":/bin:/run/devc2/bin:/home/devbox/.local/bin",runtime_path)
 
     def test_runtime_doctor_is_disposable_and_exercises_live_boundaries(self):
         source = PATH.read_text()
@@ -194,7 +188,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("successfully authenticated", entrypoint)
         self.assertIn('git -C "$runtime_repo" verify-commit HEAD', entrypoint)
         self.assertIn("tact config show", entrypoint)
-        self.assertIn("herdr --version", entrypoint)
+        self.assertIn("Herdr must not be bundled in an ungranted Island", entrypoint)
         self.assertNotIn("set -x", entrypoint)
 
     def test_active_v1_is_refused(self):
@@ -233,7 +227,9 @@ class CliTests(unittest.TestCase):
         wrapper = (PATH.parents[1] / "devbox" / "tact-wrapper.sh").read_text()
         self.assertIn("export SSH_AUTH_SOCK=/run/devc2-ssh/agent.sock", wrapper)
         self.assertIn('exec /usr/local/libexec/devc2/tact-upstream "$@"', wrapper)
-        self.assertIn("/usr/local/bin:/home/devbox/.local/bin", (PATH.parents[1] / "Dockerfile").read_text())
+        runtime_path=(PATH.parents[1]/"Dockerfile").read_text().split("ENV HOME=",1)[1]
+        self.assertLess(runtime_path.index("/usr/local/bin"),runtime_path.index("/run/devc2/bin"))
+        self.assertLess(runtime_path.index("/run/devc2/bin"),runtime_path.index("/home/devbox/.local/bin"))
         self.assertIn("selected 1Password key could not sign", entrypoint)
         self.assertIn("sanitized SSH proxy diagnostics", PATH.read_text())
         self.assertIn("sanitized startup diagnostics", PATH.read_text())
@@ -241,7 +237,7 @@ class CliTests(unittest.TestCase):
 class AuthTests(unittest.TestCase):
     def test_parse_cli_auth_is_a_standalone_command(self):
         with mock.patch.object(D.subprocess, "run") as run:
-            self.assertEqual(D.parse_cli(["auth"]), ("auth", None, False))
+            self.assertEqual(D.parse_cli(["auth"]), ("auth", None, False, ()))
             with self.assertRaisesRegex(RuntimeError, "accepts no arguments"):
                 D.parse_cli(["auth", "extra"])
         run.assert_not_called()
@@ -397,7 +393,8 @@ class CoexistenceTests(unittest.TestCase):
     def test_reset_project_is_v2_only(self):
         with tempfile.TemporaryDirectory() as td:
             repo=Path(td); calls=[]
-            with mock.patch.object(D,"compose",side_effect=lambda *a,**k: calls.append(a)), mock.patch.object(D,"STATE",repo/"state"), contextlib.redirect_stdout(io.StringIO()):
+            state=repo/"state"
+            with mock.patch.object(D,"compose",side_effect=lambda *a,**k: calls.append(a)), mock.patch.object(D,"STATE",state), mock.patch.object(D,"INSTALL_LOCK",state/"install.lock"), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(D.reset(repo,True),0)
             self.assertTrue(D.identity(repo)[1].startswith("devc2-")); self.assertIn("down", calls[0])
     def test_source_contains_no_devcontainer_mutation(self):
