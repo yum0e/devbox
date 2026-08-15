@@ -7,6 +7,7 @@ import socket
 import ssl
 import stat
 import subprocess
+import shutil
 import sys
 import tempfile
 import time
@@ -19,45 +20,106 @@ from launcher import devc2
 from launcher import span_runtime
 
 
-class SpanDescriptionTests(unittest.TestCase):
-    def provider(self, root: Path, name: str = "echo", extra: dict | None = None) -> tuple[Path, Path]:
+class SpanCatalogTests(unittest.TestCase):
+    def load(self,catalog: Path,names: tuple[str,...],workspace: Path | None = None):
+        snapshot=Path(tempfile.mkdtemp(prefix="span-snapshot-"))
+        self.addCleanup(shutil.rmtree,snapshot,True)
+        forbidden=workspace or catalog.parent/"unrelated-workspace"
+        return span_runtime.load_catalog(catalog,names,forbidden,snapshot/"clients",snapshot/"providers")
+
+    def files(self, root: Path) -> tuple[Path, Path]:
         client = root / "client"
         client.write_text("#!/bin/sh\nexit 0\n")
         client.chmod(0o755)
-        document = {"name": name, "version": "1.0.0", "client": str(client)}
-        if extra:
-            document.update(extra)
-        provider = root / f"{name}-span"
-        provider.write_text(f"#!/bin/sh\nprintf '%s' '{json.dumps(document)}'\n")
+        provider = root / "provider"
+        provider.write_text("#!/bin/sh\nexit 0\n")
         provider.chmod(0o755)
         return provider, client
 
-    def test_provider_is_discovered_from_host_path_and_client_is_projected(self):
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            _provider, client = self.provider(root)
-            description = span_runtime.describe("echo", search_path=str(root))
-            self.assertEqual(description.client, client)
-            destination = root / "projection"
-            span_runtime.project_clients([description], destination)
-            projected = destination / "echo"
-            self.assertEqual(projected.read_bytes(), client.read_bytes())
-            self.assertEqual(stat.S_IMODE(projected.stat().st_mode), 0o555)
-            self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o555)
+    def catalog(self, root: Path, entries: dict, mode: int = 0o600) -> Path:
+        path=root/"spans.json"
+        path.write_text(json.dumps({"spans":entries}))
+        path.chmod(mode)
+        return path
 
-    def test_installation_is_not_a_grant_and_description_is_deliberately_tiny(self):
+    def test_catalog_resolves_exact_paths_without_executing_provider(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            self.provider(root, extra={"methods": ["spawn"]})
-            with self.assertRaisesRegex(RuntimeError, "only name, version, and client"):
-                span_runtime.describe("echo", search_path=str(root))
-            with self.assertRaisesRegex(RuntimeError, "not found"):
-                span_runtime.describe("missing", search_path=str(root))
+            provider, client = self.files(root)
+            sentinel=root/"provider-ran"
+            provider.write_text(f"#!/bin/sh\nprintf ran >{sentinel}\n")
+            catalog=self.catalog(root,{"echo":{"provider":str(provider),"client":str(client)}})
+            span = self.load(catalog,("echo",))[0]
+            self.assertEqual(span.name,"echo")
+            self.assertEqual(span.client.read_bytes(),client.read_bytes())
+            self.assertEqual(span.provider.read_bytes(),provider.read_bytes())
+            self.assertFalse(sentinel.exists())
+            snapshotted_provider=span.provider.read_bytes(); snapshotted_client=span.client.read_bytes()
+            provider.write_text("#!/bin/sh\nexit 99\n"); client.write_text("changed")
+            self.assertEqual(span.provider.read_bytes(),snapshotted_provider)
+            self.assertEqual(span.client.read_bytes(),snapshotted_client)
+            self.assertEqual(stat.S_IMODE(span.client.stat().st_mode),0o555)
+            self.assertEqual(stat.S_IMODE(span.client.parent.stat().st_mode),0o555)
+
+    def test_no_grant_does_not_require_or_read_a_catalog(self):
+        with tempfile.TemporaryDirectory() as raw:
+            self.assertEqual(self.load(Path(raw)/"missing",()),[])
+
+    def test_catalog_is_exact_and_host_owned(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root=Path(raw); provider,client=self.files(root)
+            entry={"provider":str(provider),"client":str(client)}
+            catalog=root/"spans.json"
+            catalog.write_text(json.dumps({"spans":{"echo":entry},"version":1}))
+            catalog.chmod(0o600)
+            with self.assertRaisesRegex(RuntimeError,"only a spans object"):
+                self.load(catalog,("echo",))
+            catalog=self.catalog(root,{"echo":{**entry,"methods":["spawn"]}})
+            with self.assertRaisesRegex(RuntimeError,"invalid catalog entry"):
+                self.load(catalog,("echo",))
+            catalog.chmod(0o622)
+            with self.assertRaisesRegex(RuntimeError,"not group/world-writable"):
+                self.load(catalog,("echo",))
+            catalog.unlink(); os.symlink(client,catalog)
+            with self.assertRaisesRegex(RuntimeError,"unreadable"):
+                self.load(catalog,("echo",))
+
+    def test_missing_catalog_entry_or_relative_path_is_rejected(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root=Path(raw); provider,client=self.files(root)
+            catalog=self.catalog(root,{"echo":{"provider":str(provider),"client":"relative"}})
+            with self.assertRaisesRegex(RuntimeError,"client must be an absolute path"):
+                self.load(catalog,("echo",))
+            with self.assertRaisesRegex(RuntimeError,"unavailable"):
+                self.load(catalog,("missing",))
+            client.chmod(0o777)
+            catalog=self.catalog(root,{"echo":{"provider":str(provider),"client":str(client)}})
+            with self.assertRaisesRegex(RuntimeError,"not group/world-writable"):
+                self.load(catalog,("echo",))
+
+    def test_catalog_and_executables_must_live_outside_the_workspace(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root=Path(raw); workspace=root/"workspace"; outside=root/"outside"
+            workspace.mkdir(); outside.mkdir()
+            provider,client=self.files(outside)
+            catalog=self.catalog(workspace,{"echo":{"provider":str(provider),"client":str(client)}})
+            with self.assertRaisesRegex(RuntimeError,"catalog must live outside"):
+                self.load(catalog,("echo",),workspace)
+            catalog=self.catalog(outside,{"echo":{"provider":str(workspace/"provider"),"client":str(client)}})
+            (workspace/"provider").write_text("#!/bin/sh\n"); (workspace/"provider").chmod(0o755)
+            with self.assertRaisesRegex(RuntimeError,"provider must live outside"):
+                self.load(catalog,("echo",),workspace)
+            catalog=self.catalog(outside,{"echo":{"provider":str(provider),"client":str(client)}})
+            os.link(provider,workspace/"provider-alias")
+            with self.assertRaisesRegex(RuntimeError,"must not have hard links"):
+                self.load(catalog,("echo",),workspace)
 
     def test_names_cannot_escape_the_projection(self):
-        for name in ("../echo", "Echo", "echo/span", "-echo", "echo-"):
-            with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, "invalid Span name"):
-                span_runtime.describe(name, search_path="")
+        with tempfile.TemporaryDirectory() as raw:
+            catalog=self.catalog(Path(raw),{})
+            for name in ("../echo", "Echo", "echo/span", "-echo", "echo-"):
+                with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, "invalid Span name"):
+                    self.load(catalog,(name,))
 
 
 class ProviderLifecycleTests(unittest.TestCase):
@@ -69,7 +131,8 @@ class ProviderLifecycleTests(unittest.TestCase):
             provider_path = root / "echo-span"
             provider_path.write_text(
                 "#!/usr/bin/env python3\n"
-                "import os,socket\n"
+                "import os,socket,sys\n"
+                "assert sys.argv==[sys.argv[0]]\n"
                 "assert os.environ['DEVC2_ISLAND_ID']=='island-one'\n"
                 f"assert os.environ['DEVC2_WORKSPACE']=={str(root)!r}\n"
                 "server=socket.socket(fileno=int(os.environ['DEVC2_SPAN_SOCKET_FD']))\n"
@@ -78,8 +141,8 @@ class ProviderLifecycleTests(unittest.TestCase):
                 "    connection.sendall(connection.recv(4096))\n"
             )
             provider_path.chmod(0o755)
-            description = span_runtime.SpanDescription("echo", "1", client, provider_path)
-            provider = span_runtime.Provider(description, root, "island-one")
+            span = span_runtime.Span("echo", client, provider_path)
+            provider = span_runtime.Provider(span, root, "island-one")
             try:
                 with socket.create_connection(provider.address, timeout=2) as connection:
                     connection.sendall(b"opaque bytes")
@@ -97,8 +160,8 @@ class ProviderLifecycleTests(unittest.TestCase):
             provider_path = root / "exit-span"
             provider_path.write_text("#!/bin/sh\nexit 23\n")
             provider_path.chmod(0o755)
-            description = span_runtime.SpanDescription("exit", "1", client, provider_path)
-            provider = span_runtime.Provider(description, root, "island-one")
+            span = span_runtime.Span("exit", client, provider_path)
+            provider = span_runtime.Provider(span, root, "island-one")
             address = provider.address
             try:
                 with self.assertRaisesRegex(RuntimeError, "status 23"):
@@ -122,8 +185,8 @@ class ProviderLifecycleTests(unittest.TestCase):
                 "exit 0\n"
             )
             provider_path.chmod(0o755)
-            description = span_runtime.SpanDescription("daemon", "1", client, provider_path)
-            provider = span_runtime.Provider(description, root, "island-one")
+            span = span_runtime.Span("daemon", client, provider_path)
+            provider = span_runtime.Provider(span, root, "island-one")
             child_pid = None
             try:
                 with self.assertRaisesRegex(RuntimeError, "status 0"):
@@ -157,7 +220,7 @@ class ProviderLifecycleTests(unittest.TestCase):
                 "import pathlib,time\n"
                 "from launcher import span_runtime\n"
                 f"root=pathlib.Path({str(root)!r})\n"
-                "d=span_runtime.SpanDescription('wait','1',root/'client',root/'wait-span')\n"
+                "d=span_runtime.Span('wait',root/'client',root/'wait-span')\n"
                 "p=span_runtime.Provider(d,root,'island-crash')\n"
                 "p.check_started()\n"
                 f"pathlib.Path({str(ready_file)!r}).write_text('ready')\n"
@@ -210,8 +273,8 @@ class ProviderLifecycleTests(unittest.TestCase):
             )
             provider_path.chmod(0o755)
             server_tls, client_tls = devc2.generate_relay_pki(root / "pki")
-            description = span_runtime.SpanDescription("echo", "1", client, provider_path)
-            provider = span_runtime.Provider(description, root, "island-one")
+            span = span_runtime.Span("echo", client, provider_path)
+            provider = span_runtime.Provider(span, root, "island-one")
             relay = span_runtime.OpaqueRelay(provider.address, server_tls)
             try:
                 context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=str(client_tls / "ca.crt"))
@@ -289,7 +352,7 @@ class LauncherGrantTests(unittest.TestCase):
         client = root / "herdr-client"
         client.write_text("#!/bin/sh\nexit 0\n")
         client.chmod(0o755)
-        description = span_runtime.SpanDescription("herdr", "1", client, root / "herdr-span")
+        span = span_runtime.Span("herdr", client, root / "herdr-span")
         completed = mock.Mock(returncode=0)
         with mock.patch.object(devc2, "require_docker"), \
              mock.patch.object(devc2, "ensure_v1_not_running"), \
@@ -301,15 +364,18 @@ class LauncherGrantTests(unittest.TestCase):
              mock.patch.object(devc2, "stop_process"), \
              mock.patch.object(devc2, "compose", side_effect=lambda *args, **kwargs: calls.append(args)), \
              mock.patch.object(devc2.subprocess, "run", return_value=completed), \
-             mock.patch.object(devc2.span_runtime, "describe", return_value=description) as describe, \
+             mock.patch.object(devc2.span_runtime, "load_catalog", return_value=[span] if names else []) as load_catalog, \
              mock.patch.object(devc2.span_runtime, "SpanRuntime", return_value=runtime) as start_runtime:
             self.assertEqual(devc2._start_unlocked(root, span_names=names), 0)
-        return calls, describe, start_runtime, runtime, public
+        return calls, load_catalog, start_runtime, runtime, public
 
     def test_no_grant_starts_no_provider_or_span_sidecar(self):
         with tempfile.TemporaryDirectory() as raw:
-            calls, describe, start_runtime, runtime, public = self.run_launcher(Path(raw), ())
-            describe.assert_not_called()
+            calls, load_catalog, start_runtime, runtime, public = self.run_launcher(Path(raw), ())
+            load_catalog.assert_called_once()
+            args=load_catalog.call_args.args
+            self.assertEqual(args[:3],(devc2.SPAN_CATALOG,(),Path(raw)))
+            self.assertEqual((args[3].name,args[4].name),("span-clients","span-providers"))
             start_runtime.assert_not_called()
             runtime.stop.assert_not_called()
             self.assertFalse((public / "spans.json").exists())
@@ -318,8 +384,11 @@ class LauncherGrantTests(unittest.TestCase):
 
     def test_explicit_grant_starts_and_stops_only_that_span(self):
         with tempfile.TemporaryDirectory() as raw:
-            calls, describe, start_runtime, runtime, public = self.run_launcher(Path(raw), ("herdr",))
-            describe.assert_called_once_with("herdr")
+            calls, load_catalog, start_runtime, runtime, public = self.run_launcher(Path(raw), ("herdr",))
+            load_catalog.assert_called_once()
+            args=load_catalog.call_args.args
+            self.assertEqual(args[:3],(devc2.SPAN_CATALOG,("herdr",),Path(raw)))
+            self.assertEqual((args[3].name,args[4].name),("span-clients","span-providers"))
             start_runtime.assert_called_once()
             runtime.stop.assert_called_once()
             self.assertEqual(json.loads((public / "spans.json").read_text()), [{"name": "herdr", "port": 49153}])

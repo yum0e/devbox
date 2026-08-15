@@ -21,6 +21,7 @@ CONFIG=xdg("XDG_CONFIG_HOME", ".config")/"devc2"
 STATE=xdg("XDG_STATE_HOME", ".local/state")/"devc2"
 AUTH=CONFIG/"auth"
 TACT_CONFIG=CONFIG/"tact"/"config.toml"
+SPAN_CATALOG=CONFIG/"spans.json"
 TACT_CONFIG_DEFAULT="[agent]\nmax_subagents = 8\n"
 AUTH_IMAGE=f"devc2:{VERSION}"
 INSTALL_STATE=STATE/"installation.json"
@@ -781,32 +782,31 @@ def _start_unlocked(repo, runtime_doctor=False, span_names=()):
     ensure_v1_not_running(repo)
     ensure_tact_config()
     digest, _project = identity(repo)
-    descriptions=[span_runtime.describe(name) for name in span_names]
     with repository_lock(repo):
         with tempfile.TemporaryDirectory(prefix='devc2-') as raw:
             temp=Path(raw); temp.chmod(0o700)
+            span_clients=temp/'span-clients'; span_providers=temp/'span-providers'
+            granted_spans=span_runtime.load_catalog(SPAN_CATALOG,span_names,repo,span_clients,span_providers)
             empty=temp/'empty'; empty.mkdir(0o700)
             # A killed launcher may have left sidecars behind. Stop the old
             # project before projecting this launch's explicit grant set.
             cleanup_env=compose_env(repo,empty,empty,span_client_dir=empty,spans=True)
             compose(repo,cleanup_env,'down','--remove-orphans',check=False)
             private,public=prepare(repo,temp)
-            span_clients=temp/'span-clients'
-            span_runtime.project_clients(descriptions,span_clients)
             relay_server_dir,relay_client_dir=generate_relay_pki(temp/'ssh-relay-pki')
             host_agent_relay,relay_port=start_host_agent_relay(temp/'ssh-relay-port',relay_server_dir,public/'ssh-allowed.pub')
             spans=None
             try:
-                if descriptions:
-                    spans=span_runtime.SpanRuntime(descriptions,repo,f'{digest}-{secrets.token_hex(8)}',relay_server_dir)
-                if descriptions:
+                if granted_spans:
+                    spans=span_runtime.SpanRuntime(granted_spans,repo,f'{digest}-{secrets.token_hex(8)}',relay_server_dir)
+                if granted_spans:
                     (public/'span-ready').write_text(secrets.token_hex(16))
                     (public/'span-ready').chmod(0o444)
                     (public/'spans.json').write_text(json.dumps([
-                        {'name':item.name,'port':spans.ports[item.name]} for item in descriptions
+                        {'name':item.name,'port':spans.ports[item.name]} for item in granted_spans
                     ],separators=(',',':')))
                     (public/'spans.json').chmod(0o444)
-                env=compose_env(repo,private,public,relay_port,relay_client_dir,span_clients,bool(descriptions))
+                env=compose_env(repo,private,public,relay_port,relay_client_dir,span_clients,bool(granted_spans))
             except Exception:
                 if spans is not None: spans.stop()
                 stop_process(host_agent_relay)
@@ -821,16 +821,16 @@ def _start_unlocked(repo, runtime_doctor=False, span_names=()):
                 previous[signum] = signal.signal(signum, terminate)
             try:
                 build_services=['devbox','ssh-proxy']
-                if descriptions: build_services.append('span-proxy')
+                if granted_spans: build_services.append('span-proxy')
                 compose(repo,env,'build',*build_services)
                 try:
                     services=['credential-proxy','ssh-proxy']
-                    if descriptions: services.append('span-proxy')
+                    if granted_spans: services.append('span-proxy')
                     compose(repo,env,'up','-d',*services)
                 except RuntimeError:
                     print("devc2: sanitized startup diagnostics:",file=sys.stderr)
                     compose(repo,env,'logs','--no-color','--tail','100','ssh-proxy',capture=False,check=False)
-                    if descriptions: compose(repo,env,'logs','--no-color','--tail','100','span-proxy',capture=False,check=False)
+                    if granted_spans: compose(repo,env,'logs','--no-color','--tail','100','span-proxy',capture=False,check=False)
                     raise
                 command=['docker','compose','--project-name',identity(repo)[1],'-f',str(ROOT/'compose.yaml'),'run','--rm','--no-deps']
                 if runtime_doctor: command.extend(['--env','DEVC2_RUNTIME_DOCTOR=1'])
@@ -839,7 +839,7 @@ def _start_unlocked(repo, runtime_doctor=False, span_names=()):
                 if result:
                     print("devc2: sanitized SSH proxy diagnostics:",file=sys.stderr)
                     compose(repo,env,'logs','--no-color','--tail','100','ssh-proxy',capture=False,check=False)
-                    if descriptions: compose(repo,env,'logs','--no-color','--tail','100','span-proxy',capture=False,check=False)
+                    if granted_spans: compose(repo,env,'logs','--no-color','--tail','100','span-proxy',capture=False,check=False)
                 return result
             except KeyboardInterrupt:
                 return 130 if stopping else 1

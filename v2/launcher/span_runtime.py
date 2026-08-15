@@ -9,6 +9,7 @@ import shutil
 import select
 import socket
 import ssl
+import stat
 import subprocess
 import sys
 import threading
@@ -17,17 +18,17 @@ from pathlib import Path
 
 
 NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
-MAX_DESCRIPTION_BYTES = 64 * 1024
+MAX_CATALOG_BYTES = 64 * 1024
 MAX_CLIENT_BYTES = 64 * 1024 * 1024
+MAX_PROVIDER_BYTES = 64 * 1024 * 1024
 MAX_CONNECTIONS = 64
 MAX_SPANS = 16
 SUPERVISOR = Path(__file__).with_name("span_supervisor.py")
 
 
 @dataclass(frozen=True)
-class SpanDescription:
+class Span:
     name: str
-    version: str
     client: Path
     provider: Path
 
@@ -36,60 +37,104 @@ def valid_name(name: str) -> bool:
     return bool(NAME.fullmatch(name))
 
 
-def describe(name: str, *, search_path: str | None = None) -> SpanDescription:
-    if not valid_name(name):
-        raise RuntimeError(f"invalid Span name: {name!r}")
-    command = shutil.which(f"{name}-span", path=search_path)
-    if not command:
-        raise RuntimeError(f"Span provider not found on host PATH: {name}-span")
-    provider = Path(command).resolve(strict=True)
-    try:
-        completed = subprocess.run(
-            [str(provider), "describe"], text=False, capture_output=True,
-            check=False, timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise RuntimeError(f"could not describe Span {name!r}") from error
-    if completed.returncode:
-        detail = completed.stderr[:4096].decode("utf-8", "replace").strip()
-        raise RuntimeError(f"{name}-span describe failed{': ' + detail if detail else ''}")
-    if len(completed.stdout) > MAX_DESCRIPTION_BYTES:
-        raise RuntimeError(f"{name}-span describe returned too much data")
-    try:
-        document = json.loads(completed.stdout)
-    except (UnicodeDecodeError, ValueError) as error:
-        raise RuntimeError(f"{name}-span describe did not return JSON") from error
-    if not isinstance(document, dict) or set(document) != {"name", "version", "client"}:
-        raise RuntimeError(f"{name}-span describe must return only name, version, and client")
-    if document["name"] != name:
-        raise RuntimeError(f"{name}-span described a different Span name")
-    if not isinstance(document["version"], str) or not document["version"]:
-        raise RuntimeError(f"{name}-span described an invalid version")
-    if not isinstance(document["client"], str) or not Path(document["client"]).is_absolute():
-        raise RuntimeError(f"{name}-span client must be an absolute path")
-    client = Path(document["client"]).resolve(strict=True)
-    metadata = client.stat()
-    if not client.is_file() or metadata.st_size > MAX_CLIENT_BYTES:
-        raise RuntimeError(f"{name}-span client must be a regular file no larger than 64 MiB")
-    if not metadata.st_mode & 0o111:
-        raise RuntimeError(f"{name}-span client is not executable")
-    return SpanDescription(name, document["version"], client, provider)
+def _inside(path: Path, root: Path | None) -> bool:
+    return root is not None and (path==root or root in path.parents)
 
 
-def project_clients(descriptions: list[SpanDescription], destination: Path) -> None:
-    if len(descriptions) > MAX_SPANS:
-        raise RuntimeError(f"an Island may grant at most {MAX_SPANS} Spans")
-    destination.mkdir(mode=0o700)
-    for item in descriptions:
-        target = destination / item.name
-        shutil.copyfile(item.client, target)
+def _snapshot_executable(raw: object, label: str, target: Path, maximum: int, forbidden_root: Path | None) -> Path:
+    if not isinstance(raw, str) or not Path(raw).is_absolute():
+        raise RuntimeError(f"Span {label} must be an absolute path")
+    descriptor=None
+    try:
+        path = Path(raw).resolve(strict=True)
+        if _inside(path,forbidden_root):
+            raise RuntimeError(f"Span {label} must live outside the mounted workspace")
+        descriptor=os.open(path,os.O_RDONLY|getattr(os,"O_CLOEXEC",0)|getattr(os,"O_NOFOLLOW",0))
+        metadata=os.fstat(descriptor)
+    except OSError as error:
+        raise RuntimeError(f"Span {label} is unavailable: {raw}") from error
+    try:
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size>maximum:
+            raise RuntimeError(f"Span {label} must be a regular file no larger than 64 MiB")
+        if metadata.st_nlink!=1:
+            raise RuntimeError(f"Span {label} must not have hard links")
+        if metadata.st_uid not in {0,os.getuid()} or metadata.st_mode & 0o022:
+            raise RuntimeError(f"Span {label} must be owned by root/current user and not group/world-writable")
+        if not metadata.st_mode & 0o111:
+            raise RuntimeError(f"Span {label} is not executable")
+        output=os.open(target,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o500)
+        with os.fdopen(descriptor,"rb") as source,os.fdopen(output,"wb") as destination:
+            descriptor=None
+            shutil.copyfileobj(source,destination,1024*1024)
         target.chmod(0o555)
-    destination.chmod(0o555)
+        return target
+    finally:
+        if descriptor is not None: os.close(descriptor)
+
+
+def load_catalog(path: Path, names: tuple[str, ...], forbidden_root: Path, client_destination: Path, provider_destination: Path) -> list[Span]:
+    if len(names)>MAX_SPANS:
+        raise RuntimeError(f"an Island may grant at most {MAX_SPANS} Spans")
+    client_destination.mkdir(mode=0o700)
+    provider_destination.mkdir(mode=0o700)
+    if not names:
+        client_destination.chmod(0o555)
+        return []
+    for name in names:
+        if not valid_name(name):
+            raise RuntimeError(f"invalid Span name: {name!r}")
+    forbidden_root=forbidden_root.resolve()
+    if _inside(path.resolve(strict=False),forbidden_root):
+        raise RuntimeError("Span catalog must live outside the mounted workspace")
+    descriptor=None
+    try:
+        descriptor=os.open(path,os.O_RDONLY|getattr(os,"O_CLOEXEC",0)|getattr(os,"O_NOFOLLOW",0))
+        metadata=os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError("Span catalog must be a regular file, not a symlink")
+        if metadata.st_uid != os.getuid() or metadata.st_mode & 0o022:
+            raise RuntimeError("Span catalog must be owned by the current user and not group/world-writable")
+        if metadata.st_size > MAX_CATALOG_BYTES:
+            raise RuntimeError("Span catalog exceeds 64 KiB")
+        with os.fdopen(descriptor,"rb") as source:
+            descriptor=None
+            payload=source.read(MAX_CATALOG_BYTES+1)
+            if len(payload)>MAX_CATALOG_BYTES:
+                raise RuntimeError("Span catalog exceeds 64 KiB")
+            document=json.loads(payload)
+    except FileNotFoundError as error:
+        raise RuntimeError(f"Span catalog not found: {path}") from error
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        raise RuntimeError(f"Span catalog is unreadable or invalid JSON: {path}") from error
+    finally:
+        if descriptor is not None: os.close(descriptor)
+    if not isinstance(document, dict) or set(document) != {"spans"} or not isinstance(document["spans"], dict):
+        raise RuntimeError("Span catalog must contain only a spans object")
+    entries = document["spans"]
+    if len(entries) > 64:
+        raise RuntimeError("Span catalog contains too many entries")
+    for catalog_name,entry in entries.items():
+        if not isinstance(catalog_name,str) or not valid_name(catalog_name):
+            raise RuntimeError("Span catalog contains an invalid name")
+        if not isinstance(entry,dict) or set(entry)!={"provider","client"}:
+            raise RuntimeError(f"Span {catalog_name!r} has an invalid catalog entry")
+        if not all(isinstance(entry[field],str) for field in ("provider","client")):
+            raise RuntimeError(f"Span {catalog_name!r} has an invalid catalog path")
+    result=[]
+    for name in names:
+        entry=entries.get(name)
+        if entry is None:
+            raise RuntimeError(f"Span {name!r} is unavailable")
+        provider=_snapshot_executable(entry["provider"],f"{name!r} provider",provider_destination/name,MAX_PROVIDER_BYTES,forbidden_root)
+        client=_snapshot_executable(entry["client"],f"{name!r} client",client_destination/name,MAX_CLIENT_BYTES,forbidden_root)
+        result.append(Span(name,client,provider))
+    client_destination.chmod(0o555)
+    return result
 
 
 class Provider:
-    def __init__(self, description: SpanDescription, workspace: Path, instance_id: str):
-        self.description = description
+    def __init__(self, span: Span, workspace: Path, instance_id: str):
+        self.span = span
         self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.listener.bind(("127.0.0.1", 0))
@@ -107,7 +152,7 @@ class Provider:
             self.process = subprocess.Popen(
                 [
                     sys.executable, os.fspath(SUPERVISOR),
-                    "--provider", os.fspath(description.provider),
+                    "--provider", os.fspath(span.provider),
                     "--listener-fd", str(self.listener.fileno()),
                     "--lifetime-fd", str(lifetime_read),
                     "--ready-fd", str(ready_write),
@@ -146,8 +191,8 @@ class Provider:
         try:
             status = self.process.wait(timeout=2)
         except subprocess.TimeoutExpired as error:
-            raise RuntimeError(f"{self.description.name}-span serve did not become ready") from error
-        raise RuntimeError(f"{self.description.name}-span serve exited with status {status}")
+            raise RuntimeError(f"Span {self.span.name!r} provider did not become ready") from error
+        raise RuntimeError(f"Span {self.span.name!r} provider exited with status {status}")
 
     def stop(self) -> None:
         if self.ready_read is not None:
@@ -278,18 +323,18 @@ class OpaqueRelay:
 
 
 class SpanRuntime:
-    def __init__(self, descriptions: list[SpanDescription], workspace: Path, instance_id: str, tls_directory: Path):
+    def __init__(self, spans: list[Span], workspace: Path, instance_id: str, tls_directory: Path):
         self.providers: list[Provider] = []
         self.relays: list[OpaqueRelay] = []
         self.ports: dict[str, int] = {}
         try:
-            for description in descriptions:
-                provider = Provider(description, workspace, instance_id)
+            for span in spans:
+                provider = Provider(span, workspace, instance_id)
                 self.providers.append(provider)
                 provider.check_started()
                 relay = OpaqueRelay(provider.address, tls_directory)
                 self.relays.append(relay)
-                self.ports[description.name] = relay.port
+                self.ports[span.name] = relay.port
         except Exception:
             self.stop()
             raise

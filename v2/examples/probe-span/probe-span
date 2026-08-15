@@ -7,7 +7,6 @@ import os
 import socket
 import struct
 import sys
-from pathlib import Path
 
 
 VERSION = "0.1.0"
@@ -59,12 +58,6 @@ def handle(connection: socket.socket) -> None:
             pass
 
 
-def describe() -> int:
-    client = Path(__file__).resolve().with_name("probe-span-client")
-    print(json.dumps({"name": "probe", "version": VERSION, "client": str(client)}, separators=(",", ":")))
-    return 0
-
-
 def serve() -> int:
     try:
         descriptor = int(os.environ["DEVC2_SPAN_SOCKET_FD"])
@@ -85,12 +78,10 @@ def serve() -> int:
 
 
 def main() -> int:
-    if sys.argv[1:] == ["describe"]:
-        return describe()
-    if sys.argv[1:] == ["serve"]:
-        return serve()
-    print("usage: probe-span describe | probe-span serve", file=sys.stderr)
-    return 2
+    if sys.argv[1:]:
+        print("probe-span: provider accepts no arguments", file=sys.stderr)
+        return 2
+    return serve()
 
 
 if __name__ == "__main__":

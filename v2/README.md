@@ -42,10 +42,10 @@ devc2 reset /path/to/repository --yes
 
 `devc2 run /path/to/repository` grants no Spans and opens a shell after
 credential and signing readiness checks pass. `--span herdr` is an explicit
-grant: it discovers `herdr-span` on the host `PATH`, projects only the client it
-describes, and starts a provider scoped to that one Island. Granting a Span does
-not automatically invoke it. Inside the Island, the projected command and its
-private endpoint are `/run/devc2/bin/herdr` and
+grant: it resolves `herdr` from the host-owned Span catalog, projects only its
+configured client, and starts its configured provider scoped to that one
+Island. Granting a Span does not automatically invoke its client. Inside the
+Island, the projected command and its private endpoint are `/run/devc2/bin/herdr` and
 `/run/devc2/spans/herdr.sock`.
 
 `reset` removes only that checkout's v2 Compose resources and state. It never
@@ -72,25 +72,33 @@ transport unless its name appears in `--span`.
 An Island may grant at most 16 Spans; the transport rejects excess concurrent
 connections instead of creating unbounded threads.
 
-A provider is a host executable named `<name>-span` with two operations:
-
-```sh
-<name>-span describe
-<name>-span serve
-```
-
-`describe` writes exactly one JSON object to stdout:
+A Span is made available in the host-owned catalog at
+`~/.config/devc2/spans.json` (or `$XDG_CONFIG_HOME/devc2/spans.json`):
 
 ```json
-{"name":"herdr","version":"0.1.0","client":"/absolute/path/to/linux/herdr"}
+{
+  "spans": {
+    "herdr": {
+      "provider": "/absolute/host/path/to/herdr-provider",
+      "client": "/absolute/host/path/to/herdr-client-linux"
+    }
+  }
+}
 ```
 
-The client must be one regular executable file of at most 64 MiB. `devc2`
-snapshots it for that launch and mounts the snapshot read-only as
+The catalog must be a regular file owned by the current host user and must not
+be group- or world-writable. Entries contain exactly absolute `provider` and
+`client` paths; there are no shell command strings or provider-reported fields.
+Both paths must resolve outside the mounted workspace to root/current-user-owned
+executables that are not group/world-writable or hard-linked. Each executable
+must be a self-contained file of at most 64 MiB. `devc2` opens and validates both
+without running them, snapshots their exact bytes for that launch, and mounts
+the client snapshot read-only as
 `/run/devc2/bin/<name>`; it never becomes a release asset or part of the base
 image.
 
-For `serve`, `DEVC2_SPAN_SOCKET_FD` names an inherited listening socket.
+The provider is executed directly with no devc2-defined arguments.
+`DEVC2_SPAN_SOCKET_FD` names an inherited listening socket.
 `DEVC2_ISLAND_ID` is unique to the launch and `DEVC2_WORKSPACE` is the canonical
 host checkout path. The provider accepts one connection for each client stream.
 The launcher and its small bridge copy bytes without interpreting or framing
@@ -111,6 +119,14 @@ reports its scoped launch identity and echoes bounded opaque bytes, but cannot
 execute commands or read arbitrary host files. Use it to validate installation
 versus grant, client projection, transport, and lifecycle before integrating a
 real capability.
+
+The catalog/no-argument contract replaces the earlier experimental
+`<name>-span describe|serve` prototype. Re-run the probe installer after updating.
+Other prototype providers should install immutable provider/client files outside
+the workspace and register them in `spans.json`; a legacy provider that requires
+`serve` needs a tiny external wrapper that executes it with that argument. There
+is no automatic PATH migration because availability is now intentionally an
+explicit host configuration decision.
 
 
 ## Safe installation and updates

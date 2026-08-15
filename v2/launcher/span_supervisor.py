@@ -53,7 +53,7 @@ def main(argv: list[str] | None = None) -> int:
         signal.signal(signum, request_stop)
 
     provider = subprocess.Popen(
-        [args.provider, "serve"],
+        [args.provider],
         stdin=subprocess.DEVNULL,
         pass_fds=(args.listener_fd,),
         start_new_session=True,

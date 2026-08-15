@@ -29,12 +29,29 @@ def load_provider():
 
 
 class ProbeSpanTests(unittest.TestCase):
-    def test_description_is_the_exact_lean_contract(self):
-        completed = subprocess.run([str(PROVIDER), "describe"], text=True, capture_output=True, check=True)
-        self.assertEqual(
-            json.loads(completed.stdout),
-            {"name": "probe", "version": "0.1.0", "client": str(CLIENT.resolve())},
-        )
+    def test_installer_registers_exact_host_paths(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root=Path(raw); span_root=root/"span-root"; config=root/"config"
+            environment={**os.environ,"HOME":str(root),"DEVC2_SPAN_ROOT":str(span_root),"XDG_CONFIG_HOME":str(config)}
+            completed=subprocess.run([str(EXAMPLE/"install.sh")],env=environment,text=True,capture_output=True,check=True)
+            catalog=config/"devc2"/"spans.json"
+            entry=json.loads(catalog.read_text())["spans"]["probe"]
+            provider=Path(entry["provider"]); client=Path(entry["client"])
+            self.assertEqual(provider.parent,client.parent)
+            self.assertEqual(provider.parent.parent,span_root)
+            self.assertEqual(provider.read_bytes(),PROVIDER.read_bytes())
+            self.assertEqual(client.read_bytes(),CLIENT.read_bytes())
+            self.assertEqual(provider.stat().st_nlink,1)
+            self.assertEqual(client.stat().st_nlink,1)
+            self.assertEqual(provider.stat().st_mode&0o777,0o555)
+            self.assertEqual(client.stat().st_mode&0o777,0o555)
+            self.assertEqual(catalog.stat().st_mode & 0o777,0o600)
+            self.assertIn("registered probe Span",completed.stdout)
+            document=json.loads(catalog.read_text())
+            document["spans"]["other"]={"provider":"/opt/other/provider","client":"/opt/other/client"}
+            catalog.write_text(json.dumps(document)); catalog.chmod(0o600)
+            subprocess.run([str(EXAMPLE/"install.sh")],env=environment,capture_output=True,check=True)
+            self.assertIn("other",json.loads(catalog.read_text())["spans"])
 
     def test_provider_info_and_binary_echo(self):
         provider = load_provider()
@@ -48,7 +65,7 @@ class ProbeSpanTests(unittest.TestCase):
         listener.listen()
         environment["DEVC2_SPAN_SOCKET_FD"] = str(listener.fileno())
         process = subprocess.Popen(
-            [str(PROVIDER), "serve"], env=environment,
+            [str(PROVIDER)], env=environment,
             pass_fds=(listener.fileno(),), stdout=subprocess.DEVNULL,
         )
         try:
