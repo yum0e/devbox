@@ -19,17 +19,7 @@ READY_TOKEN = re.compile(r"^[a-f0-9]{32}$")
 MAX_CONNECTIONS = 16
 MAX_SPANS = 16
 
-
-def copy_stream(source: socket.socket, destination: socket.socket) -> None:
-    try:
-        while chunk := source.recv(64 * 1024):
-            destination.sendall(chunk)
-    except OSError:
-        pass
-    try:
-        destination.shutdown(socket.SHUT_WR)
-    except OSError:
-        pass
+from .stream_relay import duplex_stream
 
 
 class Bridge:
@@ -95,10 +85,7 @@ class Bridge:
                                 self.connections.add(remote)
                             client.settimeout(None)
                             remote.settimeout(None)
-                            reverse = threading.Thread(target=copy_stream, args=(remote, client), daemon=True)
-                            reverse.start()
-                            copy_stream(client, remote)
-                            reverse.join()
+                            duplex_stream(client, remote, self.stopping)
                 except (OSError, ssl.SSLError, RuntimeError):
                     return
         finally:

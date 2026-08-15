@@ -431,7 +431,7 @@ class ProviderLifecycleTests(unittest.TestCase):
         relay_right, world = socket.socketpair()
         stopping = threading.Event()
         thread = threading.Thread(
-            target=span_runtime.OpaqueRelay._duplex,
+            target=span_bridge.duplex_stream,
             args=(relay_left, relay_right, stopping),
             daemon=True,
         )

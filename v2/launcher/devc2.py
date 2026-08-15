@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse, base64, contextlib, fcntl, gzip, hashlib, json, os, platform, secrets, shlex, shutil, signal, stat, subprocess, sys, tarfile, tempfile, time, unicodedata, urllib.error, urllib.parse, urllib.request
 from pathlib import Path, PurePosixPath
 
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 import span_runtime
 
@@ -126,7 +127,7 @@ def source_version(source):
     return match.group(1)
 
 def validate_asset_tree(source,strict=False):
-    required=("Dockerfile","compose.yaml","devbox/entrypoint.sh","devbox/tact-wrapper.sh","launcher/devc2.py","launcher/span_runtime.py","launcher/span_supervisor.py","launcher/dispatcher.py","launcher/command_projection.py","launcher/scoped_exec_projection.py","credential_proxy/span_bridge.py","spans/openai/world","spans/github/world","spans/ssh-agent/world","spans/github/provider","spans/github/client","spans/ssh-agent/provider","spans/ssh-agent/client")
+    required=("Dockerfile","compose.yaml","devbox/entrypoint.sh","devbox/tact-wrapper.sh","launcher/devc2.py","launcher/span_runtime.py","launcher/span_supervisor.py","launcher/dispatcher.py","launcher/command_projection.py","launcher/scoped_exec_projection.py","credential_proxy/span_bridge.py","credential_proxy/stream_relay.py","spans/openai/world","spans/github/world","spans/ssh-agent/world","spans/github/provider","spans/github/client","spans/ssh-agent/provider","spans/ssh-agent/client")
     if not source.is_dir() or source.is_symlink(): raise RuntimeError("release asset root must be a directory")
     total=0; count=0; allowed={"Dockerfile","compose.yaml","README.md","install.sh","devbox","credential_proxy","launcher","spans"}
     for path in source.rglob("*"):
