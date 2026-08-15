@@ -149,7 +149,12 @@ class Provider:
         self.jobs: dict[str, Job] = {}
         self.lock = threading.RLock()
         self.stopping = threading.Event()
-        self.herdr.call("pane.get", {"pane_id": self.anchor})
+
+    def check_anchor(self) -> None:
+        result = self.herdr.call("pane.get", {"pane_id": self.anchor})
+        pane = result.get("pane")
+        if not isinstance(pane, dict) or pane.get("pane_id") != self.anchor:
+            raise SpanError("Herdr no longer recognizes the launching pane")
 
     @property
     def workspace_hash(self) -> str:
@@ -297,6 +302,9 @@ class Provider:
     def handle(self, request: dict) -> object:
         if not isinstance(request, dict) or not isinstance(request.get("op"), str):
             raise SpanError("request must contain an operation")
+        # Upstream health is a client-call concern, not Span startup readiness.
+        # Retrying every call also lets a restarted Herdr server recover naturally.
+        self.check_anchor()
         operation = request["op"]
         if operation == "spawn":
             return self.spawn(request)

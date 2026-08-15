@@ -48,8 +48,10 @@ Herdr must already be running on the host. From a host Herdr pane:
 devc2 run . --span herdr
 ```
 
-The provider deliberately refuses to start if `devc2` was not launched from a
-Herdr-managed pane.
+The provider starts independently of Herdr's current health. Each client call
+checks the pane inherited from the host launch, reports a bounded error if
+Herdr is unavailable, and retries that check on the next call. Calls are
+rejected if `devc2` was not launched from a Herdr-managed pane.
 
 Inside the Island:
 

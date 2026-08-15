@@ -105,6 +105,12 @@ The launcher and its small bridge copy bytes without interpreting or framing
 them. Tool methods, schemas, authorization, PTYs, process execution, prompts,
 and every other semantic decision belong to the provider.
 
+Provider startup is structural, not a semantic health check: devc2 verifies that
+the configured executable starts and does not exit immediately, but it does not
+ask whether Herdr, Slack, or another provider-specific upstream is ready. Clients
+surface those failures normally and providers may retry or recover without a new
+Island launch.
+
 On Docker Desktop, the private Unix endpoint cannot cross directly from macOS
 to Linux. The transport therefore uses a per-launch mutually authenticated TLS
 hop. Its keys enter only the protocol-blind bridge sidecar, never the Island.

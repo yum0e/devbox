@@ -41,7 +41,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--provider", required=True)
     parser.add_argument("--listener-fd", required=True, type=int)
     parser.add_argument("--lifetime-fd", required=True, type=int)
-    parser.add_argument("--ready-fd", required=True, type=int)
+    parser.add_argument("--started-fd", required=True, type=int)
     args = parser.parse_args(argv)
     stopping = False
 
@@ -68,8 +68,10 @@ def main(argv: list[str] | None = None) -> int:
         if stopping:
             stop_group(provider)
             return 0
-        os.write(args.ready_fd, b"1")
-        os.close(args.ready_fd)
+        # This is deliberately structural: the child exec succeeded and did not
+        # exit immediately. Semantic readiness belongs to the Span client/provider.
+        os.write(args.started_fd, b"1")
+        os.close(args.started_fd)
         while not stopping:
             status = provider.poll()
             if status is not None:
@@ -81,7 +83,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     finally:
         try:
-            os.close(args.ready_fd)
+            os.close(args.started_fd)
         except OSError:
             pass
         os.close(args.lifetime_fd)

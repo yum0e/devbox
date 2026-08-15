@@ -171,6 +171,22 @@ class ProviderLifecycleTests(unittest.TestCase):
             finally:
                 provider.stop()
 
+    def test_start_check_is_structural_not_semantic_readiness(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            client = root / "client"
+            client.write_text("client")
+            provider_path = root / "delayed-exit-span"
+            provider_path.write_text("#!/bin/sh\nsleep 0.25\nexit 23\n")
+            provider_path.chmod(0o755)
+            span = span_runtime.Span("delayed", client, provider_path)
+            provider = span_runtime.Provider(span, root, "island-one")
+            try:
+                provider.check_started()
+                self.assertEqual(provider.process.wait(timeout=2), 23)
+            finally:
+                provider.stop()
+
     def test_exited_provider_cannot_leave_background_children(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

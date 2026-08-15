@@ -141,7 +141,7 @@ class Provider:
         self.listener.listen(64)
         self._address = self.listener.getsockname()
         lifetime_read, self.lifetime_write = os.pipe()
-        self.ready_read, ready_write = os.pipe()
+        self.started_read, started_write = os.pipe()
         environment = dict(os.environ)
         environment.update({
             "DEVC2_SPAN_SOCKET_FD": str(self.listener.fileno()),
@@ -155,23 +155,23 @@ class Provider:
                     "--provider", os.fspath(span.provider),
                     "--listener-fd", str(self.listener.fileno()),
                     "--lifetime-fd", str(lifetime_read),
-                    "--ready-fd", str(ready_write),
+                    "--started-fd", str(started_write),
                 ],
                 env=environment,
                 stdin=subprocess.DEVNULL,
-                pass_fds=(self.listener.fileno(), lifetime_read, ready_write),
+                pass_fds=(self.listener.fileno(), lifetime_read, started_write),
                 start_new_session=True,
             )
         except Exception:
             os.close(lifetime_read)
-            os.close(ready_write)
-            os.close(self.ready_read)
+            os.close(started_write)
+            os.close(self.started_read)
             os.close(self.lifetime_write)
             self.lifetime_write = None
             self.listener.close()
             raise
         os.close(lifetime_read)
-        os.close(ready_write)
+        os.close(started_write)
         self.listener.close()
 
     @property
@@ -180,24 +180,24 @@ class Provider:
         return host, port
 
     def check_started(self) -> None:
-        readable, _writable, _errors = select.select([self.ready_read], [], [], 2)
-        if readable and os.read(self.ready_read,1)==b"1":
-            os.close(self.ready_read)
-            self.ready_read = None
+        readable, _writable, _errors = select.select([self.started_read], [], [], 2)
+        if readable and os.read(self.started_read,1)==b"1":
+            os.close(self.started_read)
+            self.started_read = None
             return
-        if self.ready_read is not None:
-            os.close(self.ready_read)
-            self.ready_read = None
+        if self.started_read is not None:
+            os.close(self.started_read)
+            self.started_read = None
         try:
             status = self.process.wait(timeout=2)
         except subprocess.TimeoutExpired as error:
-            raise RuntimeError(f"Span {self.span.name!r} provider did not become ready") from error
+            raise RuntimeError(f"Span {self.span.name!r} provider did not stay running through startup") from error
         raise RuntimeError(f"Span {self.span.name!r} provider exited with status {status}")
 
     def stop(self) -> None:
-        if self.ready_read is not None:
-            os.close(self.ready_read)
-            self.ready_read = None
+        if self.started_read is not None:
+            os.close(self.started_read)
+            self.started_read = None
         try:
             if self.lifetime_write is not None:
                 os.close(self.lifetime_write)

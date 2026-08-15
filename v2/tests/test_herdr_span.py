@@ -68,6 +68,25 @@ def provider() -> H.Provider:
 
 
 class ProviderTests(unittest.TestCase):
+    def test_upstream_validation_is_lazy_retryable_and_nonfatal(self):
+        environment = {
+            "DEVC2_ISLAND_ID": "island-one",
+            "DEVC2_WORKSPACE": "/workspace",
+            "HERDR_ENV": "1",
+            "HERDR_SOCKET_PATH": "/host/herdr.sock",
+            "HERDR_PANE_ID": "w1:p1",
+        }
+        responses = [H.SpanError("Herdr is offline"), {"pane": {"pane_id": "w1:p1"}}]
+        with mock.patch.dict(H.os.environ, environment, clear=True), \
+             mock.patch.object(H, "safe_socket", return_value=Path("/host/herdr.sock")), \
+             mock.patch.object(H, "safe_executable", return_value="/bin/true"), \
+             mock.patch.object(H.Herdr, "call", side_effect=responses) as call:
+            item = H.Provider()
+            self.assertEqual(call.call_count, 0, "provider startup must not contact semantic upstreams")
+            with self.assertRaisesRegex(H.SpanError, "offline"):
+                item.handle({"op": "list"})
+            self.assertEqual(item.handle({"op": "list"}), [])
+
     def test_spawn_constructs_only_a_worker_invocation(self):
         item = provider()
         argv = ["sh", "-lc", "printf '%s' \"$HOME; $(id)\"", "", "snowman-☃"]
