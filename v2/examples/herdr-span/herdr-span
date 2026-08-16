@@ -6,21 +6,17 @@ import argparse
 import base64
 import binascii
 import contextlib
-import hashlib
 import io
 import json
 import os
 import re
 import shlex
-import shutil
 import signal
 import socket
 import stat
 import struct
-import subprocess
 import sys
 import threading
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -81,16 +77,16 @@ def safe_socket(path: str) -> Path:
     return candidate
 
 
-def safe_executable(name: str) -> str:
-    found = shutil.which(name)
-    if not found:
-        raise SpanError(f"required host executable is unavailable: {name}")
-    resolved = Path(found).resolve(strict=True)
+def safe_executable(raw: str) -> str:
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        raise SpanError("worker Link executable must be absolute")
+    resolved = candidate.resolve(strict=True)
     metadata = resolved.stat()
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid not in (0, os.getuid()):
-        raise SpanError(f"unsafe host executable: {name}")
+        raise SpanError("unsafe worker Link executable")
     if metadata.st_mode & 0o022 or not os.access(resolved, os.X_OK):
-        raise SpanError(f"unsafe host executable: {name}")
+        raise SpanError("unsafe worker Link executable")
     return str(resolved)
 
 
@@ -148,16 +144,17 @@ def start_marker(marker: str) -> str:
 
 class World:
     def __init__(self):
-        required = ("DEVC2_ISLAND_ID", "DEVC2_WORKSPACE", "HERDR_SOCKET_PATH", "HERDR_PANE_ID")
+        required = (
+            "HERDR_SOCKET_PATH", "HERDR_PANE_ID",
+            "DEVC2_HERDR_WORKER", "DEVC2_HERDR_WORKER_SOCKET",
+        )
         missing = [name for name in required if not os.environ.get(name)]
         if os.environ.get("HERDR_ENV") != "1" or missing:
             raise SpanError("launch devc2 --span herdr from inside a host Herdr pane")
-        self.island_id = bounded_string(os.environ["DEVC2_ISLAND_ID"], "Island ID", 128)
-        self.workspace = Path(os.environ["DEVC2_WORKSPACE"]).resolve(strict=True)
         self.anchor = bounded_string(os.environ["HERDR_PANE_ID"], "Herdr pane ID", 128)
         self.herdr = Herdr(safe_socket(os.environ["HERDR_SOCKET_PATH"]))
-        self.docker = safe_executable("docker")
-        self.world_executable = str(Path(__file__).resolve(strict=True))
+        self.worker_executable = safe_executable(os.environ["DEVC2_HERDR_WORKER"])
+        self.worker_socket = safe_socket(os.environ["DEVC2_HERDR_WORKER_SOCKET"])
         self.jobs: dict[str, Job] = {}
         self.lock = threading.RLock()
         self.stopping = threading.Event()
@@ -167,66 +164,6 @@ class World:
         pane = result.get("pane")
         if not isinstance(pane, dict) or pane.get("pane_id") != self.anchor:
             raise SpanError("Herdr no longer recognizes the launching pane")
-
-    @property
-    def workspace_hash(self) -> str:
-        return hashlib.sha256(os.fsencode(self.workspace)).hexdigest()[:16]
-
-    def island_container(self) -> str:
-        filters = (
-            f"label=dev.devbox.generation=2",
-            f"label=dev.devbox.workspace-hash={self.workspace_hash}",
-            f"label=com.docker.compose.project=devc2-{self.workspace_hash}",
-            "label=com.docker.compose.service=devbox",
-            "label=com.docker.compose.oneoff=True",
-        )
-        command = [self.docker, "ps"]
-        for item in filters:
-            command.extend(("--filter", item))
-        command.extend(("--format", "{{.ID}}"))
-        try:
-            completed = subprocess.run(command, text=True, capture_output=True, timeout=10, check=False)
-        except subprocess.SubprocessError as error:
-            raise SpanError("Docker did not identify the Island") from error
-        identifiers = completed.stdout.split() if completed.returncode == 0 else []
-        if len(identifiers) != 1:
-            raise SpanError("could not identify exactly one running Island container")
-        try:
-            inspected = subprocess.run(
-                [self.docker, "inspect", identifiers[0]], text=True, capture_output=True, timeout=10, check=False
-            )
-        except subprocess.SubprocessError as error:
-            raise SpanError("Docker did not inspect the Island") from error
-        try:
-            document = json.loads(inspected.stdout)[0]
-            labels = document["Config"]["Labels"]
-            mounts = document["Mounts"]
-            identifier = document["Id"]
-            running = document["State"]["Running"]
-        except (IndexError, KeyError, TypeError, json.JSONDecodeError) as error:
-            raise SpanError("Docker returned invalid Island metadata") from error
-        expected = {
-            "dev.devbox.generation": "2",
-            "dev.devbox.workspace-hash": self.workspace_hash,
-            "com.docker.compose.project": f"devc2-{self.workspace_hash}",
-            "com.docker.compose.service": "devbox",
-            "com.docker.compose.oneoff": "True",
-        }
-        workspace_sources = {os.fspath(self.workspace)}
-        if sys.platform == "darwin":
-            workspace_sources.add("/host_mnt" + os.fspath(self.workspace))
-        workspace_mounts = [
-            item for item in mounts
-            if item.get("Destination") == "/workspace"
-            and item.get("Type") == "bind"
-            and item.get("RW") is True
-            and item.get("Source") in workspace_sources
-        ]
-        if inspected.returncode or not running or not isinstance(labels, dict) or any(labels.get(k) != v for k, v in expected.items()):
-            raise SpanError("Docker container is not the granted Island")
-        if len(workspace_mounts) != 1 or not isinstance(identifier, str) or not re.fullmatch(r"[0-9a-f]{64}", identifier):
-            raise SpanError("Docker container has invalid Island metadata")
-        return identifier
 
     def pane(self, job: Job) -> dict:
         result = self.herdr.call("pane.get", {"pane_id": job.pane_id})
@@ -303,7 +240,6 @@ class World:
                 raise SpanError(f"worker already exists: {name}")
             if len(self.jobs) >= MAX_JOBS:
                 raise SpanError(f"an Island may create at most {MAX_JOBS} Herdr workers")
-            container = self.island_container()
             split = self.herdr.call(
                 "pane.split",
                 {"target_pane_id": self.anchor, "direction": "right", "focus": False},
@@ -314,11 +250,17 @@ class World:
             marker = f"__DEVC2_HERDR_{os.urandom(16).hex()}_EXIT_"
             job = Job(name, pane["pane_id"], pane["terminal_id"], marker)
             payload = base64.urlsafe_b64encode(
-                json.dumps({"docker": self.docker, "container": container, "argv": argv, "marker": marker}, separators=(",", ":")).encode()
+                json.dumps({
+                    "socket": os.fspath(self.worker_socket), "argv": argv, "marker": marker,
+                }, separators=(",", ":")).encode()
             ).decode()
             self.jobs[name] = job
             try:
-                command = f"exec {shlex.quote(self.world_executable)} worker {payload}"
+                command = (
+                    "exec /usr/bin/env -i "
+                    "PATH=/usr/local/bin:/usr/bin:/bin "
+                    f"{shlex.quote(self.worker_executable)} worker {payload}"
+                )
                 self.herdr.call(
                     "pane.send_input", {"pane_id": job.pane_id, "text": command, "keys": ["Enter"]}
                 )
@@ -522,48 +464,6 @@ def invoke_command(world: World, request: object) -> dict:
     }
 
 
-def decode_worker(raw: str) -> dict:
-    if len(raw) > 64 * 1024 or not re.fullmatch(r"[A-Za-z0-9_=-]+", raw):
-        raise SpanError("invalid worker payload")
-    try:
-        document = json.loads(base64.urlsafe_b64decode(raw.encode()))
-    except (ValueError, json.JSONDecodeError) as error:
-        raise SpanError("invalid worker payload") from error
-    if not isinstance(document, dict) or set(document) != {"docker", "container", "argv", "marker"}:
-        raise SpanError("invalid worker payload")
-    docker, container, argv, marker = (document[key] for key in ("docker", "container", "argv", "marker"))
-    if not isinstance(docker, str) or not Path(docker).is_absolute() or not os.access(docker, os.X_OK):
-        raise SpanError("invalid worker Docker path")
-    if not isinstance(container, str) or not re.fullmatch(r"[0-9a-f]{64}", container):
-        raise SpanError("invalid worker container")
-    if not isinstance(argv, list) or not argv or len(argv) > 64 or not all(isinstance(item, str) and "\0" not in item for item in argv):
-        raise SpanError("invalid worker argv")
-    if not isinstance(marker, str) or not re.fullmatch(r"__DEVC2_HERDR_[0-9a-f]{32}_EXIT_", marker):
-        raise SpanError("invalid worker marker")
-    return document
-
-
-def worker(raw: str) -> int:
-    document = decode_worker(raw)
-    command = [
-        document["docker"], "exec", "--interactive", "--tty", "--user", "1000:1000",
-        "--workdir", "/workspace", document["container"], *document["argv"],
-    ]
-    try:
-        print(f"\r\n{start_marker(document['marker'])}", flush=True)
-        environment = os.environ.copy()
-        environment["DOCKER_CLI_HINTS"] = "false"
-        completed = subprocess.run(command, check=False, env=environment)
-        code = completed.returncode if 0 <= completed.returncode <= 255 else 255
-    except (OSError, subprocess.SubprocessError) as error:
-        print(f"herdr-span worker: {error}", file=sys.stderr)
-        code = 125
-    print(f"\r\n{document['marker']}{code}", flush=True)
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    while True:
-        time.sleep(3600)
-
-
 def serve() -> int:
     try:
         descriptor = int(os.environ["DEVC2_SPAN_SOCKET_FD"])
@@ -614,8 +514,6 @@ def serve() -> int:
 
 
 def main() -> int:
-    if len(sys.argv) == 3 and sys.argv[1] == "worker":
-        return worker(sys.argv[2])
     if sys.argv[1:]:
         print("herdr-span: World accepts no devc2 arguments", file=sys.stderr)
         return 2
@@ -625,6 +523,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (OSError, SpanError, subprocess.SubprocessError) as error:
+    except (OSError, SpanError) as error:
         print(f"herdr-span: {error}", file=sys.stderr)
         raise SystemExit(1)

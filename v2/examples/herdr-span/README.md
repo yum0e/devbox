@@ -5,39 +5,27 @@ giving the Island Herdr's host socket or Docker. Every spawned command still
 runs inside the same Island.
 
 ```text
-                         HOST
+                            HOST
 
- ┌─ Herdr session ────────────────────────────────────────────┐
- │                                                           │
- │  pane: devc2                       pane: reviewer           │
- │  ┌──────────────────────┐          ┌──────────────────────┐ │
- │  │ Island shell         │  split   │ trusted worker       │ │
- │  │                      │ ───────► │                      │ │
- │  │ $ herdr spawn ... ───┼──bytes──►│ docker exec          │ │
- │  └──────────┬───────────┘          └──────────┬───────────┘ │
- │             │                                 │             │
- └─────────────┼─────────────────────────────────┼─────────────┘
-               │                                 │
- ══════════════╪══════════ ISLAND BOUNDARY ══════╪══════════════
-               │                                 │
-       projected `herdr`                 command + argv
-               │                                 │
-       ┌───────▼─────────────────────────────────▼───────┐
-       │                    ISLAND                       │
-       │                                                │
-       │  repo · shell · tact · tests · spawned process │
-       │                                                │
-       │  no Docker socket · no host Herdr socket       │
-       └────────────────────────────────────────────────┘
+ Island ── projected `herdr` ──▶ Herdr World ── pane operations ──▶ Herdr
+                                      │
+                              private worker Link
+                                      │
+                                      ▼
+                                 Docker Agent
+                                      │ fixed backend policy
+                                      ▼
+                         docker exec ──▶ same Island
 
- grant: Herdr World + generic command projection + opaque byte stream
- deny:  host command · host pane ID · Docker option · host socket
+ Herdr World: pane ownership · names · read/send/wait · no Docker knowledge
+ Docker Agent: exact Island selection · fixed user/cwd/TTY · no Herdr authority
+ Island:       no Docker socket · no host Herdr socket · no worker Link
 ```
 
-The pattern is intentionally small: the World performs five fixed operations
-and Herdr remains unaware of Spans or Islands. As in a narrow control-plane
-agent, adding more orchestration later should be a loop over these primitives,
-not a reason to widen the boundary.
+One deterministic executable bundle keeps installation and catalog lookup atomic,
+but runs a composition root, Herdr World, and Docker Agent as separate processes
+with allowlisted environments. The catalog and generic projected command Link
+remain unchanged. Backend complexity stays behind the private worker Link.
 
 ## Install and run
 
@@ -79,7 +67,7 @@ printf 'continue with the tests' | herdr send reviewer
 ```
 
 The projected command never accepts a Herdr pane ID, container ID, cwd, environment, Docker
-option, or host command. The World targets only the pane inherited from the
+option, or host command. The Herdr World targets only the pane inherited from the
 host launch, remembers only panes it created, and rechecks each pane's terminal
 identity before using it. The host shell `exec`s the trusted worker, so there is
 no host prompt underneath it; a completed worker stays parked for inspection.
@@ -88,11 +76,13 @@ World teardown makes bounded best-effort attempts to close its panes.
 expose the host bootstrap command, executable path, container identity, payload,
 or completion marker.
 
-The Herdr installation and catalog contribute only the World executable path.
+The Herdr installation and catalog contribute only one immutable bundle path.
 The host resolves the granted name and supplies one generic Link shim, which
 derives `herdr` from `argv[0]` and transports only
 bounded argv, optional stdin, stdout, stderr, and an exit status. The protocol
 has no arbitrary executable, shell string, cwd, environment, PTY, or signal API.
 
-This first version intentionally has no Island discovery, peer communication,
-raw terminal keys, arbitrary Herdr methods, persistence, or recovery protocol.
+This proof intentionally has no Island discovery, peer communication, window
+resize, arbitrary signals, arbitrary Herdr methods, persistence, or recovery
+protocol. Separate same-UID host processes and their private Unix socket are
+authority minimization, not a security boundary against hostile host processes.

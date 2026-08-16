@@ -5,12 +5,15 @@ import importlib.machinery
 import importlib.util
 import json
 import shlex
+import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -19,6 +22,9 @@ ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = ROOT / "examples" / "herdr-span"
 PROVIDER_PATH = EXAMPLE / "herdr-span"
 REGISTER = EXAMPLE / "register.py"
+AGENT_PATH = EXAMPLE / "docker_agent.py"
+WORKER_PATH = EXAMPLE / "worker_link.py"
+BUNDLE_PATH = EXAMPLE / "bundle.py"
 
 
 def load(path: Path, name: str):
@@ -31,6 +37,10 @@ def load(path: Path, name: str):
 
 
 H = load(PROVIDER_PATH, "herdr_span_example")
+D = load(AGENT_PATH, "herdr_docker_agent")
+W = load(WORKER_PATH, "herdr_worker_link")
+sys.modules.update({"herdr_world": H, "docker_agent": D, "worker_link": W})
+B = load(BUNDLE_PATH, "herdr_bundle")
 
 
 class FakeHerdr:
@@ -53,16 +63,20 @@ class FakeHerdr:
 
 def provider() -> H.World:
     item = H.World.__new__(H.World)
-    item.island_id = "island-one"
-    item.workspace = Path("/workspace")
     item.anchor = "w1:p1"
     item.herdr = FakeHerdr()
-    item.docker = "/bin/true"
-    item.world_executable = "/trusted/herdr-span"
+    item.worker_executable = "/trusted/herdr-span"
+    item.worker_socket = Path("/private/worker.sock")
     item.jobs = {}
     item.lock = threading.RLock()
     item.stopping = threading.Event()
-    item.island_container = lambda: "a" * 64
+    return item
+
+
+def docker_backend() -> D.DockerIsland:
+    item = D.DockerIsland.__new__(D.DockerIsland)
+    item.workspace = Path("/workspace")
+    item.docker = "/bin/true"
     return item
 
 
@@ -72,11 +86,11 @@ class WorldAuthorityTests(unittest.TestCase):
 
     def test_upstream_validation_is_lazy_retryable_and_nonfatal(self):
         environment = {
-            "DEVC2_ISLAND_ID": "island-one",
-            "DEVC2_WORKSPACE": "/workspace",
             "HERDR_ENV": "1",
             "HERDR_SOCKET_PATH": "/host/herdr.sock",
             "HERDR_PANE_ID": "w1:p1",
+            "DEVC2_HERDR_WORKER": "/trusted/herdr-span",
+            "DEVC2_HERDR_WORKER_SOCKET": "/private/worker.sock",
         }
         responses = [H.SpanError("Herdr is offline"), {"pane": {"pane_id": "w1:p1"}}]
         with mock.patch.dict(H.os.environ, environment, clear=True), \
@@ -101,10 +115,10 @@ class WorldAuthorityTests(unittest.TestCase):
         self.assertEqual(params["pane_id"], "w1:p2")
         self.assertEqual(params["keys"], ["Enter"])
         host_argv = shlex.split(params["text"])
-        self.assertEqual(host_argv[:3], ["exec", "/trusted/herdr-span", "worker"])
-        task = H.decode_worker(host_argv[3])
-        self.assertEqual(task["docker"], "/bin/true")
-        self.assertEqual(task["container"], "a" * 64)
+        self.assertEqual(host_argv[:4], ["exec", "/usr/bin/env", "-i", "PATH=/usr/local/bin:/usr/bin:/bin"])
+        self.assertEqual(host_argv[-3:-1], ["/trusted/herdr-span", "worker"])
+        task = W.decode(host_argv[-1])
+        self.assertEqual(task["socket"], "/private/worker.sock")
         self.assertEqual(task["argv"], argv)
         self.assertRegex(task["marker"], r"^__DEVC2_HERDR_[0-9a-f]{32}_EXIT_$")
         self.assertEqual(item.herdr.calls[2][0], "pane.rename")
@@ -199,7 +213,7 @@ class WorldAuthorityTests(unittest.TestCase):
                 item.handle(request)
 
     def test_container_selection_requires_the_exact_oneoff_island_bind(self):
-        item = provider()
+        item = docker_backend()
         labels = {
             "dev.devbox.generation": "2",
             "dev.devbox.workspace-hash": item.workspace_hash,
@@ -217,9 +231,8 @@ class WorldAuthorityTests(unittest.TestCase):
             subprocess.CompletedProcess([], 0, stdout="short-id\n", stderr=""),
             subprocess.CompletedProcess([], 0, stdout=json.dumps(inspect), stderr=""),
         )
-        del item.island_container
-        with mock.patch.object(H.subprocess, "run", side_effect=responses) as run:
-            self.assertEqual(item.island_container(), "c" * 64)
+        with mock.patch.object(D.subprocess, "run", side_effect=responses) as run:
+            self.assertEqual(item.container(), "c" * 64)
         ps = run.call_args_list[0].args[0]
         self.assertIn("label=com.docker.compose.oneoff=True", ps)
 
@@ -228,11 +241,11 @@ class WorldAuthorityTests(unittest.TestCase):
             subprocess.CompletedProcess([], 0, stdout="short-id\n", stderr=""),
             subprocess.CompletedProcess([], 0, stdout=json.dumps(inspect), stderr=""),
         )
-        with mock.patch.object(H.subprocess, "run", side_effect=responses), self.assertRaisesRegex(H.SpanError, "metadata"):
-            item.island_container()
+        with mock.patch.object(D.subprocess, "run", side_effect=responses), self.assertRaisesRegex(D.AgentError, "granted Island"):
+            item.container()
 
     def test_container_selection_accepts_only_exact_docker_desktop_workspace_encoding(self):
-        item = provider()
+        item = docker_backend()
         labels = {
             "dev.devbox.generation": "2",
             "dev.devbox.workspace-hash": item.workspace_hash,
@@ -253,41 +266,127 @@ class WorldAuthorityTests(unittest.TestCase):
             subprocess.CompletedProcess([], 0, stdout="short-id\n", stderr=""),
             subprocess.CompletedProcess([], 0, stdout=json.dumps(inspect), stderr=""),
         )
-        del item.island_container
-        with mock.patch.object(H.sys, "platform", "darwin"), \
-             mock.patch.object(H.subprocess, "run", side_effect=responses):
-            self.assertEqual(item.island_container(), "d" * 64)
+        with mock.patch.object(D.sys, "platform", "darwin"), \
+             mock.patch.object(D.subprocess, "run", side_effect=responses):
+            self.assertEqual(item.container(), "d" * 64)
 
         inspect[0]["Mounts"][0]["Source"] = "/host_mnt/other"
         responses = (
             subprocess.CompletedProcess([], 0, stdout="short-id\n", stderr=""),
             subprocess.CompletedProcess([], 0, stdout=json.dumps(inspect), stderr=""),
         )
-        with mock.patch.object(H.sys, "platform", "darwin"), \
-             mock.patch.object(H.subprocess, "run", side_effect=responses), \
-             self.assertRaisesRegex(H.SpanError, "metadata"):
-            item.island_container()
+        with mock.patch.object(D.sys, "platform", "darwin"), \
+             mock.patch.object(D.subprocess, "run", side_effect=responses), \
+             self.assertRaisesRegex(D.AgentError, "granted Island"):
+            item.container()
 
-    def test_worker_uses_fixed_docker_options_and_parks(self):
+    def test_worker_protocol_exposes_no_backend_options(self):
         task = {
-            "docker": "/bin/true", "container": "b" * 64,
+            "socket": "/private/worker.sock",
             "argv": ["sh", "-lc", "echo $HOME; $(id)"],
             "marker": "__DEVC2_HERDR_" + "3" * 32 + "_EXIT_",
         }
         raw = base64.urlsafe_b64encode(json.dumps(task).encode()).decode()
-        with mock.patch.dict(H.os.environ, {"REQUIRED_HOST_SETTING": "yes"}, clear=True), \
-             mock.patch.object(H.subprocess, "run", return_value=mock.Mock(returncode=23)) as run, \
-             mock.patch.object(H.signal, "signal"), \
-             mock.patch.object(H.time, "sleep", side_effect=RuntimeError("parked")), \
-             self.assertRaisesRegex(RuntimeError, "parked"):
-            H.worker(raw)
-        run.assert_called_once_with([
+        self.assertEqual(W.decode(raw), task)
+        for field in ("docker", "container", "cwd", "environment", "user", "pty"):
+            altered = {**task, field: "forbidden"}
+            payload = base64.urlsafe_b64encode(json.dumps(altered).encode()).decode()
+            with self.subTest(field=field), self.assertRaises(W.WorkerError):
+                W.decode(payload)
+
+    def test_agent_owns_the_fixed_docker_invocation(self):
+        item = docker_backend()
+        item.container = lambda: "b" * 64
+        self.assertEqual(item.command(["sh", "-lc", "echo ok"]), [
             "/bin/true", "exec", "--interactive", "--tty", "--user", "1000:1000",
-            "--workdir", "/workspace", "b" * 64, "sh", "-lc", "echo $HOME; $(id)",
-        ], check=False, env={"REQUIRED_HOST_SETTING": "yes", "DOCKER_CLI_HINTS": "false"})
+            "--workdir", "/workspace", "b" * 64, "sh", "-lc", "echo ok",
+        ])
+
+    def test_agent_worker_request_is_exact_and_bounded(self):
+        valid = {"argv": ["printf", "ok"]}
+
+        def decode(document):
+            left, right = socket.socketpair()
+            try:
+                payload = json.dumps(document).encode()
+                left.sendall(struct.pack("!I", len(payload)) + payload)
+                return D.request(right)
+            finally:
+                left.close()
+                right.close()
+
+        self.assertEqual(decode(valid), valid)
+        for extra in ("docker", "container", "cwd", "environment", "pane_id"):
+            with self.subTest(extra=extra), self.assertRaises(D.AgentError):
+                decode({**valid, extra: "forbidden"})
+
+    def test_agent_relays_a_real_pty_and_publishes_exit(self):
+        class LocalBackend:
+            def command(self, argv):
+                return argv
+
+        listener = socket.socket()
+        agent = D.Agent(listener, LocalBackend())
+        worker, projection = socket.socketpair()
+        thread = threading.Thread(target=agent.run_worker, args=(worker, {
+            "argv": ["/bin/sh", "-c", "printf pty-proof"],
+        }))
+        thread.start()
+        projection.settimeout(3)
+        output = bytearray()
+        exit_code = None
+        try:
+            while exit_code is None:
+                kind, size = D.FRAME.unpack(D.receive(projection, D.FRAME.size))
+                payload = D.receive(projection, size)
+                if kind == b"O":
+                    output.extend(payload)
+                elif kind == b"E":
+                    exit_code = payload[0]
+        finally:
+            projection.close()
+            worker.close()
+            thread.join(3)
+            listener.close()
+        self.assertFalse(thread.is_alive())
+        self.assertIn(b"pty-proof", output)
+        self.assertEqual(exit_code, 0)
+
+    def test_agent_stops_the_pty_process_when_the_worker_disconnects(self):
+        class LocalBackend:
+            def command(self, argv):
+                return argv
+
+        listener = socket.socket()
+        agent = D.Agent(listener, LocalBackend())
+        worker, projection = socket.socketpair()
+        errors = []
+
+        def relay():
+            try:
+                agent.run_worker(worker, {"argv": ["/bin/sh", "-c", "sleep 30"]})
+            except OSError as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=relay)
+        thread.start()
+        projection.close()
+        thread.join(4)
+        worker.close()
+        listener.close()
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(errors), 1)
 
 
 class InstallerTests(unittest.TestCase):
+    def test_bundle_keeps_world_authorities_disjoint(self):
+        self.assertNotIn("HERDR_SOCKET_PATH", B.AGENT_ENVIRONMENT)
+        self.assertNotIn("HERDR_PANE_ID", B.AGENT_ENVIRONMENT)
+        self.assertNotIn("DEVC2_SPAN_SOCKET_FD", B.AGENT_ENVIRONMENT)
+        self.assertNotIn("DEVC2_WORKSPACE", B.HERDR_ENVIRONMENT)
+        self.assertNotIn("DEVC2_ISLAND_ID", B.HERDR_ENVIRONMENT)
+        self.assertNotIn("DOCKER_HOST", B.HERDR_ENVIRONMENT)
+
     def test_installer_preserves_catalog_and_installs_immutable_generation(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -297,7 +396,7 @@ class InstallerTests(unittest.TestCase):
             catalog.write_text(json.dumps({"spans": {"other": {"provider": "/old/provider", "client": "/old/client"}}}))
             catalog.chmod(0o600)
             completed = subprocess.run(
-                [sys.executable, str(REGISTER), str(catalog), str(root / "spans"), str(PROVIDER_PATH)],
+                [sys.executable, str(REGISTER), str(catalog), str(root / "spans"), str(EXAMPLE)],
                 text=True, capture_output=True, check=True,
             )
             self.assertIn("registered Herdr command Link", completed.stdout)
@@ -307,6 +406,31 @@ class InstallerTests(unittest.TestCase):
             self.assertTrue(world.is_file())
             self.assertEqual(stat.S_IMODE(world.stat().st_mode), 0o555)
             self.assertEqual(set(world.parent.iterdir()), {world})
+            with zipfile.ZipFile(world) as archive:
+                self.assertEqual(set(archive.namelist()), {
+                    "__main__.py", "herdr_world.py", "docker_agent.py", "worker_link.py",
+                })
+                herdr_source = archive.read("herdr_world.py").lower()
+            for backend_word in (b"docker", b"container", b"compose"):
+                self.assertNotIn(backend_word, herdr_source)
+            invoked = subprocess.run([world, "invalid"], text=True, capture_output=True)
+            self.assertEqual(invoked.returncode, 2)
+            self.assertIn("invalid bundle invocation", invoked.stderr)
+
+            repeated = subprocess.run(
+                [sys.executable, str(REGISTER), str(catalog), str(root / "spans"), str(EXAMPLE)],
+                text=True, capture_output=True, check=True,
+            )
+            self.assertIn(str(world.parent), repeated.stdout)
+            self.assertEqual(Path(json.loads(catalog.read_text())["spans"]["herdr"]), world)
+
+            world.chmod(0o755)
+            rejected = subprocess.run(
+                [sys.executable, str(REGISTER), str(catalog), str(root / "spans"), str(EXAMPLE)],
+                text=True, capture_output=True,
+            )
+            self.assertEqual(rejected.returncode, 1)
+            self.assertIn("generation is inconsistent", rejected.stderr)
 
 
 class CommandAffordanceTests(unittest.TestCase):

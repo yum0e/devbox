@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import io
 import json
 import os
 import re
@@ -11,12 +12,19 @@ import shutil
 import stat
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 
 
 NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 MAX_BYTES = 64 * 1024 * 1024
 MAX_CATALOG_BYTES = 64 * 1024
+BUNDLE_FILES = {
+    "__main__.py": "bundle.py",
+    "herdr_world.py": "herdr-span",
+    "docker_agent.py": "docker_agent.py",
+    "worker_link.py": "worker_link.py",
+}
 
 
 def read_file(path: Path) -> bytes:
@@ -40,14 +48,48 @@ def write_file(path: Path, payload: bytes) -> None:
     path.chmod(0o555)
 
 
+def build_bundle(root: Path) -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as archive:
+        for destination, source in BUNDLE_FILES.items():
+            info = zipfile.ZipInfo(destination, date_time=(1980, 1, 1, 0, 0, 0))
+            info.external_attr = 0o644 << 16
+            archive.writestr(info, read_file(root / source))
+    payload = b"#!/usr/bin/env python3\n" + output.getvalue()
+    if len(payload) > MAX_BYTES:
+        raise RuntimeError("Herdr bundle exceeds 64 MiB")
+    return payload
+
+
+def checked_directory(path: Path, label: str) -> None:
+    metadata = path.lstat()
+    if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid()
+            or metadata.st_mode & 0o077):
+        raise RuntimeError(f"{label} must be a current-user-owned private directory: {path}")
+
+
+def checked_generation(generation: Path, world: bytes) -> None:
+    checked_directory(generation, "Herdr generation")
+    if {item.name for item in generation.iterdir()} != {"world"}:
+        raise RuntimeError(f"existing Herdr generation is inconsistent: {generation}")
+    path = generation / "world"
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(descriptor, "rb") as source:
+        metadata = os.fstat(source.fileno())
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o555
+                or source.read(MAX_BYTES + 1) != world):
+            raise RuntimeError(f"existing Herdr generation is inconsistent: {generation}")
+
+
 def install_generation(root: Path, world: bytes) -> Path:
     digest = hashlib.sha256(b"world\0" + world).hexdigest()[:16]
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     root = root.resolve(strict=True)
+    checked_directory(root, "Herdr install root")
     generation = root / digest
     if generation.exists():
-        if (generation / "world").read_bytes() != world:
-            raise RuntimeError(f"existing Herdr generation is inconsistent: {generation}")
+        checked_generation(generation, world)
         return generation
     staging = Path(tempfile.mkdtemp(prefix=".herdr.", dir=root))
     try:
@@ -69,6 +111,7 @@ def install_generation(root: Path, world: bytes) -> Path:
     finally:
         if staging.exists():
             shutil.rmtree(staging)
+    checked_generation(generation, world)
     return generation
 
 
@@ -117,10 +160,10 @@ def write_catalog(path: Path, document: dict) -> None:
 
 def main() -> int:
     if len(sys.argv) != 4:
-        print("usage: register.py CATALOG INSTALL_ROOT WORLD_SOURCE", file=sys.stderr)
+        print("usage: register.py CATALOG INSTALL_ROOT SOURCE_ROOT", file=sys.stderr)
         return 2
-    catalog, install_root, world_source = map(Path, sys.argv[1:])
-    generation = install_generation(install_root, read_file(world_source))
+    catalog, install_root, source_root = map(Path, sys.argv[1:])
+    generation = install_generation(install_root, build_bundle(source_root))
     lock_path = catalog.with_suffix(".lock")
     lock = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0), 0o600)
     with os.fdopen(lock, "a+") as locked:
