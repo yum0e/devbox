@@ -164,13 +164,18 @@ class WorldTests(unittest.TestCase):
             listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             listener.bind(("127.0.0.1", 0))
             listener.listen()
-            provider = P.World(listener, P.AgentFilter(P.FilterConfig(str(upstream.path), allowed, b"selected")))
+            provider = P.World(listener, P.AgentFilter(P.FilterConfig(
+                str(upstream.path), allowed, b"selected", upstream_timeout=0.05,
+            )))
             thread = threading.Thread(target=provider.serve_forever, daemon=True)
             thread.start()
             try:
                 with socket.create_connection(listener.getsockname(), timeout=2) as connection:
                     P.write_packet(connection, bytes([P.SSH2_AGENTC_REQUEST_IDENTITIES]))
                     self.assertEqual(P.parse_identities(P.read_packet(connection)), [(allowed, b"selected")])
+                    # Link idleness is not an upstream-agent operation and must
+                    # not inherit the much shorter upstream request timeout.
+                    time.sleep(0.15)
                     sign = (bytes([P.SSH2_AGENTC_SIGN_REQUEST]) + P.pack_string(allowed)
                             + P.pack_string(b"data") + P.pack_u32(0))
                     P.write_packet(connection, sign)

@@ -270,7 +270,6 @@ class World:
             if not self.slots.acquire(blocking=False):
                 connection.close()
                 continue
-            connection.settimeout(self.agent_filter.config.upstream_timeout)
             thread = threading.Thread(target=self._serve_connection, args=(connection,), daemon=True)
             with self.lock:
                 self.connections.add(connection)
