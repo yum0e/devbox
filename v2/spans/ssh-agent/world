@@ -208,6 +208,34 @@ class AgentFilter:
         return bytes([SSH_AGENT_FAILURE])
 
 
+class ConfiguredAgentFilter:
+    """Resolve host configuration lazily, then retain one selected-key policy."""
+
+    def __init__(self, upstream_socket: str, key_path: Path):
+        self.config = FilterConfig(upstream_socket, b"", b"")
+        self.key_path = key_path
+        self.delegate: AgentFilter | None = None
+        self.lock = threading.Lock()
+
+    def handle(self, request: bytes) -> bytes:
+        with self.lock:
+            if self.delegate is None:
+                try:
+                    blob, comment = read_public_key(self.key_path)
+                except RuntimeError:
+                    LOG.warning("selected SSH public key is unavailable")
+                    return bytes([SSH_AGENT_FAILURE])
+                self.delegate = AgentFilter(FilterConfig(
+                    self.config.upstream_socket,
+                    blob,
+                    comment,
+                    self.config.max_message,
+                    self.config.upstream_timeout,
+                ))
+            delegate = self.delegate
+        return delegate.handle(request)
+
+
 class World:
     def __init__(self, listener: socket.socket, agent_filter: AgentFilter):
         self.listener = listener
@@ -302,24 +330,16 @@ class World:
 def configured_world() -> World:
     try:
         descriptor = int(os.environ["DEVC2_SPAN_SOCKET_FD"])
-        upstream_path = os.environ["SSH_AUTH_SOCK"]
     except (KeyError, ValueError) as error:
         raise RuntimeError("missing SSH Span runtime environment") from error
     try:
-        if not stat.S_ISSOCK(os.stat(upstream_path).st_mode):
-            raise RuntimeError("SSH_AUTH_SOCK is not a Unix socket")
         listener = socket.socket(fileno=descriptor)
         if listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) != 1:
             raise RuntimeError("DEVC2_SPAN_SOCKET_FD is not a listening socket")
     except OSError as error:
         raise RuntimeError("SSH Span socket is unavailable") from error
     key_path = Path.home() / ".config" / "devc2" / "ssh-key.pub"
-    try:
-        blob, comment = read_public_key(key_path)
-    except RuntimeError as error:
-        listener.close()
-        raise RuntimeError(f"selected SSH public key is unavailable: {key_path}") from error
-    agent_filter = AgentFilter(FilterConfig(upstream_path, blob, comment))
+    agent_filter = ConfiguredAgentFilter(os.environ.get("SSH_AUTH_SOCK", ""), key_path)
     return World(listener, agent_filter)
 
 

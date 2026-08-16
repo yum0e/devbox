@@ -268,16 +268,30 @@ class WorldTests(unittest.TestCase):
             provider.shutdown()
             listener.close()
             agent.close()
-            self.assertEqual(provider.agent_filter.config.allowed_key_blob, allowed)
+            self.assertEqual(provider.agent_filter.key_path, config / "ssh-key.pub")
+            self.assertEqual(provider.agent_filter.config.upstream_socket, str(agent.path))
             self.assertEqual(
                 agent.requests,
                 [],
             )
 
-    def test_configured_world_rejects_missing_agent(self):
-        with mock.patch.dict(os.environ, {"DEVC2_SPAN_SOCKET_FD": "3"}, clear=True):
-            with self.assertRaisesRegex(RuntimeError, "missing SSH Span runtime environment"):
-                P.configured_world()
+    def test_configured_world_survives_missing_agent_configuration(self):
+        with tempfile.TemporaryDirectory() as raw:
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            descriptor = os.dup(listener.fileno())
+            with mock.patch.dict(os.environ, {
+                "HOME": raw,
+                "DEVC2_SPAN_SOCKET_FD": str(descriptor),
+            }, clear=True):
+                world = P.configured_world()
+            self.assertEqual(
+                world.agent_filter.handle(bytes([P.SSH2_AGENTC_REQUEST_IDENTITIES])),
+                bytes([P.SSH_AGENT_FAILURE]),
+            )
+            world.shutdown()
+            listener.close()
 
     def test_configured_world_recovers_when_selected_identity_appears_later(self):
         with tempfile.TemporaryDirectory() as raw:

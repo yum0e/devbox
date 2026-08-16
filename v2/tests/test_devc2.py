@@ -195,7 +195,7 @@ class CliTests(unittest.TestCase):
         seen=[]
         def start(repo, runtime_doctor=False, span_names=()):
             self.assertTrue(runtime_doctor)
-            self.assertEqual(span_names, ("openai", "github", "ssh-agent"))
+            self.assertEqual(span_names, ("openai", "github", "ssh-agent", "diagnostics"))
             self.assertTrue((repo / ".git").is_dir())
             seen.append(repo)
             return 0
@@ -218,6 +218,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("namespaces=\"git\"", entrypoint)
         self.assertIn("SSH-agent Span selected identity could not sign", entrypoint)
         self.assertIn("if [[ -S /run/devc2/spans/ssh-agent.sock ]]", entrypoint)
+        self.assertIn("report_span_diagnostics", entrypoint)
         self.assertIn("git config --global --unset-all core.sshCommand", entrypoint)
         self.assertIn("jj config unset --user signing.key", entrypoint)
         self.assertLess(entrypoint.index("--unset-all core.sshCommand"),entrypoint.index("if [[ -S /run/devc2/spans/ssh-agent.sock ]]"))

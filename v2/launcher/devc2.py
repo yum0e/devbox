@@ -898,7 +898,7 @@ def doctor(runtime=False):
     print("Running disposable end-to-end runtime checks…")
     with tempfile.TemporaryDirectory(prefix='devc2-doctor-repo-') as raw:
         repo=Path(raw); (repo/'.git').mkdir(); project=identity(repo)[1]
-        result=_start_unlocked(repo,runtime_doctor=True,span_names=("openai","github","ssh-agent"))
+        result=_start_unlocked(repo,runtime_doctor=True,span_names=("openai","github","ssh-agent","diagnostics"))
         leftovers=[]
         resource_commands={
             'containers':['docker','container','ls','-aq'],

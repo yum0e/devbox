@@ -6,10 +6,11 @@ import os
 import socket
 import struct
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
-from launcher import span_runtime
+from launcher import devc2, span_runtime
 
 
 V2_ROOT = Path(__file__).parents[1]
@@ -64,6 +65,8 @@ class DiagnosticsWorldTests(unittest.TestCase):
             self.assertEqual(ssh["last_stage"], "World connection")
             self.assertEqual(ssh["last_result"], "failed")
             self.assertEqual(ssh["last_error"], "ConnectionRefusedError")
+            self.assertEqual(ssh["world_status"], "starting")
+            self.assertIsNone(ssh["world_exit"])
             self.assertEqual((root / "state.json").stat().st_mode & 0o777, 0o600)
 
     def test_world_serves_report_and_rejects_extra_authority(self):
@@ -105,6 +108,29 @@ class DiagnosticsWorldTests(unittest.TestCase):
             state.update("ssh-agent", last_stage="stream relay")
             state.finished("ssh-agent", "stream relay", None)
             self.assertEqual(state.links["ssh-agent"]["completed"], 1)
+
+    def test_runtime_records_a_world_that_exits_after_structural_startup(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            delayed = root / "delayed-world"
+            delayed.write_text("#!/bin/sh\nsleep 0.35\nexit 23\n")
+            delayed.chmod(0o755)
+            server_tls, _client_tls = devc2.generate_relay_pki(root / "pki")
+            runtime = span_runtime.SpanRuntime([
+                span_runtime.Span("diagnostics", COMMAND_LINK, WORLD),
+                span_runtime.Span("delayed", COMMAND_LINK, delayed),
+            ], root, "island-one", server_tls)
+            try:
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    delayed_state = runtime.diagnostics.links["delayed"]
+                    if delayed_state["world_status"] == "exited":
+                        break
+                    time.sleep(0.05)
+                self.assertEqual(delayed_state["world_status"], "exited")
+                self.assertEqual(delayed_state["world_exit"], 23)
+            finally:
+                runtime.stop()
 
 
 if __name__ == "__main__":

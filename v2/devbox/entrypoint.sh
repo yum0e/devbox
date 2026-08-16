@@ -4,6 +4,13 @@ set -euo pipefail
 readonly workspace="${TACT_WORKSPACE:-/workspace}"
 mkdir -p "$TACT_HOME"
 
+report_span_diagnostics() {
+  if command -v diagnostics >/dev/null 2>&1; then
+    echo "devc2: launch-scoped diagnostics:" >&2
+    diagnostics report >&2 || true
+  fi
+}
+
 readonly shared_tact_config=/run/devc2-public/tact-config.toml
 if [[ ! -r "$shared_tact_config" ]]; then
   echo "devc2: shared Tact config is unavailable" >&2
@@ -64,10 +71,15 @@ if [[ -S /run/devc2/spans/ssh-agent.sock ]]; then
   signing_key="$signing_dir/signing-key.pub"
   allowed_signers="$signing_dir/allowed-signers"
   mkdir -p -m 700 "$signing_dir"
-  ssh-add -L | sed -n '1p' >"$signing_key"
+  if ! ssh-add -L | sed -n '1p' >"$signing_key"; then
+    echo "devc2: SSH-agent Span identity request failed" >&2
+    report_span_diagnostics
+    exit 1
+  fi
   chmod 0600 "$signing_key"
   if [[ ! -s "$signing_key" ]]; then
     echo "devc2: SSH-agent Span exposed no selected identity" >&2
+    report_span_diagnostics
     exit 1
   fi
   read -r key_type key_blob _comment <"$signing_key"
@@ -78,6 +90,7 @@ if [[ -S /run/devc2/spans/ssh-agent.sock ]]; then
   if ! ssh-keygen -Y sign -f "$signing_key" -n git "$signing_probe" >/dev/null 2>&1; then
     rm -f -- "$signing_probe" "$signing_probe.sig"
     echo "devc2: SSH-agent Span selected identity could not sign" >&2
+    report_span_diagnostics
     exit 1
   fi
   rm -f -- "$signing_probe" "$signing_probe.sig"

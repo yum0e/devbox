@@ -280,7 +280,9 @@ class DiagnosticsState:
         self.sequence = 0
         self.links = {
             name: {
-                "startup": "passed",
+                "startup": "pending",
+                "world_status": "starting",
+                "world_exit": None,
                 "accepted": 0,
                 "active": 0,
                 "completed": 0,
@@ -488,6 +490,8 @@ class SpanRuntime:
         self.relays: list[OpaqueRelay] = []
         self.ports: dict[str, int] = {}
         self.diagnostics = None
+        self.stopping = threading.Event()
+        self.monitors: list[threading.Thread] = []
         try:
             if any(span.name == "diagnostics" for span in spans):
                 self.diagnostics = DiagnosticsState(tls_directory.parent / "diagnostics.json", [span.name for span in spans])
@@ -498,6 +502,19 @@ class SpanRuntime:
                 )
                 self.providers.append(provider)
                 provider.check_started()
+                if self.diagnostics is not None:
+                    self.diagnostics.update(
+                        span.name,
+                        startup="passed",
+                        world_status="running",
+                    )
+                    monitor = threading.Thread(
+                        target=self._monitor_provider,
+                        args=(provider,),
+                        daemon=True,
+                    )
+                    monitor.start()
+                    self.monitors.append(monitor)
                 relay = OpaqueRelay(provider.address, tls_directory, span.name, self.diagnostics)
                 self.relays.append(relay)
                 self.ports[span.name] = relay.port
@@ -505,10 +522,27 @@ class SpanRuntime:
             self.stop()
             raise
 
+    def _monitor_provider(self, provider: Provider) -> None:
+        while not self.stopping.is_set():
+            status = provider.process.poll()
+            if status is not None:
+                if self.diagnostics is not None:
+                    self.diagnostics.update(
+                        provider.span.name,
+                        world_status="exited",
+                        world_exit=status,
+                    )
+                return
+            self.stopping.wait(0.1)
+
     def stop(self) -> None:
+        self.stopping.set()
         for relay in reversed(self.relays):
             relay.stop()
         self.relays.clear()
         for provider in reversed(self.providers):
             provider.stop()
         self.providers.clear()
+        for monitor in self.monitors:
+            monitor.join(timeout=1)
+        self.monitors.clear()

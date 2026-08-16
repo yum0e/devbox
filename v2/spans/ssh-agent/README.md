@@ -12,8 +12,9 @@ opaque-stream Link projects it as `/run/devc2/spans/ssh-agent.sock`, and the
 Island points `SSH_AUTH_SOCK` there directly. No command, SSH-specific client,
 second agent proxy, or adapter runs inside the Island.
 
-The World validates its socket and selected public-key configuration before it
-starts serving. Host-agent availability is evaluated on every request: a
-missing or temporarily unavailable identity returns a normal SSH-agent failure
-but does not kill the World, so a later request can recover without restarting
-the Island.
+Only the inherited Link listener is validated during startup. The selected
+public key is loaded on the first request and then fixed for that World process;
+host-agent availability is evaluated on every request. Missing configuration or
+a temporarily unavailable identity returns a normal SSH-agent failure but does
+not kill the World, so a later request can recover without restarting the
+Island.
