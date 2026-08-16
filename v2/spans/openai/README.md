@@ -20,7 +20,3 @@ the exact host, methods, Codex path prefix, and required placeholder headers.
 
 Subscription renewal is deliberately host-only. The World rejects a managed
 access token expiring within one hour; refresh tokens never cross the Link.
-
-The non-executable `provider` and `client` files are inert compatibility
-tombstones for the immediately previous updater. The current resolver ignores
-them, and neither is executed or projected into an Island.

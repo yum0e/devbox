@@ -87,17 +87,9 @@ def read_catalog(path: Path) -> dict:
     document = json.loads(payload)
     if not isinstance(document, dict) or set(document) != {"spans"} or not isinstance(document["spans"], dict):
         raise RuntimeError("Span catalog must contain only a spans object")
-    for name, entry in document["spans"].items():
+    for name in document["spans"]:
         if not isinstance(name, str) or not NAME.fullmatch(name):
             raise RuntimeError("Span catalog contains an invalid name")
-        if isinstance(entry, str):
-            if not Path(entry).is_absolute():
-                raise RuntimeError("Span catalog contains an invalid World path")
-            continue
-        if not isinstance(entry, dict) or set(entry) != {"provider", "client"}:
-            raise RuntimeError("Span catalog contains an invalid entry")
-        if not all(isinstance(entry[field], str) and Path(entry[field]).is_absolute() for field in ("provider", "client")):
-            raise RuntimeError("Span catalog contains an invalid path")
     return document
 
 

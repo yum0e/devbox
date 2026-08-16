@@ -163,12 +163,10 @@ class CliTests(unittest.TestCase):
     def test_herdr_is_not_bundled_and_shell_is_the_default_environment(self):
         dockerfile = (PATH.parents[1] / "Dockerfile").read_text()
         entrypoint = (PATH.parents[1] / "devbox" / "entrypoint.sh").read_text()
-        legacy_marker = (PATH.parents[1] / "devbox" / "herdr-wrapper.py").read_text()
         self.assertNotIn("HERDR_VERSION", dockerfile)
         self.assertNotIn("herdr-linux-", dockerfile)
         self.assertNotIn("herdr-wrapper", dockerfile)
-        self.assertIn("Legacy release marker", legacy_marker)
-        self.assertIn("explicitly grant a Herdr Span", legacy_marker)
+        self.assertFalse((PATH.parents[1] / "devbox" / "herdr-wrapper.py").exists())
         self.assertTrue(entrypoint.rstrip().endswith('exec /bin/zsh'))
         runtime_path=dockerfile.split("ENV HOME=",1)[1]
         self.assertIn(":/bin:/run/devc2/bin:/home/devbox/.local/bin",runtime_path)

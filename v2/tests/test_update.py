@@ -24,32 +24,24 @@ class UpdateTests(unittest.TestCase):
     def runtime(self,root):
         D.STATE=root/"state"; D.INSTALL_LOCK=D.STATE/"install.lock"; D.UPDATE_LOCK=D.STATE/"update.lock"; D.INSTALL_STATE=D.STATE/"installation.json"
 
-    def test_current_tree_satisfies_previous_updater_asset_contract(self):
-        legacy_required=(
-            "Dockerfile", "compose.yaml", "devbox/entrypoint.sh",
-            "devbox/tact-wrapper.sh", "devbox/herdr-wrapper.py",
-            "launcher/devc2.py", "launcher/dispatcher.py",
-            "credential_proxy/ssh_agent_proxy.py",
+    def test_current_tree_satisfies_bridge_updater_asset_contract(self):
+        bridge_required=(
+            "Dockerfile", "compose.yaml", "devbox/entrypoint.sh", "devbox/tact-wrapper.sh",
+            "launcher/devc2.py", "launcher/span_runtime.py", "launcher/span_supervisor.py",
+            "launcher/dispatcher.py", "launcher/command_projection.py",
+            "launcher/scoped_exec_projection.py", "credential_proxy/span_bridge.py",
+            "credential_proxy/stream_relay.py", "spans/openai/world", "spans/github/world",
+            "spans/ssh-agent/world", "spans/diagnostics/world",
         )
-        for relative in legacy_required:
+        for relative in bridge_required:
             self.assertTrue((ROOT/relative).is_file(),relative)
         for relative in (
+            "devbox/herdr-wrapper.py", "credential_proxy/ssh_agent_proxy.py",
             "spans/openai/provider", "spans/openai/client",
             "spans/github/provider", "spans/github/client",
             "spans/ssh-agent/provider", "spans/ssh-agent/client",
         ):
-            self.assertTrue((ROOT/relative).is_file(), relative)
-            self.assertEqual(stat.S_IMODE((ROOT/relative).stat().st_mode), 0o644, relative)
-        self.assertNotIn("herdr-wrapper.py",(ROOT/"Dockerfile").read_text())
-        launcher=(ROOT/"launcher"/"devc2.py").read_text()
-        packager=(ROOT/"package-release.py").read_text()
-        for legacy in (
-            '"devbox/herdr-wrapper.py"', '"spans/github/provider"',
-            '"spans/github/client"', '"spans/ssh-agent/provider"',
-            '"spans/ssh-agent/client"',
-        ):
-            self.assertNotIn(legacy,launcher)
-        self.assertNotIn('"devbox/herdr-wrapper.py"',packager)
+            self.assertFalse((ROOT/relative).exists(), relative)
 
     def test_versioned_install_and_rollback_preserve_configuration(self):
         with tempfile.TemporaryDirectory() as td:

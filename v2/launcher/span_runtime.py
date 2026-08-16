@@ -47,7 +47,7 @@ def _inside(path: Path, root: Path | None) -> bool:
     return root is not None and (path==root or root in path.parents)
 
 
-def _snapshot_executable(raw: object, label: str, target: Path, maximum: int, forbidden_root: Path | None, require_executable: bool = True) -> Path:
+def _snapshot_executable(raw: object, label: str, target: Path, maximum: int, forbidden_root: Path | None) -> Path:
     if not isinstance(raw, str) or not Path(raw).is_absolute():
         raise RuntimeError(f"Span {label} must be an absolute path")
     descriptor=None
@@ -66,7 +66,7 @@ def _snapshot_executable(raw: object, label: str, target: Path, maximum: int, fo
             raise RuntimeError(f"Span {label} must not have hard links")
         if metadata.st_uid not in {0,os.getuid()} or metadata.st_mode & 0o022:
             raise RuntimeError(f"Span {label} must be owned by root/current user and not group/world-writable")
-        if require_executable and not metadata.st_mode & 0o111:
+        if not metadata.st_mode & 0o111:
             raise RuntimeError(f"Span {label} is not executable")
         output=os.open(target,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o500)
         with os.fdopen(descriptor,"rb") as source,os.fdopen(output,"wb") as destination:
@@ -117,20 +117,15 @@ def load_catalog(path: Path, names: tuple[str, ...], forbidden_root: Path, clien
             raise RuntimeError(f"Span {name!r} is unavailable")
         if isinstance(entry,tuple):
             world,link=entry
-            # The immediately previous updater normalizes unknown new assets to
-            # 0444. Built-ins are part of devc2's immutable validated tree, so
-            # snapshot them read-only and restore execute permission only on the
-            # per-launch copies. Catalog-supplied executables remain strict.
-            provider=_snapshot_executable(str(world),f"{name!r} World",provider_destination/name,MAX_PROVIDER_BYTES,forbidden_root,False)
-            client=None if link is None else _snapshot_executable(str(link),f"{name!r} scoped-exec Link",client_destination/name,MAX_CLIENT_BYTES,None,False)
+            provider=_snapshot_executable(str(world),f"{name!r} World",provider_destination/name,MAX_PROVIDER_BYTES,forbidden_root)
+            client=None if link is None else _snapshot_executable(str(link),f"{name!r} scoped-exec Link",client_destination/name,MAX_CLIENT_BYTES,None)
         elif isinstance(entry,str):
             if command_projection is None:
                 raise RuntimeError(f"Span {name!r} cannot be projected")
             provider=_snapshot_executable(entry,f"{name!r} World",provider_destination/name,MAX_PROVIDER_BYTES,forbidden_root)
             client=_snapshot_executable(str(command_projection),f"{name!r} command projection",client_destination/name,MAX_CLIENT_BYTES,None)
         else:
-            provider=_snapshot_executable(entry["provider"],f"{name!r} provider",provider_destination/name,MAX_PROVIDER_BYTES,forbidden_root)
-            client=_snapshot_executable(entry["client"],f"{name!r} client",client_destination/name,MAX_CLIENT_BYTES,forbidden_root)
+            raise RuntimeError(f"Span {name!r} has an invalid World path")
         result.append(Span(name,client,provider))
     client_destination.chmod(0o555)
     return result
@@ -166,17 +161,9 @@ def _read_catalog(path: Path, forbidden_root: Path) -> dict:
     entries = document["spans"]
     if len(entries) > 64:
         raise RuntimeError("Span catalog contains too many entries")
-    for catalog_name,entry in entries.items():
+    for catalog_name in entries:
         if not isinstance(catalog_name,str) or not valid_name(catalog_name):
             raise RuntimeError("Span catalog contains an invalid name")
-        if isinstance(entry,str):
-            if not Path(entry).is_absolute():
-                raise RuntimeError(f"Span {catalog_name!r} has an invalid World path")
-            continue
-        if not isinstance(entry,dict) or set(entry)!={"provider","client"}:
-            raise RuntimeError(f"Span {catalog_name!r} has an invalid catalog entry")
-        if not all(isinstance(entry[field],str) for field in ("provider","client")):
-            raise RuntimeError(f"Span {catalog_name!r} has an invalid catalog path")
     return entries
 
 

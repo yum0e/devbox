@@ -90,12 +90,12 @@ shell startup files or retaining authentication state.
 
 ## Span contract
 
-Installing a provider is not a grant. `devc2` launches no provider or Span
+Installing a World is not a grant. `devc2` launches no World or Span
 transport unless its name appears in `--span`.
 An Island may grant at most 16 Spans; the transport rejects excess concurrent
 connections instead of creating unbounded threads.
 
-The three first-party Spans are immutable release assets outside the Island
+First-party Spans are immutable release assets outside the Island
 image and cannot be shadowed by configuration. Additional Spans are made
 available in the host-owned catalog at
 `~/.config/devc2/spans.json` (or `$XDG_CONFIG_HOME/devc2/spans.json`):
@@ -116,14 +116,13 @@ a root/current-user-owned executable that is not group/world-writable or
 hard-linked. `devc2` snapshots its exact bytes without running it and projects
 its own generic shim read-only as `/run/devc2/bin/<name>`. The World supplies no
 client artifact. The host resolves the granted name to this World and supplies
-the generic Link shim. External legacy exact `provider`/`client` entries remain
-temporarily accepted for third-party migration; built-in Spans are Worlds only.
-First-party OpenAI
-uses a second host-owned generic Link shape: scoped execution with bounded public
+the generic Link shim. A catalog value has no second shape: every Span is one
+World path. First-party OpenAI uses a second host-owned generic Link shape:
+scoped execution with bounded public
 bootstrap material and declared CONNECT routes. The OpenAI World supplies no
 Island executable.
 
-The World (or a legacy provider) is executed directly with no devc2-defined arguments.
+The World is executed directly with no devc2-defined arguments.
 `DEVC2_SPAN_SOCKET_FD` names an inherited listening socket.
 `DEVC2_ISLAND_ID` is unique to the launch and `DEVC2_WORKSPACE` is the canonical
 host checkout path. It accepts one connection for each projected stream.
@@ -131,7 +130,7 @@ The launcher and its small bridge copy bytes without interpreting or framing
 them. Tool methods, schemas, authorization, PTYs, process execution, prompts,
 and every other semantic decision belong to the World.
 
-World/provider startup is structural, not a semantic health check: devc2 verifies that
+World startup is structural, not a semantic health check: devc2 verifies that
 the configured executable starts and does not exit immediately, but it does not
 ask whether Herdr, Slack, or another World-specific upstream is ready. Links
 surface those failures normally and Worlds may retry or recover without a new
@@ -141,16 +140,9 @@ On Docker Desktop, the private Unix endpoint cannot cross directly from macOS
 to Linux. The transport therefore uses a per-launch mutually authenticated TLS
 hop. Its keys enter only the protocol-blind bridge sidecar, never the Island.
 The bridge owns the socket directory; Island processes may connect to granted
-endpoints but cannot replace them. The provider process and transport stop when
-the Island exits. Different Islands receive different provider processes,
+endpoints but cannot replace them. The World process and transport stop when
+the Island exits. Different Islands receive different World processes,
 instance IDs, endpoints, and transport credentials.
-
-A deliberately narrow, checkout-only reference implementation lives in
-`examples/probe-span/`; it is not packaged into devc2 or its Island image. It
-reports its scoped launch identity and echoes bounded opaque bytes, but cannot
-execute commands or read arbitrary host files. Use it to validate installation
-versus grant, client projection, transport, and lifecycle before integrating a
-real capability.
 
 `examples/herdr-span/` is the first production-oriented command-Link experiment. When devc2 is
 launched from a host Herdr pane, it can create host-visible panes whose fixed
@@ -159,13 +151,10 @@ command semantics while devc2 projects the same generic executable it would use
 for any command affordance. Its security boundary, manual proof, and
 intentionally omitted features are documented in the example README.
 
-The catalog/no-argument contract replaces the earlier experimental
-`<name>-span describe|serve` prototype. Re-run the probe installer after updating.
 Other command Worlds should install one immutable executable outside the
-workspace and register it in `spans.json`; a legacy provider that requires
-`serve` needs a tiny external wrapper that executes it with that argument. There
-is no automatic PATH migration because availability is now intentionally an
-explicit host configuration decision.
+workspace and register its absolute path in `spans.json`. There is no automatic
+PATH migration because availability is intentionally an explicit host
+configuration decision.
 
 
 ## Safe installation and updates

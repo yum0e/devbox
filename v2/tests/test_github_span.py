@@ -229,14 +229,14 @@ class WorldAuthTests(unittest.TestCase):
 
 
 class FileContractTests(unittest.TestCase):
-    def test_world_is_executable_and_tombstones_are_inert(self):
+    def test_world_is_the_only_executable_asset(self):
         world = EXAMPLE / "world"
         self.assertTrue(world.stat().st_mode & stat.S_IXUSR)
         self.assertLess(world.stat().st_size, 64 * 1024 * 1024)
-        for name in ("provider", "client"):
-            path = EXAMPLE / name
-            self.assertTrue(path.is_file())
-            self.assertFalse(path.stat().st_mode & stat.S_IXUSR)
+        self.assertEqual(
+            {path.name for path in EXAMPLE.iterdir() if path.is_file()},
+            {"README.md", "world"},
+        )
 
 
 if __name__ == "__main__":

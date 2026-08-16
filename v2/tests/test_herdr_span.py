@@ -294,7 +294,7 @@ class InstallerTests(unittest.TestCase):
             config = root / "config"
             config.mkdir()
             catalog = config / "spans.json"
-            catalog.write_text(json.dumps({"spans": {"other": {"provider": "/opt/p", "client": "/opt/c"}}}))
+            catalog.write_text(json.dumps({"spans": {"other": {"provider": "/old/provider", "client": "/old/client"}}}))
             catalog.chmod(0o600)
             completed = subprocess.run(
                 [sys.executable, str(REGISTER), str(catalog), str(root / "spans"), str(PROVIDER_PATH)],

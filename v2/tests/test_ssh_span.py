@@ -361,15 +361,15 @@ class WorldTests(unittest.TestCase):
 
 
 class FileContractTests(unittest.TestCase):
-    def test_world_is_executable_and_tombstones_are_inert(self):
+    def test_world_is_the_only_executable_asset(self):
         world = ROOT / "spans" / "ssh-agent" / "world"
         self.assertTrue(world.stat().st_mode & 0o100)
         self.assertLess(world.stat().st_size, 64 * 1024 * 1024)
         self.assertNotIn("SO_ACCEPTCONN", world.read_text())
-        for name in ("provider", "client"):
-            path = ROOT / "spans" / "ssh-agent" / name
-            self.assertTrue(path.is_file())
-            self.assertFalse(path.stat().st_mode & 0o111)
+        self.assertEqual(
+            {path.name for path in world.parent.iterdir() if path.is_file()},
+            {"README.md", "world"},
+        )
 
 
 if __name__ == "__main__":

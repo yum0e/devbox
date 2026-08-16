@@ -268,10 +268,10 @@ class ScopedExecLinkTests(unittest.TestCase):
         source = PROJECTION_PATH.read_bytes().lower()
         for term in (b"openai", b"chatgpt", b"tact", b"codex"):
             self.assertNotIn(term, source)
-        legacy = PRODUCTION / "client"
-        self.assertTrue(legacy.is_file())
-        self.assertEqual(stat.S_IMODE(legacy.stat().st_mode), 0o644)
-        self.assertIn("Never projected", legacy.read_text())
+        self.assertEqual(
+            {path.name for path in PRODUCTION.iterdir() if path.is_file()},
+            {"README.md", "world"},
+        )
 
     def test_run_materializes_manifest_for_exact_child_and_removes_it(self):
         seen = {}

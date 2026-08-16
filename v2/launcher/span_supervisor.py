@@ -69,7 +69,7 @@ def main(argv: list[str] | None = None) -> int:
             stop_group(provider)
             return 0
         # This is deliberately structural: the child exec succeeded and did not
-        # exit immediately. Semantic readiness belongs to the Span client/provider.
+        # exit immediately. Semantic readiness belongs to the World and its Link.
         os.write(args.started_fd, b"1")
         os.close(args.started_fd)
         while not stopping:

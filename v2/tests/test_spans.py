@@ -33,16 +33,16 @@ class SpanCatalogTests(unittest.TestCase):
         snapshot=Path(tempfile.mkdtemp(prefix="span-snapshot-"))
         self.addCleanup(shutil.rmtree,snapshot,True)
         forbidden=workspace or catalog.parent/"unrelated-workspace"
-        return span_runtime.load_catalog(catalog,names,forbidden,snapshot/"clients",snapshot/"providers")
+        return span_runtime.load_catalog(
+            catalog,names,forbidden,snapshot/"clients",snapshot/"providers",
+            command_projection=COMMAND_PROJECTION,
+        )
 
-    def files(self, root: Path) -> tuple[Path, Path]:
-        client = root / "client"
-        client.write_text("#!/bin/sh\nexit 0\n")
-        client.chmod(0o755)
-        provider = root / "provider"
-        provider.write_text("#!/bin/sh\nexit 0\n")
-        provider.chmod(0o755)
-        return provider, client
+    def world(self, root: Path) -> Path:
+        world = root / "world"
+        world.write_text("#!/bin/sh\nexit 0\n")
+        world.chmod(0o755)
+        return world
 
     def catalog(self, root: Path, entries: dict, mode: int = 0o600) -> Path:
         path=root/"spans.json"
@@ -50,22 +50,21 @@ class SpanCatalogTests(unittest.TestCase):
         path.chmod(mode)
         return path
 
-    def test_catalog_resolves_exact_paths_without_executing_provider(self):
+    def test_catalog_resolves_exact_world_without_executing_it(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            provider, client = self.files(root)
-            sentinel=root/"provider-ran"
-            provider.write_text(f"#!/bin/sh\nprintf ran >{sentinel}\n")
-            catalog=self.catalog(root,{"echo":{"provider":str(provider),"client":str(client)}})
+            world = self.world(root)
+            sentinel=root/"world-ran"
+            world.write_text(f"#!/bin/sh\nprintf ran >{sentinel}\n")
+            catalog=self.catalog(root,{"echo":str(world)})
             span = self.load(catalog,("echo",))[0]
             self.assertEqual(span.name,"echo")
-            self.assertEqual(span.client.read_bytes(),client.read_bytes())
-            self.assertEqual(span.provider.read_bytes(),provider.read_bytes())
+            self.assertEqual(span.client.read_bytes(),COMMAND_PROJECTION.read_bytes())
+            self.assertEqual(span.provider.read_bytes(),world.read_bytes())
             self.assertFalse(sentinel.exists())
-            snapshotted_provider=span.provider.read_bytes(); snapshotted_client=span.client.read_bytes()
-            provider.write_text("#!/bin/sh\nexit 99\n"); client.write_text("changed")
-            self.assertEqual(span.provider.read_bytes(),snapshotted_provider)
-            self.assertEqual(span.client.read_bytes(),snapshotted_client)
+            snapshotted_world=span.provider.read_bytes()
+            world.write_text("#!/bin/sh\nexit 99\n")
+            self.assertEqual(span.provider.read_bytes(),snapshotted_world)
             self.assertEqual(stat.S_IMODE(span.client.stat().st_mode),0o555)
             self.assertEqual(stat.S_IMODE(span.client.parent.stat().st_mode),0o555)
 
@@ -75,33 +74,32 @@ class SpanCatalogTests(unittest.TestCase):
 
     def test_catalog_is_exact_and_host_owned(self):
         with tempfile.TemporaryDirectory() as raw:
-            root=Path(raw); provider,client=self.files(root)
-            entry={"provider":str(provider),"client":str(client)}
+            root=Path(raw); world=self.world(root)
             catalog=root/"spans.json"
-            catalog.write_text(json.dumps({"spans":{"echo":entry},"version":1}))
+            catalog.write_text(json.dumps({"spans":{"echo":str(world)},"version":1}))
             catalog.chmod(0o600)
             with self.assertRaisesRegex(RuntimeError,"only a spans object"):
                 self.load(catalog,("echo",))
-            catalog=self.catalog(root,{"echo":{**entry,"methods":["spawn"]}})
-            with self.assertRaisesRegex(RuntimeError,"invalid catalog entry"):
+            catalog=self.catalog(root,{"echo":{"world":str(world)}})
+            with self.assertRaisesRegex(RuntimeError,"invalid World path"):
                 self.load(catalog,("echo",))
             catalog.chmod(0o622)
             with self.assertRaisesRegex(RuntimeError,"not group/world-writable"):
                 self.load(catalog,("echo",))
-            catalog.unlink(); os.symlink(client,catalog)
+            catalog.unlink(); os.symlink(world,catalog)
             with self.assertRaisesRegex(RuntimeError,"unreadable"):
                 self.load(catalog,("echo",))
 
     def test_missing_catalog_entry_or_relative_path_is_rejected(self):
         with tempfile.TemporaryDirectory() as raw:
-            root=Path(raw); provider,client=self.files(root)
-            catalog=self.catalog(root,{"echo":{"provider":str(provider),"client":"relative"}})
-            with self.assertRaisesRegex(RuntimeError,"client must be an absolute path"):
+            root=Path(raw); world=self.world(root)
+            catalog=self.catalog(root,{"echo":"relative"})
+            with self.assertRaisesRegex(RuntimeError,"World must be an absolute path"):
                 self.load(catalog,("echo",))
+            catalog=self.catalog(root,{"echo":str(world)})
             with self.assertRaisesRegex(RuntimeError,"unavailable"):
                 self.load(catalog,("missing",))
-            client.chmod(0o777)
-            catalog=self.catalog(root,{"echo":{"provider":str(provider),"client":str(client)}})
+            world.chmod(0o777)
             with self.assertRaisesRegex(RuntimeError,"not group/world-writable"):
                 self.load(catalog,("echo",))
 
@@ -109,16 +107,17 @@ class SpanCatalogTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root=Path(raw); workspace=root/"workspace"; outside=root/"outside"
             workspace.mkdir(); outside.mkdir()
-            provider,client=self.files(outside)
-            catalog=self.catalog(workspace,{"echo":{"provider":str(provider),"client":str(client)}})
+            world=self.world(outside)
+            catalog=self.catalog(workspace,{"echo":str(world)})
             with self.assertRaisesRegex(RuntimeError,"catalog must live outside"):
                 self.load(catalog,("echo",),workspace)
-            catalog=self.catalog(outside,{"echo":{"provider":str(workspace/"provider"),"client":str(client)}})
-            (workspace/"provider").write_text("#!/bin/sh\n"); (workspace/"provider").chmod(0o755)
-            with self.assertRaisesRegex(RuntimeError,"provider must live outside"):
+            workspace_world=workspace/"world"
+            workspace_world.write_text("#!/bin/sh\n"); workspace_world.chmod(0o755)
+            catalog=self.catalog(outside,{"echo":str(workspace_world)})
+            with self.assertRaisesRegex(RuntimeError,"World must live outside"):
                 self.load(catalog,("echo",),workspace)
-            catalog=self.catalog(outside,{"echo":{"provider":str(provider),"client":str(client)}})
-            os.link(provider,workspace/"provider-alias")
+            catalog=self.catalog(outside,{"echo":str(world)})
+            os.link(world,workspace/"world-alias")
             with self.assertRaisesRegex(RuntimeError,"must not have hard links"):
                 self.load(catalog,("echo",),workspace)
 
@@ -132,8 +131,8 @@ class SpanCatalogTests(unittest.TestCase):
     def test_builtin_span_needs_no_external_catalog_and_cannot_be_shadowed(self):
         with tempfile.TemporaryDirectory() as raw:
             root=Path(raw); builtin=root/"builtins"/"openai"; builtin.mkdir(parents=True)
-            world=builtin/"world"; world.write_text("#!/bin/sh\nexit 0\n"); world.chmod(0o444)
-            link=root/"scoped-link"; link.write_bytes(SCOPED_EXEC_PROJECTION.read_bytes()); link.chmod(0o444)
+            world=builtin/"world"; world.write_text("#!/bin/sh\nexit 0\n"); world.chmod(0o555)
+            link=root/"scoped-link"; link.write_bytes(SCOPED_EXEC_PROJECTION.read_bytes()); link.chmod(0o555)
             destination=root/"snapshot"; destination.mkdir()
             spans=span_runtime.load_catalog(
                 root/"missing.json",("openai",),root/"workspace",destination/"clients",destination/"worlds",
@@ -146,19 +145,6 @@ class SpanCatalogTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(spans[0].provider.stat().st_mode),0o555)
             self.assertEqual(stat.S_IMODE(spans[0].client.stat().st_mode),0o555)
             self.assertNotIn(b"openai",link.read_bytes().lower())
-
-    def test_builtin_legacy_provider_and_client_are_not_a_span(self):
-        with tempfile.TemporaryDirectory() as raw:
-            root=Path(raw); builtin=root/"builtins"/"echo"; builtin.mkdir(parents=True)
-            for name in ("provider","client"):
-                path=builtin/name; path.write_text("#!/bin/sh\nexit 0\n"); path.chmod(0o755)
-            destination=root/"snapshot"; destination.mkdir()
-            catalog=self.catalog(root,{})
-            with self.assertRaisesRegex(RuntimeError,"unavailable"):
-                span_runtime.load_catalog(
-                    catalog,("echo",),root/"workspace",
-                    destination/"clients",destination/"worlds",root/"builtins",
-                )
 
     def test_actual_scoped_exec_worlds_share_one_generic_link(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -212,8 +198,19 @@ class SpanCatalogTests(unittest.TestCase):
             root=Path(raw); world=root/"world"
             world.write_text("#!/bin/sh\n"); world.chmod(0o755)
             catalog=self.catalog(root,{"x":{"world":str(world)}})
-            with self.assertRaisesRegex(RuntimeError,"invalid catalog entry"):
+            with self.assertRaisesRegex(RuntimeError,"invalid World path"):
                 self.load(catalog,("x",))
+
+    def test_ungranted_stale_entry_has_no_authority(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root=Path(raw); world=self.world(root)
+            catalog=self.catalog(root,{
+                "echo":str(world),
+                "stale":{"provider":"/old/provider","client":"/old/client"},
+            })
+            self.assertEqual(self.load(catalog,("echo",))[0].name,"echo")
+            with self.assertRaisesRegex(RuntimeError,"invalid World path"):
+                self.load(catalog,("stale",))
 
 
 class CommandProjectionTests(unittest.TestCase):
