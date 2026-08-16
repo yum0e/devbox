@@ -56,20 +56,28 @@ fi
 git config --global --unset-all core.sshCommand >/dev/null 2>&1 || true
 git config --global --unset-all gpg.format >/dev/null 2>&1 || true
 git config --global --unset-all gpg.ssh.allowedSignersFile >/dev/null 2>&1 || true
+git config --global --unset-all gpg.ssh.program >/dev/null 2>&1 || true
 git config --global --unset-all user.signingkey >/dev/null 2>&1 || true
 git config --global --unset-all commit.gpgsign >/dev/null 2>&1 || true
 jj config unset --user signing.behavior >/dev/null 2>&1 || true
 jj config unset --user signing.backend >/dev/null 2>&1 || true
 jj config unset --user signing.key >/dev/null 2>&1 || true
-rm -f -- "$HOME/.config/devc2/signing-key.pub" "$HOME/.config/devc2/allowed-signers"
+jj config unset --user signing.backends.ssh.program >/dev/null 2>&1 || true
+jj config unset --user signing.backends.ssh.allowed-signers >/dev/null 2>&1 || true
+rm -f -- \
+  "$HOME/.config/devc2/signing-key.pub" \
+  "$HOME/.config/devc2/allowed-signers" \
+  "$HOME/.config/devc2/ssh-keygen-with-agent"
 
 # The SSH World is already a selected-key-only agent. The generic stream Link
-# projects it directly; no command, credential file, or adapter is needed here.
+# projects it directly. Git and Jujutsu need one narrow ssh-keygen launcher
+# because agent runtimes may intentionally remove SSH_AUTH_SOCK from children.
 if [[ -S /run/devc2/spans/ssh-agent.sock ]]; then
   export SSH_AUTH_SOCK=/run/devc2/spans/ssh-agent.sock
   signing_dir="$HOME/.config/devc2"
   signing_key="$signing_dir/signing-key.pub"
   allowed_signers="$signing_dir/allowed-signers"
+  signing_program="$signing_dir/ssh-keygen-with-agent"
   mkdir -p -m 700 "$signing_dir"
   if ! ssh-add -L | sed -n '1p' >"$signing_key"; then
     echo "devc2: SSH-agent Span identity request failed" >&2
@@ -85,6 +93,13 @@ if [[ -S /run/devc2/spans/ssh-agent.sock ]]; then
   read -r key_type key_blob _comment <"$signing_key"
   printf '* namespaces="git" %s %s\n' "$key_type" "$key_blob" >"$allowed_signers"
   chmod 0600 "$allowed_signers"
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'SSH_AUTH_SOCK=/run/devc2/spans/ssh-agent.sock' \
+    'export SSH_AUTH_SOCK' \
+    'exec /usr/bin/ssh-keygen "$@"' >"$signing_program"
+  chmod 0500 "$signing_program"
   signing_probe="$(mktemp /tmp/devc2-signing.XXXXXX)"
   printf 'devc2 signing readiness' >"$signing_probe"
   if ! ssh-keygen -Y sign -f "$signing_key" -n git "$signing_probe" >/dev/null 2>&1; then
@@ -97,11 +112,14 @@ if [[ -S /run/devc2/spans/ssh-agent.sock ]]; then
   git config --global core.sshCommand "ssh -i $signing_key -o IdentitiesOnly=yes -o IdentityAgent=$SSH_AUTH_SOCK"
   git config --global gpg.format ssh
   git config --global gpg.ssh.allowedSignersFile "$allowed_signers"
+  git config --global gpg.ssh.program "$signing_program"
   git config --global user.signingkey "$signing_key"
   git config --global commit.gpgsign true
   jj config set --user signing.behavior own
   jj config set --user signing.backend ssh
   jj config set --user signing.key "$signing_key"
+  jj config set --user signing.backends.ssh.program "$signing_program"
+  jj config set --user signing.backends.ssh.allowed-signers "$allowed_signers"
 else
   unset SSH_AUTH_SOCK
 fi
@@ -140,10 +158,15 @@ if [[ "${DEVC2_RUNTIME_DOCTOR:-}" == "1" ]]; then
     git -C "$doctor_repo" init -q
     printf 'devc2 runtime doctor\n' >"$doctor_repo/README.md"
     git -C "$doctor_repo" add README.md
-    git -C "$doctor_repo" -c user.name=devc2 -c user.email=devc2@invalid commit -q -S -m doctor
+    env -u SSH_AUTH_SOCK git -C "$doctor_repo" -c user.name=devc2 -c user.email=devc2@invalid commit -q -S -m doctor
     git -C "$doctor_repo" verify-commit HEAD >/dev/null
     rm -rf -- "$doctor_repo"
-    echo "✓ SSH-agent Span: signed commit verified"
+    doctor_jj="$(mktemp -d /tmp/devc2-doctor-jj.XXXXXX)"
+    jj git init --colocate "$doctor_jj" >/dev/null
+    printf 'devc2 runtime doctor\n' >"$doctor_jj/README.md"
+    env -u SSH_AUTH_SOCK jj -R "$doctor_jj" sign -r @ >/dev/null
+    rm -rf -- "$doctor_jj"
+    echo "✓ SSH-agent Span: Git and Jujutsu signing verified without inherited agent state"
   fi
   if command -v github >/dev/null 2>&1; then
     github run -- gh api user --jq .login >/dev/null
