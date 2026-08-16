@@ -158,6 +158,16 @@ class FilterConfig:
 class AgentFilter:
     def __init__(self, config: FilterConfig):
         self.config = config
+        self.reported: set[str] = set()
+        self.report_lock = threading.Lock()
+
+    def warn_once(self, key: str, message: str, error: Exception | None = None) -> None:
+        with self.report_lock:
+            if key in self.reported:
+                return
+            self.reported.add(key)
+        suffix = f" ({type(error).__name__})" if error is not None else ""
+        LOG.warning("%s%s", message, suffix)
 
     def _round_trip(self, request: bytes) -> bytes:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as upstream:
@@ -181,8 +191,8 @@ class AgentFilter:
         if request == bytes([SSH2_AGENTC_REQUEST_IDENTITIES]):
             try:
                 match = self.selected_identity()
-            except (OSError, ProtocolError):
-                LOG.warning("upstream identities request failed", exc_info=True)
+            except (OSError, ProtocolError) as error:
+                self.warn_once("identities", "upstream identities request failed", error)
                 return bytes([SSH_AGENT_FAILURE])
             if match is None:
                 return bytes([SSH2_AGENT_IDENTITIES_ANSWER]) + pack_u32(0)
@@ -195,12 +205,12 @@ class AgentFilter:
             except ProtocolError:
                 return bytes([SSH_AGENT_FAILURE])
             if key != self.config.allowed_key_blob:
-                LOG.warning("rejected SSH sign request for a non-selected key")
+                self.warn_once("wrong-key", "rejected SSH sign request for a non-selected key")
                 return bytes([SSH_AGENT_FAILURE])
             try:
                 response = self._round_trip(request)
-            except (OSError, ProtocolError):
-                LOG.warning("upstream sign request failed", exc_info=True)
+            except (OSError, ProtocolError) as error:
+                self.warn_once("sign", "upstream sign request failed", error)
                 return bytes([SSH_AGENT_FAILURE])
             if not response or response[0] not in (SSH2_AGENT_SIGN_RESPONSE, SSH_AGENT_FAILURE):
                 return bytes([SSH_AGENT_FAILURE])

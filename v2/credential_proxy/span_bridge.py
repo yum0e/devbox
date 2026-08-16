@@ -30,6 +30,8 @@ class Bridge:
         self.slots = slots or threading.BoundedSemaphore(MAX_CONNECTIONS)
         self.connections: set[socket.socket] = set()
         self.connections_lock = threading.Lock()
+        self.reported_failures: set[tuple[str, str]] = set()
+        self.failure_lock = threading.Lock()
         try:
             metadata = self.path.lstat()
         except FileNotFoundError:
@@ -50,6 +52,17 @@ class Bridge:
 
     def start(self) -> None:
         self.thread.start()
+
+    def _report_failure(self, stage: str, error: Exception) -> None:
+        key = stage, type(error).__name__
+        with self.failure_lock:
+            if key in self.reported_failures:
+                return
+            self.reported_failures.add(key)
+        print(
+            f"span-bridge: Span {self.name!r} failed during {stage} ({key[1]})",
+            flush=True,
+        )
 
     def _serve(self) -> None:
         while not self.stopping.is_set():
@@ -91,11 +104,7 @@ class Bridge:
                             duplex_stream(client, remote, self.stopping)
                 except (OSError, ssl.SSLError, RuntimeError) as error:
                     if not self.stopping.is_set():
-                        print(
-                            f"span-bridge: Span {self.name!r} failed during {stage} "
-                            f"({type(error).__name__})",
-                            flush=True,
-                        )
+                        self._report_failure(stage, error)
                     return
         finally:
             with self.connections_lock:

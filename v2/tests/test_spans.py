@@ -467,6 +467,21 @@ class ProviderLifecycleTests(unittest.TestCase):
 
 
 class BridgeConfigTests(unittest.TestCase):
+    def test_repeated_bridge_failure_emits_one_bounded_diagnostic(self):
+        with tempfile.TemporaryDirectory() as raw:
+            bridge = span_bridge.Bridge("ssh-agent", 1, Path(raw), "127.0.0.1", mock.Mock())
+            try:
+                with mock.patch("builtins.print") as output:
+                    for _attempt in range(10):
+                        bridge._report_failure("host connection", ConnectionRefusedError())
+                output.assert_called_once_with(
+                    "span-bridge: Span 'ssh-agent' failed during host connection (ConnectionRefusedError)",
+                    flush=True,
+                )
+            finally:
+                bridge.server.close()
+                bridge.path.unlink(missing_ok=True)
+
     def test_bridge_config_knows_only_names_and_ports(self):
         with tempfile.TemporaryDirectory() as raw:
             path = Path(raw) / "spans.json"

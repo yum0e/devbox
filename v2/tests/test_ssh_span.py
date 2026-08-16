@@ -140,6 +140,20 @@ class FilterTests(unittest.TestCase):
         )
         self.assertEqual(len(self.upstream.requests), before)
 
+    def test_repeated_upstream_failure_emits_one_bounded_diagnostic(self):
+        unavailable = P.AgentFilter(P.FilterConfig(
+            str(Path(self.temp.name) / "missing.sock"), self.allowed, b"selected",
+        ))
+        with self.assertLogs("ssh-agent-span", level="WARNING") as captured:
+            for _attempt in range(10):
+                self.assertEqual(
+                    unavailable.handle(bytes([P.SSH2_AGENTC_REQUEST_IDENTITIES])),
+                    bytes([P.SSH_AGENT_FAILURE]),
+                )
+        self.assertEqual(len(captured.output), 1)
+        self.assertIn("upstream identities request failed (FileNotFoundError)", captured.output[0])
+        self.assertNotIn("Traceback", captured.output[0])
+
 
 class WorldTests(unittest.TestCase):
     def test_world_supports_multiple_packets_on_one_connection_and_stops_cleanly(self):
