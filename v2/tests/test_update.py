@@ -41,6 +41,15 @@ class UpdateTests(unittest.TestCase):
             self.assertTrue((ROOT/relative).is_file(), relative)
             self.assertEqual(stat.S_IMODE((ROOT/relative).stat().st_mode), 0o644, relative)
         self.assertNotIn("herdr-wrapper.py",(ROOT/"Dockerfile").read_text())
+        launcher=(ROOT/"launcher"/"devc2.py").read_text()
+        packager=(ROOT/"package-release.py").read_text()
+        for legacy in (
+            '"devbox/herdr-wrapper.py"', '"spans/github/provider"',
+            '"spans/github/client"', '"spans/ssh-agent/provider"',
+            '"spans/ssh-agent/client"',
+        ):
+            self.assertNotIn(legacy,launcher)
+        self.assertNotIn('"devbox/herdr-wrapper.py"',packager)
 
     def test_versioned_install_and_rollback_preserve_configuration(self):
         with tempfile.TemporaryDirectory() as td:

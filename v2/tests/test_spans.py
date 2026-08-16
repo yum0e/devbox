@@ -147,6 +147,19 @@ class SpanCatalogTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(spans[0].client.stat().st_mode),0o555)
             self.assertNotIn(b"openai",link.read_bytes().lower())
 
+    def test_builtin_legacy_provider_and_client_are_not_a_span(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root=Path(raw); builtin=root/"builtins"/"echo"; builtin.mkdir(parents=True)
+            for name in ("provider","client"):
+                path=builtin/name; path.write_text("#!/bin/sh\nexit 0\n"); path.chmod(0o755)
+            destination=root/"snapshot"; destination.mkdir()
+            catalog=self.catalog(root,{})
+            with self.assertRaisesRegex(RuntimeError,"unavailable"):
+                span_runtime.load_catalog(
+                    catalog,("echo",),root/"workspace",
+                    destination/"clients",destination/"worlds",root/"builtins",
+                )
+
     def test_actual_scoped_exec_worlds_share_one_generic_link(self):
         with tempfile.TemporaryDirectory() as raw:
             root=Path(raw); destination=root/"snapshot"; destination.mkdir()

@@ -20,7 +20,8 @@ AUTH=CONFIG/"auth"
 TACT_CONFIG=CONFIG/"tact"/"config.toml"
 SPAN_CATALOG=CONFIG/"spans.json"
 TACT_CONFIG_DEFAULT="[agent]\nmax_subagents = 8\n"
-AUTH_IMAGE=f"devc2:{VERSION}"
+RUNTIME_IMAGE=f"devc2:{VERSION}"
+AUTH_IMAGE=f"devc2-auth:{VERSION}"
 INSTALL_STATE=STATE/"installation.json"
 INSTALL_LOCK=STATE/"install.lock"
 UPDATE_LOCK=STATE/"update.lock"
@@ -127,7 +128,7 @@ def source_version(source):
     return match.group(1)
 
 def validate_asset_tree(source,strict=False):
-    required=("Dockerfile","compose.yaml","devbox/entrypoint.sh","devbox/tact-wrapper.sh","launcher/devc2.py","launcher/span_runtime.py","launcher/span_supervisor.py","launcher/dispatcher.py","launcher/command_projection.py","launcher/scoped_exec_projection.py","credential_proxy/span_bridge.py","credential_proxy/stream_relay.py","spans/openai/world","spans/github/world","spans/ssh-agent/world","spans/diagnostics/world","spans/github/provider","spans/github/client","spans/ssh-agent/provider","spans/ssh-agent/client")
+    required=("Dockerfile","compose.yaml","devbox/entrypoint.sh","devbox/tact-wrapper.sh","launcher/devc2.py","launcher/span_runtime.py","launcher/span_supervisor.py","launcher/dispatcher.py","launcher/command_projection.py","launcher/scoped_exec_projection.py","credential_proxy/span_bridge.py","credential_proxy/stream_relay.py","spans/openai/world","spans/github/world","spans/ssh-agent/world","spans/diagnostics/world")
     if not source.is_dir() or source.is_symlink(): raise RuntimeError("release asset root must be a directory")
     total=0; count=0; allowed={"Dockerfile","compose.yaml","README.md","install.sh","devbox","credential_proxy","launcher","spans"}
     for path in source.rglob("*"):
@@ -186,14 +187,14 @@ def copy_release_assets(source,destination):
     for path in destination.rglob("*"):
         if path.is_dir(): path.chmod(0o755)
         elif path.is_file(): path.chmod(0o644)
-    for relative in ("launcher/devc2.py","launcher/dispatcher.py","launcher/command_projection.py","launcher/scoped_exec_projection.py","devbox/entrypoint.sh","devbox/tact-wrapper.sh","devbox/herdr-wrapper.py","spans/openai/world","spans/github/world","spans/ssh-agent/world","spans/diagnostics/world"):
+    for relative in ("launcher/devc2.py","launcher/dispatcher.py","launcher/command_projection.py","launcher/scoped_exec_projection.py","devbox/entrypoint.sh","devbox/tact-wrapper.sh","spans/openai/world","spans/github/world","spans/ssh-agent/world","spans/diagnostics/world"):
         (destination/relative).chmod(0o755)
 
 def freeze_asset_tree(destination):
     for path in destination.rglob("*"):
         if path.is_dir(): path.chmod(0o555)
         elif path.is_file(): path.chmod(0o444)
-    for relative in ("launcher/devc2.py","launcher/dispatcher.py","launcher/command_projection.py","launcher/scoped_exec_projection.py","devbox/entrypoint.sh","devbox/tact-wrapper.sh","devbox/herdr-wrapper.py","spans/openai/world","spans/github/world","spans/ssh-agent/world","spans/diagnostics/world"):
+    for relative in ("launcher/devc2.py","launcher/dispatcher.py","launcher/command_projection.py","launcher/scoped_exec_projection.py","devbox/entrypoint.sh","devbox/tact-wrapper.sh","spans/openai/world","spans/github/world","spans/ssh-agent/world","spans/diagnostics/world"):
         (destination/relative).chmod(0o555)
     destination.chmod(0o555)
 
@@ -542,19 +543,19 @@ def read_codex():
         descriptor = os.open(path, flags)
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 1024 * 1024:
-            raise RuntimeError("Codex auth must be a regular file smaller than 1 MiB")
+            raise RuntimeError("ChatGPT auth must be a regular file smaller than 1 MiB")
         with os.fdopen(descriptor, "r", encoding="utf-8") as auth_file:
             doc = json.load(auth_file)
     except RuntimeError:
         raise
     except Exception as e:
-        raise RuntimeError(f"valid ChatGPT Codex login required at {path}; run `devc2 auth`") from e
+        raise RuntimeError(f"valid ChatGPT login required at {path}; run `devc2 auth`") from e
     tokens=doc.get("tokens",doc)
     access=tokens.get("access_token"); account=tokens.get("account_id")
-    if not access or not account: raise RuntimeError(f"ChatGPT Codex login at {path} lacks access_token/account_id")
+    if not access or not account: raise RuntimeError(f"ChatGPT login at {path} lacks access_token/account_id")
     try:
         body=access.split('.')[1]; body+='='*(-len(body)%4); exp=json.loads(base64.urlsafe_b64decode(body))["exp"]
-        if exp < time.time()+3600: raise RuntimeError("ChatGPT access token expires within one hour; run codex login on the host")
+        if exp < time.time()+3600: raise RuntimeError("ChatGPT access token expires within one hour; run `devc2 auth`")
     except RuntimeError: raise
     except Exception as e: raise RuntimeError("ChatGPT access token is malformed") from e
     return access,account
@@ -562,19 +563,25 @@ def read_codex():
 def ensure_auth_image():
     inspected=run(["docker","image","inspect",AUTH_IMAGE],check=False,timeout=15)
     if inspected.returncode==0: return
-    print(f"Building local devc2 runtime image {AUTH_IMAGE}…")
-    run(["docker","build","--tag",AUTH_IMAGE,str(ROOT)],capture=False,timeout=1800)
+    print(f"Building local devc2 authentication image {AUTH_IMAGE}…")
+    run(["docker","build","--target","auth","--tag",AUTH_IMAGE,str(ROOT)],capture=False,timeout=1800)
+
+def ensure_runtime_image():
+    inspected=run(["docker","image","inspect",RUNTIME_IMAGE],check=False,timeout=15)
+    if inspected.returncode==0: return
+    print(f"Building local devc2 runtime image {RUNTIME_IMAGE}…")
+    run(["docker","build","--tag",RUNTIME_IMAGE,str(ROOT)],capture=False,timeout=1800)
 
 def github_token():
     managed = AUTH / "gh"
     if (managed / "hosts.yml").exists():
-        ensure_auth_image()
+        ensure_runtime_image()
         value = run([
             "docker", "run", "--rm", "--pull=never", "--user", f"{os.getuid()}:{os.getgid()}",
             "--env", "HOME=/tmp", "--env", "GH_CONFIG_DIR=/run/devc2-gh",
             "--env", "GH_TOKEN=", "--env", "GITHUB_TOKEN=",
             "--volume", f"{managed}:/run/devc2-gh:ro",
-            "--entrypoint", "gh", AUTH_IMAGE, "auth", "token",
+            "--entrypoint", "gh", RUNTIME_IMAGE, "auth", "token",
         ], timeout=30).stdout.strip()
     else:
         try:
@@ -810,7 +817,6 @@ def authenticate():
     codex_config = codex_home / "config.toml"
     if not codex_config.exists():
         private_write(codex_config, 'cli_auth_credentials_store = "file"\n')
-
     codex_ready = False
     github_ready = False
     ssh_ready = False
@@ -838,7 +844,7 @@ def authenticate():
     ensure_auth_image()
 
     if not codex_ready:
-        print("Signing in to ChatGPT for Codex…")
+        print("Signing in to ChatGPT…")
         run([
             "docker", "run", "--rm", "-it", "--user", f"{os.getuid()}:{os.getgid()}",
             "--env", "HOME=/tmp/devc2-login", "--env", "CODEX_HOME=/home/devbox/.codex",
@@ -884,7 +890,7 @@ def doctor(runtime=False):
         except Exception as e: checks.append((False,label,str(e)))
     check('Docker Desktop',lambda: require_docker())
     check('OpenSSL',lambda: run(['/usr/bin/openssl','version'],timeout=10).stdout.strip())
-    check('ChatGPT Codex login',lambda: (read_codex() and 'access token has more than one hour remaining'))
+    check('ChatGPT login',lambda: (read_codex() and 'access token has more than one hour remaining'))
     check('GitHub CLI OAuth',lambda: f"authenticated as {validate_github_token()}")
     def check_agent():
         keys = public_keys()

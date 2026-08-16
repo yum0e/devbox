@@ -1,13 +1,13 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 ARG TACT_VERSION=0.5.3
 FROM ghcr.io/clabby/tact:${TACT_VERSION}@sha256:ef44abc4d69b27f3c13526717ac0258e2bb88497611449d5b02e935630d074c5 AS tact
-FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS island
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       bubblewrap build-essential ca-certificates curl fd-find gh git jq less \
       libatomic1 libnss-wrapper lsof ncurses-term netcat-openbsd \
-      openssh-client passwd procps python3 python3-venv ripgrep socat sudo \
+      openssh-client passwd procps python3 python3-venv ripgrep \
       unzip vim zoxide zsh \
  && install -d /usr/share/postgresql-common/pgdg \
  && curl --fail --show-error --silent \
@@ -45,7 +45,6 @@ RUN install -d -m 0755 "$PNPM_HOME" \
  && pnpm --version \
  && pnpm runtime set node latest --global \
  && node --version \
- && pnpm add --global @openai/codex@0.147.0 \
  && pnpm store prune
 
 # Match v1's managed Python and Ethereum development toolchain without placing
@@ -99,3 +98,14 @@ ENV HOME=/home/devbox \
 USER devbox
 WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/devc2-entrypoint"]
+
+# Authentication is deliberately outside the Island image. Codex currently
+# supplies the headless device flow; this target is built only by `devc2 auth`.
+FROM island AS auth
+USER root
+RUN pnpm add --global @openai/codex@0.147.0 \
+ && pnpm store prune
+USER devbox
+
+# Keep the lean Island as the default build result.
+FROM island AS runtime

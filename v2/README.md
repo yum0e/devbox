@@ -116,8 +116,9 @@ a root/current-user-owned executable that is not group/world-writable or
 hard-linked. `devc2` snapshots its exact bytes without running it and projects
 its own generic shim read-only as `/run/devc2/bin/<name>`. The World supplies no
 client artifact. The host resolves the granted name to this World and supplies
-the generic Link shim. Legacy exact `provider`/`client` entries remain temporarily
-accepted while the other working Spans migrate one at a time. First-party OpenAI
+the generic Link shim. External legacy exact `provider`/`client` entries remain
+temporarily accepted for third-party migration; built-in Spans are Worlds only.
+First-party OpenAI
 uses a second host-owned generic Link shape: scoped execution with bounded public
 bootstrap material and declared CONNECT routes. The OpenAI World supplies no
 Island executable.

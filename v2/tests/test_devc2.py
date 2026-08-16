@@ -118,22 +118,29 @@ class CliTests(unittest.TestCase):
         self.assertIn("ghcr.io/clabby/tact:${TACT_VERSION}@sha256:", dockerfile)
         self.assertIn("ghcr.io/astral-sh/uv:0.9.26@sha256:", dockerfile)
         self.assertIn("python:3.12-alpine@sha256:", proxy_dockerfile)
+        self.assertNotIn("COPY credential_proxy /app/credential_proxy", proxy_dockerfile)
+        for source in ("__init__.py", "span_bridge.py", "stream_relay.py"):
+            self.assertIn(source, proxy_dockerfile)
+        self.assertNotIn("ssh_agent_proxy.py", proxy_dockerfile)
 
     def test_v1_developer_tools_postgres_17_and_pnpm_managed_node(self):
         dockerfile = (PATH.parents[1] / "Dockerfile").read_text()
         entrypoint = (PATH.parents[1] / "devbox" / "entrypoint.sh").read_text()
         for package in (
-            "bubblewrap", "fd-find", "lsof", "ncurses-term", "socat",
-            "sudo", "unzip", "zoxide",
+            "bubblewrap", "fd-find", "lsof", "ncurses-term", "unzip", "zoxide",
         ):
             self.assertIn(package, dockerfile)
+        self.assertNotRegex(dockerfile, r"\b(?:socat|sudo)\b")
         self.assertIn("postgresql-17 postgresql-client-17", dockerfile)
         self.assertIn("/usr/lib/postgresql/17/bin", dockerfile)
         self.assertIn("https://get.pnpm.io/install.sh", dockerfile)
         self.assertIn("${PNPM_HOME}/bin", dockerfile)
         self.assertIn("/usr/local/share/pnpm/bin", dockerfile)
         self.assertIn("pnpm runtime set node latest --global", dockerfile)
-        self.assertIn("pnpm add --global @openai/codex@0.147.0", dockerfile)
+        island,auth=dockerfile.split("FROM island AS auth",1)
+        self.assertNotIn("@openai/codex", island)
+        self.assertIn("pnpm add --global @openai/codex@0.147.0", auth)
+        self.assertIn("FROM island AS runtime",auth)
         self.assertNotIn("\n && npm --version", dockerfile)
         self.assertNotIn("\n && npm install", dockerfile)
         self.assertIn("uv python install 3.14", dockerfile)
@@ -262,7 +269,8 @@ class AuthTests(unittest.TestCase):
             self.assertEqual(len(commands), 4)
             self.assertTrue(all(command[0] in {"docker", "gh"} for command in commands))
             self.assertEqual(commands[0][:3], ["docker", "image", "inspect"])
-            self.assertEqual(commands[1][:4], ["docker", "build", "--tag", "devc2:0.2.0"])
+            self.assertEqual(commands[1][:5], ["docker", "build", "--target", "auth", "--tag"])
+            self.assertEqual(commands[1][5], "devc2-auth:0.2.0")
             self.assertIn(f"{auth / 'codex'}:/home/devbox/.codex", commands[2])
             self.assertIn("codex", commands[2])
             self.assertEqual(commands[2][-2:], ["login", "--device-auth"])
@@ -298,13 +306,13 @@ class AuthTests(unittest.TestCase):
             inspected=subprocess.CompletedProcess([],0,"","")
             with mock.patch.object(D, "AUTH", auth), mock.patch.object(D, "run", side_effect=[inspected,completed]) as run:
                 self.assertEqual(D.github_token(), "managed-token")
-            self.assertEqual(run.call_args_list[0].args[0],["docker","image","inspect",D.AUTH_IMAGE])
+            self.assertEqual(run.call_args_list[0].args[0],["docker","image","inspect",D.RUNTIME_IMAGE])
             self.assertEqual(run.call_args_list[1],mock.call([
                 "docker", "run", "--rm", "--pull=never", "--user", f"{os.getuid()}:{os.getgid()}",
                 "--env", "HOME=/tmp", "--env", "GH_CONFIG_DIR=/run/devc2-gh",
                 "--env", "GH_TOKEN=", "--env", "GITHUB_TOKEN=",
                 "--volume", f"{gh}:/run/devc2-gh:ro",
-                "--entrypoint", "gh", D.AUTH_IMAGE, "auth", "token",
+                "--entrypoint", "gh", D.RUNTIME_IMAGE, "auth", "token",
             ], timeout=30))
 
     def test_bootstrapped_auth_needs_no_host_codex_or_gh(self):

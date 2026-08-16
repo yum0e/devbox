@@ -93,8 +93,6 @@ def load_catalog(path: Path, names: tuple[str, ...], forbidden_root: Path, clien
     if builtin_root is not None:
         for name in names:
             world=builtin_root/name/"world"
-            provider=builtin_root/name/"provider"
-            client=builtin_root/name/"client"
             if world.is_file() and name in SCOPED_EXEC_BUILTINS:
                 if scoped_exec_projection is None:
                     raise RuntimeError(f"Span {name!r} cannot be projected")
@@ -105,8 +103,6 @@ def load_catalog(path: Path, names: tuple[str, ...], forbidden_root: Path, clien
                 if command_projection is None:
                     raise RuntimeError(f"Span {name!r} cannot be projected")
                 builtin_entries[name]=(world,command_projection)
-            elif provider.is_file() and client.is_file():
-                builtin_entries[name]={"provider":str(provider),"client":str(client)}
     external_names=[name for name in names if name not in builtin_entries]
     forbidden_root=forbidden_root.resolve()
     if not external_names:
