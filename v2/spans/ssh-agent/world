@@ -320,14 +320,6 @@ def configured_world() -> World:
         listener.close()
         raise RuntimeError(f"selected SSH public key is unavailable: {key_path}") from error
     agent_filter = AgentFilter(FilterConfig(upstream_path, blob, comment))
-    try:
-        selected = agent_filter.selected_identity()
-    except (OSError, ProtocolError) as error:
-        listener.close()
-        raise RuntimeError("host SSH agent did not answer the readiness check") from error
-    if selected is None:
-        listener.close()
-        raise RuntimeError("selected SSH identity is absent from the host agent")
     return World(listener, agent_filter)
 
 

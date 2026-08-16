@@ -11,3 +11,9 @@ The SSH World itself speaks the standard SSH-agent protocol. The existing generi
 opaque-stream Link projects it as `/run/devc2/spans/ssh-agent.sock`, and the
 Island points `SSH_AUTH_SOCK` there directly. No command, SSH-specific client,
 second agent proxy, or adapter runs inside the Island.
+
+The World validates its socket and selected public-key configuration before it
+starts serving. Host-agent availability is evaluated on every request: a
+missing or temporarily unavailable identity returns a normal SSH-agent failure
+but does not kill the World, so a later request can recover without restarting
+the Island.

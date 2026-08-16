@@ -271,7 +271,7 @@ class WorldTests(unittest.TestCase):
             self.assertEqual(provider.agent_filter.config.allowed_key_blob, allowed)
             self.assertEqual(
                 agent.requests,
-                [bytes([P.SSH2_AGENTC_REQUEST_IDENTITIES])],
+                [],
             )
 
     def test_configured_world_rejects_missing_agent(self):
@@ -279,7 +279,7 @@ class WorldTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "missing SSH Span runtime environment"):
                 P.configured_world()
 
-    def test_configured_world_rejects_an_absent_selected_identity(self):
+    def test_configured_world_recovers_when_selected_identity_appears_later(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             config = root / ".config" / "devc2"
@@ -299,13 +299,50 @@ class WorldTests(unittest.TestCase):
                     "HOME": str(root),
                     "SSH_AUTH_SOCK": str(agent.path),
                     "DEVC2_SPAN_SOCKET_FD": str(descriptor),
-                }, clear=True), self.assertRaisesRegex(
-                    RuntimeError,
-                    "selected SSH identity is absent",
-                ):
-                    P.configured_world()
+                }, clear=True):
+                    world = P.configured_world()
+                request = bytes([P.SSH2_AGENTC_REQUEST_IDENTITIES])
+                self.assertEqual(P.parse_identities(world.agent_filter.handle(request)), [])
+                agent.identities = [(selected, b"selected")]
+                self.assertEqual(
+                    P.parse_identities(world.agent_filter.handle(request)),
+                    [(selected, b"selected")],
+                )
+                world.shutdown()
             finally:
                 listener.close()
+                agent.close()
+
+    def test_world_does_not_exit_after_structural_startup_when_identity_is_temporarily_absent(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            config = root / ".config" / "devc2"
+            config.mkdir(parents=True)
+            selected = key_blob(b"selected")
+            (config / "ssh-key.pub").write_text(public_line(selected))
+            agent = FakeAgent(root / "agent.sock", []).start()
+            span = span_runtime.Span("ssh-agent", None, ROOT / "spans" / "ssh-agent" / "world")
+            with mock.patch.dict(os.environ, {
+                "HOME": str(root),
+                "SSH_AUTH_SOCK": str(agent.path),
+            }, clear=False):
+                provider = span_runtime.Provider(span, root, "island-one")
+            try:
+                provider.check_started()
+                time.sleep(0.25)
+                self.assertIsNone(provider.process.poll())
+                with socket.create_connection(provider.address, timeout=2) as connection:
+                    P.write_packet(connection, bytes([P.SSH2_AGENTC_REQUEST_IDENTITIES]))
+                    self.assertEqual(P.parse_identities(P.read_packet(connection)), [])
+                agent.identities = [(selected, b"selected")]
+                with socket.create_connection(provider.address, timeout=2) as connection:
+                    P.write_packet(connection, bytes([P.SSH2_AGENTC_REQUEST_IDENTITIES]))
+                    self.assertEqual(
+                        P.parse_identities(P.read_packet(connection)),
+                        [(selected, b"selected")],
+                    )
+            finally:
+                provider.stop()
                 agent.close()
 
 
