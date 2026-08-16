@@ -334,8 +334,6 @@ def configured_world() -> World:
         raise RuntimeError("missing SSH Span runtime environment") from error
     try:
         listener = socket.socket(fileno=descriptor)
-        if listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) != 1:
-            raise RuntimeError("DEVC2_SPAN_SOCKET_FD is not a listening socket")
     except OSError as error:
         raise RuntimeError("SSH Span socket is unavailable") from error
     key_path = Path.home() / ".config" / "devc2" / "ssh-key.pub"

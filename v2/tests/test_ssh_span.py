@@ -365,6 +365,7 @@ class FileContractTests(unittest.TestCase):
         world = ROOT / "spans" / "ssh-agent" / "world"
         self.assertTrue(world.stat().st_mode & 0o100)
         self.assertLess(world.stat().st_size, 64 * 1024 * 1024)
+        self.assertNotIn("SO_ACCEPTCONN", world.read_text())
         for name in ("provider", "client"):
             path = ROOT / "spans" / "ssh-agent" / name
             self.assertTrue(path.is_file())
