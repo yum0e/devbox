@@ -465,6 +465,90 @@ class ProviderLifecycleTests(unittest.TestCase):
                 connection.close()
             thread.join(2)
 
+    def test_duplex_relay_treats_peer_cancellation_as_stream_completion(self):
+        island, relay_left = socket.socketpair()
+        relay_right, world = socket.socketpair()
+        stopping = threading.Event()
+        errors = []
+
+        def relay():
+            try:
+                span_bridge.duplex_stream(relay_left, relay_right, stopping)
+            except Exception as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=relay, daemon=True)
+        thread.start()
+        try:
+            island.close()
+            world.sendall(b"response after client cancellation")
+            world.shutdown(socket.SHUT_WR)
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+        finally:
+            stopping.set()
+            for connection in (relay_left, relay_right, world):
+                connection.close()
+            thread.join(2)
+
+    def test_duplex_relay_preserves_reverse_stream_after_broken_write(self):
+        island, raw_relay_left = socket.socketpair()
+        relay_right, world = socket.socketpair()
+        stopping = threading.Event()
+        write_failed = threading.Event()
+        errors = []
+
+        class BrokenWriter:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def fileno(self):
+                return self.connection.fileno()
+
+            def setblocking(self, value):
+                self.connection.setblocking(value)
+
+            def recv(self, size):
+                return self.connection.recv(size)
+
+            def send(self, _payload):
+                write_failed.set()
+                raise BrokenPipeError()
+
+            def shutdown(self, how):
+                self.connection.shutdown(how)
+
+            def close(self):
+                self.connection.close()
+
+        relay_left = BrokenWriter(raw_relay_left)
+
+        def relay():
+            try:
+                span_bridge.duplex_stream(relay_left, relay_right, stopping)
+            except Exception as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=relay, daemon=True)
+        thread.start()
+        try:
+            world.sendall(b"undeliverable")
+            self.assertTrue(write_failed.wait(2))
+            island.sendall(b"reverse survives")
+            world.settimeout(2)
+            self.assertEqual(world.recv(16), b"reverse survives")
+            island.shutdown(socket.SHUT_WR)
+            world.shutdown(socket.SHUT_WR)
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+        finally:
+            stopping.set()
+            for connection in (island, relay_left, relay_right, world):
+                connection.close()
+            thread.join(2)
+
 
 class BridgeConfigTests(unittest.TestCase):
     def test_repeated_bridge_failure_emits_one_bounded_diagnostic(self):

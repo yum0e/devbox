@@ -68,6 +68,7 @@ def provider() -> H.World:
     item.worker_executable = "/trusted/herdr-span"
     item.worker_socket = Path("/private/worker.sock")
     item.jobs = {}
+    item.owned = {}
     item.lock = threading.RLock()
     item.stopping = threading.Event()
     return item
@@ -122,7 +123,16 @@ class WorldAuthorityTests(unittest.TestCase):
         self.assertEqual(task["argv"], argv)
         self.assertRegex(task["marker"], r"^__DEVC2_HERDR_[0-9a-f]{32}_EXIT_$")
         self.assertEqual(item.herdr.calls[2][0], "pane.rename")
+        self.assertEqual(item.herdr.calls[3][0], "pane.wait_for_output")
+        self.assertEqual(item.herdr.calls[3][1]["match"]["value"], H.start_marker(task["marker"]))
+        self.assertEqual(item.herdr.calls[4], (
+            "pane.send_input",
+            {"pane_id": "w1:p2", "text": H.ready_marker(task["marker"]), "keys": ["Enter"]},
+            10,
+        ))
+        self.assertTrue(item.jobs["reviewer"].started)
         self.assertEqual(set(item.jobs), {"reviewer"})
+        self.assertEqual(set(item.owned), {"w1:p2"})
 
     def test_spawn_rolls_back_a_split_when_submission_fails(self):
         item = provider()
@@ -138,6 +148,24 @@ class WorldAuthorityTests(unittest.TestCase):
             item.spawn({"op": "spawn", "name": "worker", "argv": ["true"]})
         self.assertEqual(item.herdr.calls[-1][0], "pane.close")
         self.assertFalse(item.jobs)
+        self.assertFalse(item.owned)
+
+    def test_failed_spawn_keeps_only_private_cleanup_authority_when_close_fails(self):
+        item = provider()
+        original = item.herdr.call
+
+        def fail(method, params, timeout=10):
+            if method == "pane.wait_for_output":
+                raise H.SpanError("startup failed")
+            if method == "pane.close":
+                raise H.SpanError("close failed")
+            return original(method, params, timeout)
+
+        item.herdr.call = fail
+        with self.assertRaisesRegex(H.SpanError, "startup failed"):
+            item.spawn({"op": "spawn", "name": "worker", "argv": ["true"]})
+        self.assertFalse(item.jobs)
+        self.assertEqual(set(item.owned), {"w1:p2"})
 
     def test_spawn_cannot_race_past_teardown(self):
         item = provider()
@@ -190,6 +218,27 @@ class WorldAuthorityTests(unittest.TestCase):
         item.herdr.output = marker + "0"
         with self.assertRaisesRegex(H.SpanError, "has exited"):
             item.handle({"op": "send", "name": "done", "text": "touch /tmp/host"})
+
+    def test_spawn_boundary_makes_immediate_send_safe(self):
+        item = provider()
+        item.spawn({"op": "spawn", "name": "starting", "argv": ["sh"]})
+        self.assertIsNone(item.handle({"op": "send", "name": "starting", "text": "hello"}))
+        methods = [call[0] for call in item.herdr.calls]
+        wait = methods.index("pane.wait_for_output")
+        sent = len(methods) - 1
+        self.assertEqual(methods[sent], "pane.send_input")
+        self.assertLess(wait, sent)
+        self.assertEqual(methods[wait + 1], "pane.send_input")
+        self.assertIn("_READY_", item.herdr.calls[wait + 1][1]["text"])
+
+    def test_worker_requires_the_world_ready_token_before_relay(self):
+        marker = "__DEVC2_HERDR_" + "8" * 32 + "_EXIT_"
+        payload = W.ready_marker(marker) + b"\r"
+        with mock.patch.object(W.os, "read", side_effect=[bytes([byte]) for byte in payload]):
+            self.assertIsNone(W.receive_ready(marker))
+        with mock.patch.object(W.os, "read", side_effect=[b"x", b"\r"]), \
+             self.assertRaisesRegex(W.WorkerError, "invalid worker readiness"):
+            W.receive_ready(marker)
 
     def test_send_rejects_terminal_control_characters(self):
         item = provider()

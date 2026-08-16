@@ -23,6 +23,27 @@ def duplex_stream(
     receive_wants_write = {left: False, right: False}
     send_wants_read = {left: False, right: False}
 
+    def retire(connection: socket.socket) -> None:
+        # A receive reset closes the endpoint. Preserve bytes already queued
+        # toward its peer, but discard bytes destined for the dead endpoint.
+        readable[connection] = False
+        readable[peers[connection]] = False
+        pending[connection].clear()
+        write_closed[connection] = True
+        receive_wants_write[connection] = False
+        receive_wants_write[peers[connection]] = False
+        send_wants_read[connection] = False
+
+    def retire_write(connection: socket.socket) -> None:
+        # A broken write can still leave the reverse direction usable. Stop
+        # reading its peer, whose bytes are no longer deliverable, without
+        # discarding bytes already traveling in the reverse direction.
+        readable[peers[connection]] = False
+        pending[connection].clear()
+        write_closed[connection] = True
+        receive_wants_write[peers[connection]] = False
+        send_wants_read[connection] = False
+
     def refresh(connection: socket.socket) -> None:
         if connection.fileno() < 0:
             return
@@ -58,6 +79,9 @@ def duplex_stream(
             return
         except BlockingIOError:
             return
+        except ConnectionError:
+            retire(connection)
+            return
         receive_wants_write[connection] = False
         if data:
             pending[peer].extend(data)
@@ -78,7 +102,13 @@ def duplex_stream(
             return
         except BlockingIOError:
             return
+        except ConnectionError:
+            retire_write(connection)
+            return
         send_wants_read[connection] = False
+        if sent == 0:
+            retire_write(connection)
+            return
         del pending[connection][:sent]
 
     try:

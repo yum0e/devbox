@@ -59,8 +59,9 @@ herdr wait reviewer --timeout 600
 herdr read reviewer --lines 500
 ```
 
-`wait` exits with the worker's exit status. `send` submits stdin followed by
-Enter to a still-running worker:
+`spawn` returns only after the private worker Link is ready, so an immediate
+`send` cannot race the host shell. `wait` exits with the worker's exit status.
+`send` submits stdin followed by Enter to a still-running worker:
 
 ```sh
 printf 'continue with the tests' | herdr send reviewer

@@ -27,6 +27,7 @@ MAX_TEXT = 64 * 1024
 MAX_OUTPUT = 1024 * 1024
 MAX_ARGV_BYTES = 16 * 1024
 MAX_JOBS = 16
+START_TIMEOUT_MS = 10_000
 MAX_HANDLERS = 32
 HEADER = struct.Struct("!I")
 PARSE_LOCK = threading.Lock()
@@ -142,6 +143,10 @@ def start_marker(marker: str) -> str:
     return marker.replace("_EXIT_", "_START_", 1)
 
 
+def ready_marker(marker: str) -> str:
+    return marker.replace("_EXIT_", "_READY_", 1)
+
+
 class World:
     def __init__(self):
         required = (
@@ -156,6 +161,7 @@ class World:
         self.worker_executable = safe_executable(os.environ["DEVC2_HERDR_WORKER"])
         self.worker_socket = safe_socket(os.environ["DEVC2_HERDR_WORKER_SOCKET"])
         self.jobs: dict[str, Job] = {}
+        self.owned: dict[str, Job] = {}
         self.lock = threading.RLock()
         self.stopping = threading.Event()
 
@@ -238,7 +244,7 @@ class World:
                 raise SpanError("Herdr Span is stopping")
             if name in self.jobs:
                 raise SpanError(f"worker already exists: {name}")
-            if len(self.jobs) >= MAX_JOBS:
+            if len(self.owned) >= MAX_JOBS:
                 raise SpanError(f"an Island may create at most {MAX_JOBS} Herdr workers")
             split = self.herdr.call(
                 "pane.split",
@@ -249,12 +255,12 @@ class World:
                 raise SpanError("Herdr returned an invalid new pane")
             marker = f"__DEVC2_HERDR_{os.urandom(16).hex()}_EXIT_"
             job = Job(name, pane["pane_id"], pane["terminal_id"], marker)
+            self.owned[job.pane_id] = job
             payload = base64.urlsafe_b64encode(
                 json.dumps({
                     "socket": os.fspath(self.worker_socket), "argv": argv, "marker": marker,
                 }, separators=(",", ":")).encode()
             ).decode()
-            self.jobs[name] = job
             try:
                 command = (
                     "exec /usr/bin/env -i "
@@ -265,13 +271,32 @@ class World:
                     "pane.send_input", {"pane_id": job.pane_id, "text": command, "keys": ["Enter"]}
                 )
                 self.herdr.call("pane.rename", {"pane_id": job.pane_id, "label": name})
+                ready = self.herdr.call(
+                    "pane.wait_for_output",
+                    {
+                        "pane_id": job.pane_id,
+                        "source": "recent_unwrapped",
+                        "lines": 1000,
+                        "match": {"type": "substring", "value": start_marker(job.marker)},
+                        "timeout_ms": START_TIMEOUT_MS,
+                    },
+                    timeout=START_TIMEOUT_MS / 1000 + 5,
+                )
+                if ready.get("type") != "output_matched":
+                    raise SpanError("worker start marker was not found")
+                self.herdr.call(
+                    "pane.send_input",
+                    {"pane_id": job.pane_id, "text": ready_marker(job.marker), "keys": ["Enter"]},
+                )
+                job.started = True
+                self.jobs[name] = job
             except Exception:
                 try:
                     self.herdr.call("pane.close", {"pane_id": job.pane_id})
                 except Exception:
-                    raise
+                    pass
                 else:
-                    self.jobs.pop(name, None)
+                    self.owned.pop(job.pane_id, None)
                 raise
         return name
 
@@ -341,7 +366,7 @@ class World:
     def cleanup(self) -> None:
         self.stopping.set()
         with self.lock:
-            jobs = list(self.jobs.values())
+            jobs = list(self.owned.values())
 
         def close(job: Job) -> None:
             for _attempt in range(2):

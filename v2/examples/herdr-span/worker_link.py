@@ -69,6 +69,25 @@ def failed(marker: str, error: Exception) -> None:
     print(f"\r\n{marker}125", flush=True)
 
 
+def ready_marker(marker: str) -> bytes:
+    return marker.replace("_EXIT_", "_READY_", 1).encode()
+
+
+def receive_ready(marker: str) -> None:
+    expected = ready_marker(marker)
+    received = bytearray()
+    while len(received) <= len(expected):
+        byte = os.read(0, 1)
+        if not byte:
+            raise WorkerError("worker readiness ended early")
+        if byte in (b"\r", b"\n"):
+            if bytes(received) == expected:
+                return
+            break
+        received.extend(byte)
+    raise WorkerError("invalid worker readiness")
+
+
 def receive(connection: socket.socket, size: int) -> bytes:
     result = bytearray()
     while len(result) < size:
@@ -96,10 +115,10 @@ def run(raw: str) -> int:
         failed(document["marker"], error)
         park()
 
-    print(f"\r\n{document['marker'].replace('_EXIT_', '_START_', 1)}", flush=True)
     saved = termios.tcgetattr(0) if os.isatty(0) else None
     if saved is not None:
         tty.setraw(0)
+    print(f"\r\n{document['marker'].replace('_EXIT_', '_START_', 1)}", flush=True)
     stopping = threading.Event()
 
     def send_input() -> None:
@@ -113,10 +132,11 @@ def run(raw: str) -> int:
         except OSError:
             return
 
-    thread = threading.Thread(target=send_input, daemon=True)
-    thread.start()
     try:
         try:
+            receive_ready(document["marker"])
+            thread = threading.Thread(target=send_input, daemon=True)
+            thread.start()
             while True:
                 kind, size = FRAME.unpack(receive(connection, FRAME.size))
                 if kind == b"O" and size <= 64 * 1024:
