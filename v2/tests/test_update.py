@@ -69,7 +69,8 @@ class UpdateTests(unittest.TestCase):
                 self.assertRegex(second_version,r"^0\.2\.0\+local\.[0-9a-f]{12}$")
                 self.assertIn(f"installed devc2 {second_version}",output.getvalue())
                 self.assertEqual((share/"previous").resolve(),first)
-                installed=json.loads(D.INSTALL_STATE.read_text())
+                installed=json.loads((share/"installation.json").read_text())
+                self.assertEqual(installed["schema"],2)
                 self.assertEqual(installed["version"],second_version)
                 self.assertEqual(installed["previous_version"],first_version)
                 self.assertEqual(installed["install_kind"],"checkout")
@@ -82,7 +83,7 @@ class UpdateTests(unittest.TestCase):
                 self.assertIn(f"rolled back devc2 to {first_version}",completed.stdout)
                 version=subprocess.run([str(bin_dir/"devc2"),"--version"],env=environment,text=True,capture_output=True)
                 self.assertEqual(version.stdout.strip(),f"devc2 {first_version}")
-                rollback_state=json.loads((root/"dispatcher-state"/"devc2"/"installation.json").read_text())
+                rollback_state=json.loads((share/"installation.json").read_text())
                 self.assertEqual(rollback_state["version"],first_version)
                 self.assertEqual(rollback_state["previous_version"],second_version)
             self.assertEqual((share/"current").resolve(),first)
@@ -110,17 +111,23 @@ class UpdateTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError,"already running"): D._reset_unlocked(repo,True)
             compose.assert_not_called()
 
-    def test_first_migration_failure_leaves_legacy_launcher_usable(self):
+    def test_compatibility_pointer_failure_does_not_override_committed_record(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); self.runtime(root); bin_dir=root/"bin"; share=root/"share"; bin_dir.mkdir(); share.mkdir()
-            legacy=bin_dir/"devc2"; original='#!/usr/bin/env bash\nexport DEVC2_SHARE_DIR='+str(share)+'\nexec python3 "$DEVC2_SHARE_DIR/launcher/devc2.py" "$@"\n'; legacy.write_text(original)
+            legacy_root=root/"legacy"; shutil.copytree(ROOT,legacy_root,ignore=shutil.ignore_patterns("__pycache__"))
+            legacy=bin_dir/"devc2"; original='#!/usr/bin/env bash\nexport DEVC2_SHARE_DIR='+str(legacy_root)+'\nexec python3 "$DEVC2_SHARE_DIR/launcher/devc2.py" "$@"\n'; legacy.write_text(original)
             real_replace=D.replace_symlink
             def fail_current(link,target):
                 if link.name=="current": raise OSError("injected activation failure")
                 return real_replace(link,target)
-            with mock.patch.object(D,"replace_symlink",side_effect=fail_current), self.assertRaisesRegex(OSError,"injected"):
-                D.install_from_directory(ROOT,bin_dir,share)
-            self.assertEqual(legacy.read_text(),original)
+            with mock.patch.object(D,"replace_symlink",side_effect=fail_current), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(D.install_from_directory(ROOT,bin_dir,share),0)
+            record=json.loads((share/"installation.json").read_text())
+            self.assertEqual(record["schema"],2)
+            self.assertEqual(Path(record["current"]),Path(record["manager"]))
+            env={**os.environ,"DEVC2_DATA_DIR":str(share),"XDG_STATE_HOME":str(root/"dispatcher-state")}
+            version=subprocess.run([str(legacy),"--version"],env=env,text=True,capture_output=True)
+            self.assertEqual(version.returncode,0,version.stderr)
 
     def test_repo_lock_makes_reset_refuse_a_live_checkout(self):
         with tempfile.TemporaryDirectory() as td:
@@ -187,7 +194,7 @@ class UpdateTests(unittest.TestCase):
             with mock.patch.dict(os.environ,environment,clear=False), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(D.install_from_directory(source,bin_dir,share),0)
                 first=(share/"current").resolve()
-                state=json.loads(D.INSTALL_STATE.read_text())
+                state=json.loads((share/"installation.json").read_text())
                 self.assertEqual(state["install_kind"],"checkout")
                 self.assertEqual(state["source_dir"],str(source.resolve()))
                 (source/"README.md").write_text((source/"README.md").read_text()+"\nupdated checkout\n")
@@ -211,7 +218,7 @@ class UpdateTests(unittest.TestCase):
                 D.install_from_directory(source1,bin_dir,share)
                 D.install_from_directory(source2,bin_dir,share)
                 D.rollback_installation()
-            state=json.loads(D.INSTALL_STATE.read_text())
+            state=json.loads((share/"installation.json").read_text())
             self.assertEqual(state["install_kind"],"checkout")
             self.assertEqual(state["source_dir"],str(source1.resolve()))
             self.assertEqual(state["previous_install_kind"],"checkout")
@@ -254,6 +261,54 @@ class UpdateTests(unittest.TestCase):
                 self.assertEqual(D.update_installation(),0)
             self.assertEqual(activate.call_args.args[1:3],(bin_a,share_a))
 
+    def test_installation_record_replace_failure_preserves_old_generation(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); self.runtime(root); source1=root/"source1"; source2=root/"source2"
+            shutil.copytree(ROOT,source1,ignore=shutil.ignore_patterns("__pycache__"))
+            shutil.copytree(ROOT,source2,ignore=shutil.ignore_patterns("__pycache__"))
+            (source2/"README.md").write_text((source2/"README.md").read_text()+"\nnew generation\n")
+            bin_dir=root/"bin"; share=root/"share"
+            with mock.patch.dict(os.environ,{"DEVC2_BIN_DIR":str(bin_dir),"DEVC2_DATA_DIR":str(share)},clear=False), contextlib.redirect_stdout(io.StringIO()):
+                D.install_from_directory(source1,bin_dir,share)
+                before=(share/"installation.json").read_bytes(); old=json.loads(before)["current"]
+                real_replace=D.os.replace
+                def fail_record(source,destination):
+                    if Path(destination)==share/"installation.json": raise OSError("injected record failure")
+                    return real_replace(source,destination)
+                with mock.patch.object(D.os,"replace",side_effect=fail_record), self.assertRaisesRegex(OSError,"record failure"):
+                    D.install_from_directory(source2,bin_dir,share)
+            self.assertEqual((share/"installation.json").read_bytes(),before)
+            self.assertEqual(str((share/"current").resolve()),old)
+
+    def test_first_record_failure_leaves_legacy_wrapper_usable(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); self.runtime(root); bin_dir=root/"bin"; share=root/"share"
+            bin_dir.mkdir(); share.mkdir()
+            wrapper=bin_dir/"devc2"
+            original='#!/usr/bin/env bash\nexport DEVC2_SHARE_DIR='+str(share)+'\nexit 23\n'
+            wrapper.write_text(original)
+            real_replace=D.os.replace
+            def fail_record(source,destination):
+                if Path(destination)==share/"installation.json": raise OSError("injected record failure")
+                return real_replace(source,destination)
+            with mock.patch.object(D.os,"replace",side_effect=fail_record), self.assertRaisesRegex(OSError,"record failure"):
+                D.install_from_directory(ROOT,bin_dir,share)
+            self.assertEqual(wrapper.read_text(),original)
+            self.assertFalse((share/"installation.json").exists())
+
+    def test_legacy_metadata_and_pointer_migrate_when_record_is_absent(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); self.runtime(root); share=root/"share"; versions=share/"versions"; versions.mkdir(parents=True)
+            legacy=versions/"legacy"; shutil.copytree(ROOT,legacy,ignore=shutil.ignore_patterns("__pycache__"))
+            os.symlink(legacy,share/"current"); D.STATE.mkdir(parents=True)
+            D.atomic_write(D.INSTALL_STATE,json.dumps({"schema":1,"current":str(legacy),"install_kind":"checkout","source_dir":str(ROOT)})+"\n")
+            with mock.patch.dict(os.environ,{"DEVC2_DATA_DIR":str(share)},clear=False), contextlib.redirect_stdout(io.StringIO()):
+                D.install_from_directory(ROOT,root/"bin",share)
+            record=json.loads((share/"installation.json").read_text())
+            self.assertEqual(record["schema"],2)
+            self.assertEqual(record["previous"],str(legacy.resolve()))
+            self.assertEqual(record["previous_install_kind"],"checkout")
+
     def test_redirect_policy_rejects_http_and_non_github_hosts(self):
         handler=D.TrustedRedirectHandler()
         request=D.urllib.request.Request("https://github.com/yum0e/devbox/releases/latest")
@@ -278,6 +333,33 @@ class UpdateTests(unittest.TestCase):
                     fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
             finally:
                 process.terminate(); process.wait(timeout=5)
+
+    def test_dispatcher_routes_from_record_and_ignores_stale_mirrors(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); data=root/"data"; data.mkdir(); current=root/"current-runtime"; manager=root/"manager-runtime"
+            for runtime,label in ((current,"current"),(manager,"manager")):
+                launcher=runtime/"launcher"; launcher.mkdir(parents=True)
+                (launcher/"devc2.py").write_text(f"print({label!r})\n")
+            os.symlink(manager,data/"current"); os.symlink(current,data/"manager")
+            record={"schema":2,"current":str(current),"previous":str(manager),"manager":str(manager),"version":"test","bin_dir":str(root/"bin"),"share_dir":str(data),"install_kind":"checkout"}
+            (data/"installation.json").write_text(json.dumps(record))
+            env={**os.environ,"DEVC2_DATA_DIR":str(data),"XDG_STATE_HOME":str(root/"state")}
+            ordinary=subprocess.run([sys.executable,str(ROOT/"launcher"/"dispatcher.py"),"dummy"],env=env,text=True,capture_output=True)
+            update=subprocess.run([sys.executable,str(ROOT/"launcher"/"dispatcher.py"),"update"],env=env,text=True,capture_output=True)
+            self.assertEqual((ordinary.returncode,ordinary.stdout.strip()),(0,"current"),ordinary.stderr)
+            self.assertEqual((update.returncode,update.stdout.strip()),(0,"manager"),update.stderr)
+
+    def test_dispatcher_falls_back_only_when_record_absent(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); data=root/"data"; runtime=root/"runtime"; launcher=runtime/"launcher"; launcher.mkdir(parents=True); data.mkdir()
+            (launcher/"devc2.py").write_text("print('legacy')\n"); os.symlink(runtime,data/"current")
+            env={**os.environ,"DEVC2_DATA_DIR":str(data),"XDG_STATE_HOME":str(root/"state")}
+            legacy=subprocess.run([sys.executable,str(ROOT/"launcher"/"dispatcher.py"),"dummy"],env=env,text=True,capture_output=True)
+            self.assertEqual((legacy.returncode,legacy.stdout.strip()),(0,"legacy"),legacy.stderr)
+            (data/"installation.json").write_text("not json")
+            invalid=subprocess.run([sys.executable,str(ROOT/"launcher"/"dispatcher.py"),"dummy"],env=env,text=True,capture_output=True)
+            self.assertNotEqual(invalid.returncode,0)
+            self.assertIn("record is invalid",invalid.stderr)
 
     def test_dispatcher_allows_update_but_blocks_rollback_during_session(self):
         with tempfile.TemporaryDirectory() as td:

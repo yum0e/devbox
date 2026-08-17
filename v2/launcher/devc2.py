@@ -167,13 +167,69 @@ def validate_asset_tree(source,strict=False):
         if not path.is_file() or path.is_symlink(): raise RuntimeError(f"release lacks required asset: {name}")
     return source_version(source)
 
-def read_installation_state(path=None):
-    path=INSTALL_STATE if path is None else path
+def installation_record(data_root=None):
+    root=Path(os.environ.get("DEVC2_DATA_DIR",Path.home()/".local/share/devc2")) if data_root is None else Path(data_root)
+    return root.expanduser().absolute()/"installation.json"
+
+def _validate_installation_record(document,path):
+    if not isinstance(document,dict) or document.get("schema")!=2:
+        raise RuntimeError(f"installed runtime record is invalid: {path}")
+    required_strings=("current","manager","version","bin_dir","share_dir","install_kind")
+    if any(not isinstance(document.get(key),str) or not document[key] for key in required_strings):
+        raise RuntimeError(f"installed runtime record is invalid: {path}")
+    for key in ("current","manager","bin_dir","share_dir"):
+        if not Path(document[key]).is_absolute(): raise RuntimeError(f"installed runtime record is invalid: {path}")
+    for key in ("previous","previous_version","source_dir","previous_install_kind","previous_source_dir"):
+        if document.get(key) is not None and not isinstance(document[key],str):
+            raise RuntimeError(f"installed runtime record is invalid: {path}")
+    if document.get("previous") is not None and not Path(document["previous"]).is_absolute():
+        raise RuntimeError(f"installed runtime record is invalid: {path}")
+    if Path(document["share_dir"])!=path.parent:
+        raise RuntimeError(f"installed runtime record is invalid: {path}")
+    roles=[document["current"],document["manager"]]
+    if document.get("previous") is not None: roles.append(document["previous"])
+    for value in roles:
+        runtime=Path(value)
+        try: resolved=runtime.resolve(strict=True)
+        except OSError as error: raise RuntimeError(f"installed runtime record is invalid: {path}") from error
+        if resolved!=runtime or not runtime.is_dir() or runtime.is_symlink():
+            raise RuntimeError(f"installed runtime record is invalid: {path}")
+        launcher=runtime/"launcher"/"devc2.py"
+        if not launcher.is_file() or launcher.is_symlink():
+            raise RuntimeError(f"installed runtime record is invalid: {path}")
+    if document["manager"] not in {document["current"],document.get("previous")}:
+        raise RuntimeError(f"installed runtime record is invalid: {path}")
+    return document
+
+def read_installation_state(data_root=None):
+    """Read the authoritative record, or schema-1 metadata during migration only."""
+    path=installation_record(data_root)
     try:
-        document=json.loads(path.read_text(encoding="utf-8"))
-        if document.get("schema")!=1: return {}
-        return document
-    except (FileNotFoundError,OSError,ValueError): return {}
+        metadata=path.lstat()
+    except FileNotFoundError:
+        try:
+            document=json.loads(INSTALL_STATE.read_text(encoding="utf-8"))
+            return document if isinstance(document,dict) and document.get("schema")==1 else {}
+        except (FileNotFoundError,OSError,ValueError): return {}
+    except OSError as error:
+        raise RuntimeError(f"installed runtime record cannot be read: {path}") from error
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeError(f"installed runtime record is invalid: {path}")
+    if metadata.st_size>64*1024 or metadata.st_uid!=os.getuid() or metadata.st_mode & 0o022:
+        raise RuntimeError(f"installed runtime record is invalid: {path}")
+    try: document=json.loads(path.read_text(encoding="utf-8"))
+    except (OSError,ValueError) as error: raise RuntimeError(f"installed runtime record is invalid: {path}") from error
+    return _validate_installation_record(document,path)
+
+def write_installation_record(share_dir,document):
+    atomic_write(installation_record(share_dir),json.dumps(document,sort_keys=True,indent=2)+"\n")
+
+def mirror_symlink(link,target):
+    try:
+        if target is None: link.unlink(missing_ok=True)
+        else: replace_symlink(link,target)
+    except OSError as error:
+        print(f"devc2: warning: compatibility pointer {link} could not be updated: {error}",file=sys.stderr)
 
 def wrapper_root(wrapper):
     import re
@@ -256,9 +312,12 @@ def _activate_assets(source,bin_dir,share_dir,release=False):
     install_id=version if release else f"{version}+local.{digest[:12]}"
     target=versions/install_id; launcher_path=bin_dir/"devc2"
     current_link=share_dir/"current"; previous_link=share_dir/"previous"
-    existing_state=read_installation_state()
-    try: old_root=current_link.resolve(strict=True) if current_link.is_symlink() else wrapper_root(launcher_path)
-    except OSError: old_root=wrapper_root(launcher_path)
+    existing_state=read_installation_state(share_dir)
+    if existing_state.get("schema")==2:
+        old_root=Path(existing_state["current"])
+    else:
+        try: old_root=current_link.resolve(strict=True) if current_link.is_symlink() else wrapper_root(launcher_path)
+        except OSError: old_root=wrapper_root(launcher_path)
     if not target.exists():
         staging=Path(tempfile.mkdtemp(prefix=f".{install_id}.",dir=versions)); staging.rmdir()
         try:
@@ -272,24 +331,20 @@ def _activate_assets(source,bin_dir,share_dir,release=False):
             raise
     elif validate_asset_tree(target,True)!=version or asset_digest(target)!=digest:
         raise RuntimeError(f"existing installation target failed immutable content validation: {target}")
-    # Prepare the stable dispatcher before the current pointer, which is the only
-    # activation commit point. Existing launchers keep their already-resolved root.
+    # Everything a newly committed record can name must exist before that single
+    # atomic commit. Existing launchers keep their already-resolved root.
     bootstrap=share_dir/"bootstrap"; bootstrap.mkdir(exist_ok=True)
     ensure_owned_directory(bootstrap)
     dispatcher_source=source/"launcher"/"dispatcher.py"
     atomic_write(bootstrap/"dispatcher.py",dispatcher_source.read_bytes(),0o555)
     expected_wrapper=install_wrapper_text(share_dir,bin_dir)
-    replace_symlink(share_dir/"manager",target)
-    if old_root and old_root!=target: replace_symlink(previous_link,old_root)
-    replace_symlink(current_link,target)
-    # On first migration, replacing the legacy bin launcher is the final commit;
-    # every path it references is already complete. Future wrappers are unchanged.
-    if not launcher_path.exists() or launcher_path.read_text(encoding="utf-8")!=expected_wrapper:
-        atomic_write(launcher_path,expected_wrapper,0o555)
-    previous_root=None
-    if previous_link.is_symlink():
-        try: previous_root=previous_link.resolve(strict=True)
-        except OSError: previous_root=None
+    if old_root==target:
+        raw_previous=existing_state.get("previous")
+        if raw_previous: previous_root=Path(raw_previous)
+        else:
+            try: previous_root=previous_link.resolve(strict=True) if previous_link.is_symlink() else None
+            except OSError: previous_root=None
+    else: previous_root=old_root
     previous_version=None
     if previous_root:
         try: previous_version=installed_version(previous_root)
@@ -302,9 +357,15 @@ def _activate_assets(source,bin_dir,share_dir,release=False):
         previous_source_dir=existing_state.get("source_dir")
     else:
         previous_install_kind=None; previous_source_dir=None
-    metadata={"schema":1,"version":install_id,"current":str(target),"previous":str(previous_root) if previous_root else None,"previous_version":previous_version,"bin_dir":str(bin_dir),"share_dir":str(share_dir),"install_kind":"release" if release else "checkout","source_dir":None if release else str(source.resolve()),"previous_install_kind":previous_install_kind,"previous_source_dir":previous_source_dir,"installed_at":int(time.time())}
-    try: atomic_write(INSTALL_STATE,json.dumps(metadata,sort_keys=True,indent=2)+"\n")
-    except OSError as error: print(f"devc2: warning: activation succeeded but installation metadata could not be updated: {error}",file=sys.stderr)
+    metadata={"schema":2,"version":install_id,"current":str(target),"previous":str(previous_root) if previous_root else None,"manager":str(target),"previous_version":previous_version,"bin_dir":str(bin_dir),"share_dir":str(share_dir),"install_kind":"release" if release else "checkout","source_dir":None if release else str(source.resolve()),"previous_install_kind":previous_install_kind,"previous_source_dir":previous_source_dir,"installed_at":int(time.time())}
+    write_installation_record(share_dir,metadata)
+    # A legacy wrapper remains usable until the record commit. Once committed,
+    # the prepared dispatcher can route entirely from that record.
+    if not launcher_path.exists() or launcher_path.read_text(encoding="utf-8")!=expected_wrapper:
+        atomic_write(launcher_path,expected_wrapper,0o555)
+    mirror_symlink(share_dir/"manager",target)
+    mirror_symlink(previous_link,previous_root)
+    mirror_symlink(current_link,target)
     print(f"installed devc2 {install_id}: {launcher_path}")
     print(f"installed v2 assets: {target}")
     if previous_root: print(f"rollback preserved: {previous_root}")
@@ -438,7 +499,8 @@ def extract_release(archive,destination):
 
 def update_installation():
     with lifecycle_lock(False), forward_update_lock():
-        state=read_installation_state()
+        data_root=Path(os.environ.get("DEVC2_DATA_DIR",Path.home()/".local/share/devc2"))
+        state=read_installation_state(data_root)
         if state.get("install_kind")=="checkout":
             raw_source=state.get("source_dir")
             if not isinstance(raw_source,str) or not raw_source:
@@ -451,8 +513,9 @@ def update_installation():
             share_dir=Path(os.environ.get("DEVC2_DATA_DIR",state.get("share_dir",Path.home()/".local/share/devc2")))
             return _activate_assets(source,bin_dir,share_dir,False)
         latest,url,expected=latest_release()
-        data_root=Path(os.environ.get("DEVC2_DATA_DIR",Path.home()/".local/share/devc2"))
-        try: active_version=source_version((data_root/"current").resolve(strict=True))
+        try:
+            active=Path(state["current"]) if state.get("schema")==2 else (data_root/"current").resolve(strict=True)
+            active_version=source_version(active)
         except (RuntimeError,OSError): active_version=VERSION
         if version_tuple(latest)<=version_tuple(active_version):
             print(f"devc2 {active_version} is current")
@@ -472,21 +535,28 @@ def update_installation():
 def rollback_installation():
     with lifecycle_lock(True):
         if active_legacy_sessions(): raise RuntimeError("cannot roll back while a devc2 session is active")
-        state=read_installation_state(); share_dir=Path(os.environ.get("DEVC2_DATA_DIR",state.get("share_dir",Path.home()/".local/share/devc2"))).expanduser().resolve(); bin_dir=Path(os.environ.get("DEVC2_BIN_DIR",state.get("bin_dir",Path.home()/".local/bin"))).expanduser().resolve()
+        requested_share=Path(os.environ.get("DEVC2_DATA_DIR",Path.home()/".local/share/devc2"))
+        state=read_installation_state(requested_share); share_dir=Path(os.environ.get("DEVC2_DATA_DIR",state.get("share_dir",requested_share))).expanduser().resolve(); bin_dir=Path(os.environ.get("DEVC2_BIN_DIR",state.get("bin_dir",Path.home()/".local/bin"))).expanduser().resolve()
         current_link=share_dir/"current"; previous_link=share_dir/"previous"
-        if not current_link.is_symlink() or not previous_link.is_symlink(): raise RuntimeError("no previous devc2 installation is available")
-        try: current=current_link.resolve(strict=True); previous=previous_link.resolve(strict=True)
-        except OSError as error: raise RuntimeError("saved rollback installation is unavailable") from error
+        if state.get("schema")==2:
+            current=Path(state["current"]); raw_previous=state.get("previous")
+            if not raw_previous: raise RuntimeError("no previous devc2 installation is available")
+            previous=Path(raw_previous); manager=Path(state["manager"])
+        else:
+            if not current_link.is_symlink() or not previous_link.is_symlink(): raise RuntimeError("no previous devc2 installation is available")
+            try: current=current_link.resolve(strict=True); previous=previous_link.resolve(strict=True)
+            except OSError as error: raise RuntimeError("saved rollback installation is unavailable") from error
+            manager=current
+        if not current.is_dir() or current.is_symlink() or not previous.is_dir() or previous.is_symlink():
+            raise RuntimeError("saved rollback installation is unavailable")
         validate_asset_tree(previous,previous.parent.name=="versions")
         previous_version=installed_version(previous)
         current_version=installed_version(current)
-        replace_symlink(current_link,previous)
-        try: replace_symlink(previous_link,current)
-        except Exception:
-            replace_symlink(current_link,current)
-            raise
-        metadata={"schema":1,"version":previous_version,"current":str(previous),"previous":str(current),"previous_version":current_version,"bin_dir":str(bin_dir),"share_dir":str(share_dir),"install_kind":state.get("previous_install_kind"),"source_dir":state.get("previous_source_dir"),"previous_install_kind":state.get("install_kind"),"previous_source_dir":state.get("source_dir"),"installed_at":int(time.time())}
-        atomic_write(INSTALL_STATE,json.dumps(metadata,sort_keys=True,indent=2)+"\n")
+        metadata={"schema":2,"version":previous_version,"current":str(previous),"previous":str(current),"manager":str(manager),"previous_version":current_version,"bin_dir":str(bin_dir),"share_dir":str(share_dir),"install_kind":state.get("previous_install_kind") or "legacy","source_dir":state.get("previous_source_dir"),"previous_install_kind":state.get("install_kind") or "legacy","previous_source_dir":state.get("source_dir"),"installed_at":int(time.time())}
+        write_installation_record(share_dir,metadata)
+        mirror_symlink(current_link,previous)
+        mirror_symlink(previous_link,current)
+        mirror_symlink(share_dir/"manager",manager)
         print(f"rolled back devc2 to {metadata['version']}")
         return 0
 

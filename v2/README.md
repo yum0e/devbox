@@ -228,9 +228,10 @@ active. Runtime pruning is not supported. There is no force override. Repository
 locks are also permanent, so `reset` cannot tear down a running checkout.
 
 The new release is fully downloaded, bounded, hash-verified, safely extracted,
-and structurally validated before activation. A same-filesystem `current` symlink
-replacement is the single atomic activation point. The old runtime remains at
-`previous`; `devc2 rollback` switches back without network access. Configuration,
+and structurally validated before activation. A same-filesystem replacement of
+`$DEVC2_DATA_DIR/installation.json` is the single atomic activation point. It
+selects the current, previous, and management runtimes; matching symlinks remain
+only as compatibility mirrors. `devc2 rollback` switches back without network access. Configuration,
 OAuth data, Tact preferences, checkout contents, and Docker state volumes live
 outside versioned program assets and are never migrated or rewritten by these
 operations.
