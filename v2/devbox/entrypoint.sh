@@ -143,6 +143,7 @@ if [[ "${DEVC2_RUNTIME_DOCTOR:-}" == "1" ]]; then
   tact config show >/dev/null
   echo "✓ Tact configuration: valid"
   echo "✓ Tact binary: $(tact --version 2>&1 | head -n 1)"
+  echo "✓ Pi binary: $(pi --version 2>&1 | head -n 1)"
   echo "✓ PostgreSQL client: $(psql --version)"
   echo "✓ Node runtime: $(node --version)"
   echo "✓ pnpm: $(pnpm --version)"

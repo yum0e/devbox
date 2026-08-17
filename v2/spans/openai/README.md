@@ -10,8 +10,9 @@ The OpenAI World reads the host-managed Codex subscription login lazily and runs
 a digest-pinned, non-root Iron helper. It exports a bounded scoped-exec manifest:
 public CA, fake child authentication, exact `chatgpt.com:443` route, and scoped
 environment. devc2 resolves that World to its generic scoped-exec Link; OpenAI
-supplies no Island client code. The Tact wrapper invokes the projected Link as
-`openai run -- COMMAND`.
+supplies no Island client code. The Tact and Pi wrappers invoke the projected
+Link as `openai run -- COMMAND`; Pi receives only the same fake bearer already
+used by the scoped proxy, never the host token.
 
 The generic Link runs exact argv inside the Island with inherited stdio, forwards
 signals, streams declared CONNECT traffic to the World, preserves ordinary child

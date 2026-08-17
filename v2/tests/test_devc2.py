@@ -203,6 +203,38 @@ class CliTests(unittest.TestCase):
                 f"openai:run -- {upstream} run task", "upstream:run task",
             ])
 
+    def test_pi_wrapper_uses_openai_span_without_persisting_subscription_auth(self):
+        wrapper_source = (PATH.parents[1] / "devbox" / "pi-wrapper.sh").read_text()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            upstream, openai, wrapper = root / "pi-upstream", root / "openai", root / "pi"
+            auth, result = root / "auth.json", root / "result"
+            auth.write_text(json.dumps({"tokens": {"access_token": "projected-token"}}))
+            upstream.write_text("#!/bin/sh\n" f"printf 'upstream:%s\\n' \"$*\" >>{result}\n" "exit 17\n")
+            upstream.chmod(0o755)
+            openai.write_text(
+                "#!/bin/sh\n"
+                f"printf 'openai:%s\\n' \"$*\" >>{result}\n"
+                "shift 2\nexec \"$@\"\n"
+            )
+            openai.chmod(0o755)
+            wrapper.write_text(
+                wrapper_source
+                .replace("/usr/local/share/pnpm/bin/pi-upstream", str(upstream))
+                .replace("/run/devc2/bin/openai", str(openai))
+                .replace("/usr/local/share/pnpm/bin/pi", str(wrapper))
+            )
+            wrapper.chmod(0o755)
+            self.assertEqual(subprocess.run([str(wrapper), "--version"]).returncode, 17)
+            environment = {**os.environ, "TACT_AUTH_FILE": str(auth)}
+            self.assertEqual(subprocess.run([str(wrapper), "task"], env=environment).returncode, 17)
+            self.assertEqual(result.read_text().splitlines(), [
+                "upstream:--version",
+                f"openai:run -- env DEVC2_PI_OPENAI_SCOPE=1 {wrapper} task",
+                "upstream:--provider openai-codex --model gpt-5.5 --api-key projected-token task",
+            ])
+            self.assertFalse((root / ".pi" / "agent" / "auth.json").exists())
+
     def test_external_build_images_are_content_pinned(self):
         dockerfile = (PATH.parents[1] / "Dockerfile").read_text()
         proxy_dockerfile = (PATH.parents[1] / "credential_proxy" / "Dockerfile").read_text()
@@ -229,6 +261,9 @@ class CliTests(unittest.TestCase):
         self.assertIn("${PNPM_HOME}/bin", dockerfile)
         self.assertIn("/usr/local/share/pnpm/bin", dockerfile)
         self.assertIn("pnpm runtime set node latest --global", dockerfile)
+        self.assertIn("@earendil-works/pi-coding-agent@0.84.2", dockerfile)
+        self.assertIn("--ignore-scripts --no-optional", dockerfile)
+        self.assertIn('mv "$PNPM_HOME/bin/pi" "$PNPM_HOME/bin/pi-upstream"', dockerfile)
         island,auth=dockerfile.split("FROM island AS auth",1)
         self.assertNotIn("@openai/codex", island)
         self.assertIn("pnpm add --global @openai/codex@0.147.0", auth)
@@ -247,7 +282,7 @@ class CliTests(unittest.TestCase):
         self.assertNotIn(" tmux ", dockerfile)
         self.assertNotIn("tmux -V", entrypoint)
         for probe in (
-            "psql --version", "node --version",
+            "pi --version", "psql --version", "node --version",
             "pnpm --version", "python3.14 --version", "forge --version",
         ):
             self.assertIn(probe, entrypoint)

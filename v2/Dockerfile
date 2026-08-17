@@ -47,6 +47,13 @@ RUN install -d -m 0755 "$PNPM_HOME" \
  && node --version \
  && pnpm store prune
 
+# Pi keeps its settings and sessions in the Island, but authenticated model
+# requests cross the OpenAI Span through the wrapper installed below.
+RUN pnpm add --global --ignore-scripts --no-optional \
+      @earendil-works/pi-coding-agent@0.84.2 \
+ && mv "$PNPM_HOME/bin/pi" "$PNPM_HOME/bin/pi-upstream" \
+ && pnpm store prune
+
 # Match v1's managed Python and Ethereum development toolchain without placing
 # either installation in the persistent devbox home volume.
 RUN uv python install 3.14 \
@@ -79,7 +86,9 @@ RUN set -eux; \
 
 COPY devbox/entrypoint.sh /usr/local/bin/devc2-entrypoint
 COPY devbox/github-known-hosts /etc/ssh/ssh_known_hosts
+COPY devbox/pi-wrapper.sh /usr/local/share/pnpm/bin/pi
 RUN chmod 0755 /usr/local/bin/devc2-entrypoint /usr/local/bin/tact /usr/local/libexec/devc2/tact-upstream \
+      /usr/local/share/pnpm/bin/pi /usr/local/share/pnpm/bin/pi-upstream \
  && groupadd --gid 1000 devbox \
  && useradd --uid 1000 --gid devbox --create-home --shell /bin/zsh devbox \
  && mkdir -p /workspace /home/devbox/.cache /home/devbox/.local/share/tact \

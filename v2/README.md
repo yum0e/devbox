@@ -68,9 +68,11 @@ Island, the projected command and its private endpoint are `/run/devc2/bin/herdr
 removes the checkout or v1 resources.
 
 The first-party `openai`, `github`, `ssh-agent`, and `diagnostics` Spans ship with devc2 but are
-still inert until named. `tact` automatically runs authenticated operations
-through `openai`; local commands such as `tact config` and `tact --version` need
-no grant. `github run -- gh …` scopes GitHub authentication to one child command.
+still inert until named. `tact` and Pi automatically run authenticated
+operations through `openai`; local version and help commands need no grant. Pi
+uses its upstream `openai-codex` default (`gpt-5.5`) without storing ChatGPT
+credentials in the Island. Its settings, extensions, and sessions remain normal
+persistent Island state. `github run -- gh …` scopes GitHub authentication to one child command.
 GitHub repository transport is deliberately SSH-only in this iteration and
 composes with `ssh-agent`; the GitHub Span does not grant a second Git HTTPS
 credential path. When `ssh-agent` is present, the Island configures Git and
