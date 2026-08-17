@@ -4,6 +4,8 @@ services:
     build:
       context: ${DEVC2_INSTALL_DIR:?set DEVC2_INSTALL_DIR}
       dockerfile: Dockerfile
+      labels:
+        dev.devc2.asset-digest: ${DEVC2_ASSET_DIGEST:-development}
     image: ${DEVC2_IMAGE:-devc2:local}
     working_dir: /workspace
     init: true
@@ -52,6 +54,9 @@ services:
     build:
       context: ${DEVC2_INSTALL_DIR:?set DEVC2_INSTALL_DIR}
       dockerfile: credential_proxy/Dockerfile
+      labels:
+        dev.devc2.asset-digest: ${DEVC2_ASSET_DIGEST:-development}
+    image: ${DEVC2_CREDENTIAL_IMAGE:-devc2-span-proxy:local}
     entrypoint: [python, -m, credential_proxy.span_bridge]
     command:
       - --config

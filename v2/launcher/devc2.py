@@ -14,6 +14,20 @@ SOURCE_ROOT=Path(__file__).resolve().parents[1]
 INSTALLED_ROOT=Path(os.environ.get("DEVC2_RUNTIME_ROOT",os.environ.get("DEVC2_SHARE_DIR",Path.home()/".local/share/devc2"))).expanduser().resolve()
 ROOT=INSTALLED_ROOT if (INSTALLED_ROOT/"compose.yaml").is_file() else SOURCE_ROOT
 
+def asset_digest(source):
+    digest=hashlib.sha256(); runtime_roots={"Dockerfile","compose.yaml","README.md","devbox","credential_proxy","launcher","spans"}
+    for path in sorted(p for p in source.rglob("*") if p.is_file()):
+        relative=path.relative_to(source)
+        if relative.parts[0] not in runtime_roots or "tests" in relative.parts or "__pycache__" in relative.parts: continue
+        name=str(relative).encode(); content=path.read_bytes()
+        digest.update(len(name).to_bytes(4,"big")); digest.update(name)
+        digest.update(len(content).to_bytes(8,"big")); digest.update(content)
+    return digest.hexdigest()
+
+ASSET_DIGEST=asset_digest(ROOT)
+IMAGE_LABEL="dev.devc2.asset-digest"
+IMAGE_TAG_SUFFIX=f"{VERSION}-{ASSET_DIGEST[:12]}"
+
 def xdg(name, default): return Path(os.environ.get(name, Path.home()/default)).expanduser()
 CONFIG=xdg("XDG_CONFIG_HOME", ".config")/"devc2"
 STATE=xdg("XDG_STATE_HOME", ".local/state")/"devc2"
@@ -21,8 +35,9 @@ AUTH=CONFIG/"auth"
 TACT_CONFIG=CONFIG/"tact"/"config.toml"
 SPAN_CATALOG=CONFIG/"spans.json"
 TACT_CONFIG_DEFAULT="[agent]\nmax_subagents = 8\n"
-RUNTIME_IMAGE=f"devc2:{VERSION}"
-AUTH_IMAGE=f"devc2-auth:{VERSION}"
+RUNTIME_IMAGE=f"devc2:{IMAGE_TAG_SUFFIX}"
+AUTH_IMAGE=f"devc2-auth:{IMAGE_TAG_SUFFIX}"
+CREDENTIAL_IMAGE=f"devc2-span-proxy:{IMAGE_TAG_SUFFIX}"
 INSTALL_STATE=STATE/"installation.json"
 INSTALL_LOCK=STATE/"install.lock"
 UPDATE_LOCK=STATE/"update.lock"
@@ -223,16 +238,6 @@ def replace_symlink(link,target):
         try: os.fsync(directory)
         finally: os.close(directory)
     finally: temporary.unlink(missing_ok=True)
-
-def asset_digest(source):
-    digest=hashlib.sha256(); runtime_roots={"Dockerfile","compose.yaml","README.md","devbox","credential_proxy","launcher","spans"}
-    for path in sorted(p for p in source.rglob("*") if p.is_file()):
-        relative=path.relative_to(source)
-        if relative.parts[0] not in runtime_roots or "tests" in relative.parts or "__pycache__" in relative.parts: continue
-        name=str(relative).encode(); content=path.read_bytes()
-        digest.update(len(name).to_bytes(4,"big")); digest.update(name)
-        digest.update(len(content).to_bytes(8,"big")); digest.update(content)
-    return digest.hexdigest()
 
 def installed_version(root):
     """Return a verified immutable install ID, or the embedded base version."""
@@ -655,28 +660,47 @@ def read_codex():
     except Exception as e: raise RuntimeError("ChatGPT access token is malformed") from e
     return access,account
 
+def bound_image_id(image):
+    inspected=run(["docker","image","inspect","--format","{{json .}}",image],check=False,timeout=15)
+    if inspected.returncode: return None
+    try:
+        document=json.loads(inspected.stdout)
+        image_id=document["Id"]
+        labels=document.get("Config",{}).get("Labels") or {}
+    except (TypeError,ValueError,KeyError): return None
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}",image_id) or labels.get(IMAGE_LABEL)!=ASSET_DIGEST:
+        return None
+    return image_id
+
+def require_bound_image(image):
+    image_id=bound_image_id(image)
+    if image_id is None: raise RuntimeError(f"Docker image failed devc2 content-identity verification: {image}")
+    return image_id
+
 def ensure_auth_image():
-    inspected=run(["docker","image","inspect",AUTH_IMAGE],check=False,timeout=15)
-    if inspected.returncode==0: return
+    image_id=bound_image_id(AUTH_IMAGE)
+    if image_id is not None: return image_id
     print(f"Building local devc2 authentication image {AUTH_IMAGE}…")
-    run(["docker","build","--target","auth","--tag",AUTH_IMAGE,str(ROOT)],capture=False,timeout=1800)
+    run(["docker","build","--target","auth","--label",f"{IMAGE_LABEL}={ASSET_DIGEST}","--tag",AUTH_IMAGE,str(ROOT)],capture=False,timeout=1800)
+    return require_bound_image(AUTH_IMAGE)
 
 def ensure_runtime_image():
-    inspected=run(["docker","image","inspect",RUNTIME_IMAGE],check=False,timeout=15)
-    if inspected.returncode==0: return
+    image_id=bound_image_id(RUNTIME_IMAGE)
+    if image_id is not None: return image_id
     print(f"Building local devc2 runtime image {RUNTIME_IMAGE}…")
-    run(["docker","build","--tag",RUNTIME_IMAGE,str(ROOT)],capture=False,timeout=1800)
+    run(["docker","build","--label",f"{IMAGE_LABEL}={ASSET_DIGEST}","--tag",RUNTIME_IMAGE,str(ROOT)],capture=False,timeout=1800)
+    return require_bound_image(RUNTIME_IMAGE)
 
 def github_token():
     managed = AUTH / "gh"
     if (managed / "hosts.yml").exists():
-        ensure_runtime_image()
+        runtime_image_id=ensure_runtime_image()
         value = run([
             "docker", "run", "--rm", "--pull=never", "--user", f"{os.getuid()}:{os.getgid()}",
             "--env", "HOME=/tmp", "--env", "GH_CONFIG_DIR=/run/devc2-gh",
             "--env", "GH_TOKEN=", "--env", "GITHUB_TOKEN=",
             "--volume", f"{managed}:/run/devc2-gh:ro",
-            "--entrypoint", "gh", RUNTIME_IMAGE, "auth", "token",
+            "--entrypoint", "gh", runtime_image_id, "auth", "token",
         ], timeout=30).stdout.strip()
     else:
         try:
@@ -818,7 +842,7 @@ def generate_relay_pki(root):
 def compose_env(repo,public,relay_tls_dir=None,span_client_dir=None,spans=False):
     digest,project=identity(repo)
     world_env=public/'world.env'
-    values={'DEVC2_PROJECT_NAME':project,'DEVC2_WORKSPACE':str(repo),'DEVC2_WORKSPACE_HASH':digest,'DEVC2_PUBLIC_DIR':str(public),'DEVC2_INSTALL_DIR':str(ROOT),'DEVC2_IMAGE':f'devc2:{VERSION}'}
+    values={'DEVC2_PROJECT_NAME':project,'DEVC2_WORKSPACE':str(repo),'DEVC2_WORKSPACE_HASH':digest,'DEVC2_PUBLIC_DIR':str(public),'DEVC2_INSTALL_DIR':str(ROOT),'DEVC2_IMAGE':RUNTIME_IMAGE,'DEVC2_CREDENTIAL_IMAGE':CREDENTIAL_IMAGE,'DEVC2_ASSET_DIGEST':ASSET_DIGEST}
     values['DEVC2_SPAN_RELAY_TLS_DIR']=str(relay_tls_dir or '/dev/null')
     values['DEVC2_SPAN_CLIENT_DIR']=str(span_client_dir or public)
     values['DEVC2_SPAN_VOLUME']=project+'-span-sockets-v2'
@@ -926,13 +950,19 @@ def _start_unlocked(repo, runtime_doctor=False, span_names=()):
                 build_services=['devbox']
                 if granted_spans: build_services.append('span-proxy')
                 compose(repo,env,'build',*build_services)
+                immutable_env=dict(env)
+                immutable_env['DEVC2_IMAGE']=require_bound_image(RUNTIME_IMAGE)
+                if granted_spans:
+                    immutable_env['DEVC2_CREDENTIAL_IMAGE']=require_bound_image(CREDENTIAL_IMAGE)
+                env=immutable_env
                 try:
-                    if granted_spans: compose(repo,env,'up','-d','span-proxy')
+                    if granted_spans: compose(repo,env,'up','--pull','never','--no-build','-d','span-proxy')
                 except RuntimeError:
                     print("devc2: sanitized startup diagnostics:",file=sys.stderr)
                     if granted_spans: compose(repo,env,'logs','--no-color','--tail','100','span-proxy',capture=False,check=False)
                     raise
                 command=compose_run_command(repo,worktree_override)
+                command.extend(['--pull','never','--no-build'])
                 if runtime_doctor: command.extend(['--env','DEVC2_RUNTIME_DOCTOR=1'])
                 command.append('devbox')
                 result=subprocess.run(command,env=env).returncode
@@ -1029,15 +1059,15 @@ def authenticate():
         return 0
 
     print("Preparing the pinned authentication image…")
-    ensure_auth_image()
+    auth_image_id=ensure_auth_image()
 
     if not codex_ready:
         print("Signing in to ChatGPT…")
         run([
-            "docker", "run", "--rm", "-it", "--user", f"{os.getuid()}:{os.getgid()}",
+            "docker", "run", "--rm", "--pull=never", "-it", "--user", f"{os.getuid()}:{os.getgid()}",
             "--env", "HOME=/tmp/devc2-login", "--env", "CODEX_HOME=/home/devbox/.codex",
             "--volume", f"{codex_home}:/home/devbox/.codex",
-            "--entrypoint", "codex", AUTH_IMAGE,
+            "--entrypoint", "codex", auth_image_id,
             "login", "--device-auth",
         ], capture=False, timeout=900)
         read_codex()
@@ -1050,11 +1080,11 @@ def authenticate():
         # --insecure-storage. The minimal container has no credential-store
         # helper, so gh falls back to the mounted hosts.yml file.
         run([
-            "docker", "run", "--rm", "-it", "--user", f"{os.getuid()}:{os.getgid()}",
+            "docker", "run", "--rm", "--pull=never", "-it", "--user", f"{os.getuid()}:{os.getgid()}",
             "--env", "HOME=/tmp", "--env", "GH_CONFIG_DIR=/run/devc2-gh",
             "--env", "GH_TOKEN=", "--env", "GITHUB_TOKEN=",
             "--volume", f"{gh_home}:/run/devc2-gh",
-            "--entrypoint", "gh", AUTH_IMAGE,
+            "--entrypoint", "gh", auth_image_id,
             "auth", "login", "--hostname", "github.com",
             "--git-protocol", "ssh", "--web",
         ], capture=False, timeout=900)

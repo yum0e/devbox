@@ -817,6 +817,7 @@ class LauncherGrantTests(unittest.TestCase):
              mock.patch.object(devc2, "generate_relay_pki", return_value=(relay_server, relay_client)), \
              mock.patch.object(devc2, "remove_span_volume"), \
              mock.patch.object(devc2, "compose", side_effect=lambda *args, **kwargs: calls.append(args)), \
+             mock.patch.object(devc2, "require_bound_image", side_effect=lambda image: "sha256:"+("1" if image==devc2.RUNTIME_IMAGE else "2")*64), \
              mock.patch.object(devc2.subprocess, "run", return_value=completed), \
              mock.patch.object(devc2.span_runtime, "load_catalog", return_value=[span] if names else []) as load_catalog, \
              mock.patch.object(devc2.span_runtime, "SpanRuntime", return_value=runtime) as start_runtime:
@@ -835,7 +836,7 @@ class LauncherGrantTests(unittest.TestCase):
             runtime.stop.assert_not_called()
             self.assertFalse((public / "spans.json").exists())
             self.assertEqual(calls[0][1].get("COMPOSE_PROFILES"),"spans")
-            self.assertNotIn("span-proxy", " ".join(str(part) for call in calls for part in call))
+            self.assertNotIn("span-proxy", " ".join(str(part) for call in calls for part in call[2:]))
 
     def test_explicit_grant_starts_and_stops_only_that_span(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -849,6 +850,9 @@ class LauncherGrantTests(unittest.TestCase):
             runtime.stop.assert_called_once()
             self.assertEqual(json.loads((public / "spans.json").read_text()), [{"name": "herdr", "port": 49153}])
             self.assertIn("span-proxy", " ".join(str(part) for call in calls for part in call))
+            up=next(call for call in calls if "up" in call)
+            self.assertIn("never",up)
+            self.assertIn("--no-build",up)
 
 
 if __name__ == "__main__":

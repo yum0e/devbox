@@ -10,6 +10,14 @@ def jwt(payload):
     body=base64.urlsafe_b64encode(json.dumps(payload,separators=(",",":")).encode()).decode().rstrip("=")
     return f"header.{body}.signature"
 
+IMAGE_ID="sha256:"+"1"*64
+
+def image_inspection(image_id=IMAGE_ID,digest=None):
+    return subprocess.CompletedProcess([],0,json.dumps({
+        "Id":image_id,
+        "Config":{"Labels":{D.IMAGE_LABEL:digest or D.ASSET_DIGEST}},
+    }),"")
+
 class CliTests(unittest.TestCase):
     def test_cli(self):
         self.assertEqual(D.parse_cli(["repo"]),("start","repo",False,()))
@@ -380,8 +388,9 @@ class AuthTests(unittest.TestCase):
         completed = subprocess.CompletedProcess([], 0, "", "")
         with tempfile.TemporaryDirectory() as td:
             auth = Path(td) / "auth"
+            inspections=iter([subprocess.CompletedProcess([],1,"",""),image_inspection()])
             def auth_run(argv,**_kwargs):
-                if argv[:3]==["docker","image","inspect"]: return subprocess.CompletedProcess(argv,1,"","")
+                if argv[:3]==["docker","image","inspect"]: return next(inspections)
                 return completed
             with mock.patch.object(D, "AUTH", auth), mock.patch.object(D, "require_docker"), mock.patch.object(D, "read_codex", side_effect=[RuntimeError("missing"), ("access", "account")]) as read_codex, mock.patch.object(D, "validate_github_token", return_value="user") as github_token, mock.patch.object(D, "select_key", side_effect=[RuntimeError("missing"), "ssh-key"]) as select_key, mock.patch.object(D, "run", side_effect=auth_run) as run, contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(D.authenticate(), 0)
@@ -390,18 +399,24 @@ class AuthTests(unittest.TestCase):
             self.assertEqual(select_key.call_args_list, [mock.call(False), mock.call(True)])
 
             commands = [call.args[0] for call in run.call_args_list]
-            self.assertEqual(len(commands), 5)
+            self.assertEqual(len(commands), 6)
             self.assertTrue(all(command[0] in {"docker", "gh"} for command in commands))
             self.assertEqual(commands[0], ["gh", "auth", "token"])
             self.assertEqual(commands[1][:3], ["docker", "image", "inspect"])
-            self.assertEqual(commands[2][:5], ["docker", "build", "--target", "auth", "--tag"])
-            self.assertEqual(commands[2][5], "devc2-auth:0.2.0")
-            self.assertIn(f"{auth / 'codex'}:/home/devbox/.codex", commands[3])
-            self.assertIn("codex", commands[3])
-            self.assertEqual(commands[3][-2:], ["login", "--device-auth"])
-            self.assertIn(f"{auth / 'gh'}:/run/devc2-gh", commands[4])
-            self.assertIn("gh", commands[4])
-            self.assertEqual(commands[4][-7:], ["auth", "login", "--hostname", "github.com", "--git-protocol", "ssh", "--web"])
+            self.assertEqual(commands[2][:5], ["docker", "build", "--target", "auth", "--label"])
+            self.assertIn(f"{D.IMAGE_LABEL}={D.ASSET_DIGEST}",commands[2])
+            self.assertIn(D.AUTH_IMAGE,commands[2])
+            self.assertEqual(commands[3][:3],["docker","image","inspect"])
+            self.assertIn(f"{auth / 'codex'}:/home/devbox/.codex", commands[4])
+            self.assertIn("codex", commands[4])
+            self.assertIn("--pull=never",commands[4])
+            self.assertIn(IMAGE_ID,commands[4])
+            self.assertEqual(commands[4][-2:], ["login", "--device-auth"])
+            self.assertIn(f"{auth / 'gh'}:/run/devc2-gh", commands[5])
+            self.assertIn("gh", commands[5])
+            self.assertIn("--pull=never",commands[5])
+            self.assertIn(IMAGE_ID,commands[5])
+            self.assertEqual(commands[5][-7:], ["auth", "login", "--hostname", "github.com", "--git-protocol", "ssh", "--web"])
             config = auth / "codex" / "config.toml"
             self.assertEqual(config.read_text(), 'cli_auth_credentials_store = "file"\n')
             self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o600)
@@ -428,16 +443,16 @@ class AuthTests(unittest.TestCase):
             gh = auth / "gh"
             gh.mkdir(parents=True)
             (gh / "hosts.yml").write_text("github.com: {}\n")
-            inspected=subprocess.CompletedProcess([],0,"","")
+            inspected=image_inspection()
             with mock.patch.object(D, "AUTH", auth), mock.patch.object(D, "run", side_effect=[inspected,completed]) as run:
                 self.assertEqual(D.github_token(), "managed-token")
-            self.assertEqual(run.call_args_list[0].args[0],["docker","image","inspect",D.RUNTIME_IMAGE])
+            self.assertEqual(run.call_args_list[0].args[0],["docker","image","inspect","--format","{{json .}}",D.RUNTIME_IMAGE])
             self.assertEqual(run.call_args_list[1],mock.call([
                 "docker", "run", "--rm", "--pull=never", "--user", f"{os.getuid()}:{os.getgid()}",
                 "--env", "HOME=/tmp", "--env", "GH_CONFIG_DIR=/run/devc2-gh",
                 "--env", "GH_TOKEN=", "--env", "GITHUB_TOKEN=",
                 "--volume", f"{gh}:/run/devc2-gh:ro",
-                "--entrypoint", "gh", D.RUNTIME_IMAGE, "auth", "token",
+                "--entrypoint", "gh", IMAGE_ID, "auth", "token",
             ], timeout=30))
 
     def test_host_gh_login_is_atomically_imported_for_the_span(self):
@@ -487,6 +502,8 @@ class AuthTests(unittest.TestCase):
                 if argv[0] == "gh":
                     raise RuntimeError("host gh unavailable")
                 self.assertEqual(argv[0], "docker", f"unexpected host command: {argv}")
+                if argv[:3] == ["docker","image","inspect"]:
+                    return image_inspection()
                 if "--entrypoint" in argv and "codex" in argv:
                     (auth / "codex" / "auth.json").write_text(D.json.dumps({
                         "tokens": {"access_token": access, "account_id": "bootstrapped"}
@@ -545,10 +562,40 @@ class ComposeEnvironmentTests(unittest.TestCase):
             )
         self.assertEqual(result["DEVC2_SPAN_RELAY_TLS_DIR"], "/tmp/span-tls")
         self.assertEqual(result["DEVC2_SPAN_CLIENT_DIR"], "/tmp/span-clients")
+        self.assertEqual(result["DEVC2_IMAGE"],D.RUNTIME_IMAGE)
+        self.assertEqual(result["DEVC2_CREDENTIAL_IMAGE"],D.CREDENTIAL_IMAGE)
+        self.assertEqual(result["DEVC2_ASSET_DIGEST"],D.ASSET_DIGEST)
         self.assertRegex(result["DEVC2_SPAN_VOLUME"], r"^devc2-[0-9a-f]{16}-span-sockets-v2$")
         self.assertEqual(result["COMPOSE_PROFILES"], "spans")
         for name in ambient:
             self.assertNotIn(name, result)
+
+    def test_compose_preserves_local_defaults_and_labels_managed_builds(self):
+        raw=(PATH.parents[1]/"compose.yaml").read_text()
+        self.assertIn("${DEVC2_IMAGE:-devc2:local}",raw)
+        self.assertIn("${DEVC2_CREDENTIAL_IMAGE:-devc2-span-proxy:local}",raw)
+        self.assertEqual(raw.count("dev.devc2.asset-digest: ${DEVC2_ASSET_DIGEST:-development}"),2)
+
+class ImageIdentityTests(unittest.TestCase):
+    def test_managed_image_names_and_inspection_are_digest_bound(self):
+        self.assertTrue(D.RUNTIME_IMAGE.endswith(D.ASSET_DIGEST[:12]))
+        self.assertTrue(D.AUTH_IMAGE.endswith(D.ASSET_DIGEST[:12]))
+        self.assertTrue(D.CREDENTIAL_IMAGE.endswith(D.ASSET_DIGEST[:12]))
+        with mock.patch.object(D,"run",return_value=image_inspection()) as run:
+            self.assertEqual(D.require_bound_image(D.RUNTIME_IMAGE),IMAGE_ID)
+        self.assertEqual(run.call_args.args[0],["docker","image","inspect","--format","{{json .}}",D.RUNTIME_IMAGE])
+        with mock.patch.object(D,"run",return_value=image_inspection(digest="0"*64)):
+            with self.assertRaisesRegex(RuntimeError,"content-identity verification"):
+                D.require_bound_image(D.RUNTIME_IMAGE)
+
+    def test_runtime_build_is_labeled_then_resolved_to_immutable_id(self):
+        missing=subprocess.CompletedProcess([],1,"","")
+        with mock.patch.object(D,"run",side_effect=[missing,subprocess.CompletedProcess([],0,"",""),image_inspection()]) as run, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(D.ensure_runtime_image(),IMAGE_ID)
+        build=run.call_args_list[1].args[0]
+        self.assertEqual(build[:2],["docker","build"])
+        self.assertIn(f"{D.IMAGE_LABEL}={D.ASSET_DIGEST}",build)
+        self.assertIn(D.RUNTIME_IMAGE,build)
 
     def test_span_socket_volume_removal_is_exact_and_verified(self):
         removed=subprocess.CompletedProcess([],0,"","")
