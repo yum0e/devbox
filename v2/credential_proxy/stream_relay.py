@@ -44,6 +44,14 @@ def duplex_stream(
         receive_wants_write[peers[connection]] = False
         send_wants_read[connection] = False
 
+    def failed_write(connection: socket.socket) -> None:
+        # TLS does not expose a safe independent write half after a transport
+        # failure; retaining it can leave a relay permanently half-open.
+        if isinstance(connection, ssl.SSLSocket):
+            retire(connection)
+        else:
+            retire_write(connection)
+
     def refresh(connection: socket.socket) -> None:
         if connection.fileno() < 0:
             return
@@ -103,11 +111,11 @@ def duplex_stream(
         except BlockingIOError:
             return
         except ConnectionError:
-            retire_write(connection)
+            failed_write(connection)
             return
         send_wants_read[connection] = False
         if sent == 0:
-            retire_write(connection)
+            failed_write(connection)
             return
         del pending[connection][:sent]
 

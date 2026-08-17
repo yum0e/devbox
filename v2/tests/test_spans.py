@@ -28,6 +28,33 @@ COMMAND_PROJECTION = V2_ROOT / "launcher" / "command_projection.py"
 SCOPED_EXEC_PROJECTION = V2_ROOT / "launcher" / "scoped_exec_projection.py"
 
 
+class BrokenSendSocket:
+    def __init__(self, connection, failed):
+        self.connection, self.failed = connection, failed
+
+    def fileno(self):
+        return self.connection.fileno()
+
+    def setblocking(self, value):
+        self.connection.setblocking(value)
+
+    def recv(self, size):
+        return self.connection.recv(size)
+
+    def send(self, _payload):
+        self.failed.set()
+        raise BrokenPipeError()
+
+    def shutdown(self, how):
+        self.connection.shutdown(how)
+
+    def pending(self):
+        return 0
+
+    def close(self):
+        self.connection.close()
+
+
 class SpanCatalogTests(unittest.TestCase):
     def load(self,catalog: Path,names: tuple[str,...],workspace: Path | None = None):
         snapshot=Path(tempfile.mkdtemp(prefix="span-snapshot-"))
@@ -499,30 +526,7 @@ class ProviderLifecycleTests(unittest.TestCase):
         write_failed = threading.Event()
         errors = []
 
-        class BrokenWriter:
-            def __init__(self, connection):
-                self.connection = connection
-
-            def fileno(self):
-                return self.connection.fileno()
-
-            def setblocking(self, value):
-                self.connection.setblocking(value)
-
-            def recv(self, size):
-                return self.connection.recv(size)
-
-            def send(self, _payload):
-                write_failed.set()
-                raise BrokenPipeError()
-
-            def shutdown(self, how):
-                self.connection.shutdown(how)
-
-            def close(self):
-                self.connection.close()
-
-        relay_left = BrokenWriter(raw_relay_left)
+        relay_left = BrokenSendSocket(raw_relay_left, write_failed)
 
         def relay():
             try:
@@ -540,6 +544,35 @@ class ProviderLifecycleTests(unittest.TestCase):
             self.assertEqual(world.recv(16), b"reverse survives")
             island.shutdown(socket.SHUT_WR)
             world.shutdown(socket.SHUT_WR)
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+        finally:
+            stopping.set()
+            for connection in (island, relay_left, relay_right, world):
+                connection.close()
+            thread.join(2)
+
+    def test_duplex_relay_fully_retires_a_failed_tls_stream(self):
+        island, raw_relay_left = socket.socketpair()
+        relay_right, world = socket.socketpair()
+        stopping = threading.Event()
+        write_failed = threading.Event()
+        errors = []
+        relay_left = BrokenSendSocket(raw_relay_left, write_failed)
+
+        def relay():
+            try:
+                with mock.patch.object(span_bridge.ssl, "SSLSocket", BrokenSendSocket):
+                    span_bridge.duplex_stream(relay_left, relay_right, stopping)
+            except Exception as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=relay, daemon=True)
+        thread.start()
+        try:
+            world.sendall(b"undeliverable TLS bytes")
+            self.assertTrue(write_failed.wait(2))
             thread.join(2)
             self.assertFalse(thread.is_alive())
             self.assertEqual(errors, [])
