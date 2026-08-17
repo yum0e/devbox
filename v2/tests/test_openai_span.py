@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import importlib.machinery
 import importlib.util
 import json
@@ -114,13 +115,21 @@ class WorldTests(unittest.TestCase):
         })
 
     def test_connect_scope_is_exact_and_rejects_header_ambiguity(self):
-        accepted = b"CONNECT chatgpt.com:443 HTTP/1.1\r\nHost: chatgpt.com:443\r\n\r\nopaque"
-        left, right = socket.socketpair()
-        with left, right:
-            right.sendall(accepted)
-            request, trailing = P.read_connect(left)
-        self.assertTrue(request.endswith(b"\r\n\r\n"))
-        self.assertEqual(trailing, b"opaque")
+        accepted = (
+            (b"CONNECT chatgpt.com:443 HTTP/1.1\r\n"
+             b"Host: chatgpt.com:443\r\n\r\nopaque", b"opaque"),
+            (b"CONNECT chatgpt.com:443 HTTP/1.1\r\n"
+             b"host: chatgpt.com\r\nconnection: close\r\n"
+             b"proxy-connection: keep-alive\r\n\r\n", b""),
+        )
+        for payload, expected_trailing in accepted:
+            with self.subTest(payload=payload):
+                left, right = socket.socketpair()
+                with left, right:
+                    right.sendall(payload)
+                    request, trailing = P.read_connect(left)
+                self.assertTrue(request.endswith(b"\r\n\r\n"))
+                self.assertEqual(trailing, expected_trailing)
 
         rejected = (
             b"CONNECT api.openai.com:443 HTTP/1.1\r\n\r\n",
@@ -136,6 +145,22 @@ class WorldTests(unittest.TestCase):
                     right.sendall(payload)
                     with self.assertRaises(P.ProviderError):
                         P.read_connect(left)
+
+    def test_invalid_tunnel_returns_a_bounded_proxy_error(self):
+        client, world = socket.socketpair()
+        manager = mock.Mock()
+        worker = threading.Thread(target=P.handle, args=(world, manager))
+        worker.start()
+        with client:
+            client.sendall(
+                b"TCONNECT other.example:443 HTTP/1.1\r\n"
+                b"Host: other.example:443\r\n\r\n"
+            )
+            response = client.recv(4096)
+        worker.join(timeout=1)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(response.startswith(b"HTTP/1.1 400 Bad Request\r\n"))
+        manager.get.assert_not_called()
 
     def test_lazy_helper_is_pinned_hardened_scoped_and_contains_secrets_only_in_files(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -240,11 +265,23 @@ class WorldTests(unittest.TestCase):
         auth = json.loads(C.base64.b64decode(result["files"][0]["contents_b64"]))
         self.assertEqual(auth["tokens"]["access_token"], P.FAKE_ACCESS)
         self.assertEqual(auth["tokens"]["account_id"], P.FAKE_ACCOUNT)
+        self.assertEqual(result["environment"]["DEVC2_PI_OPENAI_TOKEN"], P.FAKE_ACCESS)
+        access_claims = json.loads(base64.urlsafe_b64decode(
+            auth["tokens"]["access_token"].split(".")[1] + "=="
+        ))
+        self.assertEqual(
+            access_claims["https://api.openai.com/auth"]["chatgpt_account_id"],
+            P.FAKE_ACCOUNT,
+        )
         self.assertNotIn(b"PRIVATE KEY", json.dumps(result).encode())
         self.assertEqual(result["routes"], ["chatgpt.com:443"])
 
 
 class ScopedExecLinkTests(unittest.TestCase):
+    def test_adapter_has_bounded_headroom_for_parallel_package_restores(self):
+        self.assertGreaterEqual(C.MAX_HANDLERS, 32)
+        self.assertLessEqual(C.MAX_HANDLERS, 128)
+
     def manifest(self):
         return (
             b"public-ca",
@@ -254,6 +291,7 @@ class ScopedExecLinkTests(unittest.TestCase):
                 "TACT_AUTH_FILE": "${ROOT}/auth.json",
                 "CODEX_HOME": "${ROOT}/codex",
                 "SSL_CERT_FILE": "${CA}",
+                "DEVC2_PI_OPENAI_TOKEN": P.FAKE_ACCESS,
             },
             {"chatgpt.com:443"},
         )
@@ -314,6 +352,7 @@ class ScopedExecLinkTests(unittest.TestCase):
         self.assertEqual(seen["routes"], {"chatgpt.com:443"})
         self.assertEqual(seen["env"]["HOME"], "/island/home")
         self.assertEqual(seen["env"]["HTTPS_PROXY"], FakeAdapter.url)
+        self.assertEqual(seen["env"]["DEVC2_PI_OPENAI_TOKEN"], P.FAKE_ACCESS)
         self.assertEqual(json.loads(seen["auth"])["tokens"]["access_token"], P.FAKE_ACCESS)
         self.assertEqual(seen["mode"], 0o600)
         self.assertTrue(seen["closed"])

@@ -20,7 +20,8 @@ HEADER = struct.Struct("!I")
 FRAME = struct.Struct("!cI")
 MAX_REQUEST = 64 * 1024
 MAX_ARGV_BYTES = 16 * 1024
-MARKER = re.compile(r"__DEVC2_HERDR_[0-9a-f]{32}_EXIT_")
+TOKEN = re.compile(r"[0-9a-f]{32}")
+CLEAR_TERMINAL = b"\x1b[2J\x1b[3J\x1b[H"
 
 
 class WorkerError(RuntimeError):
@@ -34,17 +35,17 @@ def decode(raw: str) -> dict:
         document = json.loads(base64.urlsafe_b64decode(raw.encode()))
     except (ValueError, json.JSONDecodeError) as error:
         raise WorkerError("invalid worker payload") from error
-    if not isinstance(document, dict) or set(document) != {"socket", "argv", "marker"}:
+    if not isinstance(document, dict) or set(document) != {"socket", "argv", "token"}:
         raise WorkerError("invalid worker payload")
-    path, argv, marker = document["socket"], document["argv"], document["marker"]
+    path, argv, token = document["socket"], document["argv"], document["token"]
     if not isinstance(path, str) or not Path(path).is_absolute() or "\0" in path:
         raise WorkerError("invalid worker Link")
     if (not isinstance(argv, list) or not argv or len(argv) > 64
             or not all(isinstance(item, str) and "\0" not in item for item in argv)
             or sum(len(item.encode()) for item in argv) > MAX_ARGV_BYTES):
         raise WorkerError("invalid worker argv")
-    if not isinstance(marker, str) or MARKER.fullmatch(marker) is None:
-        raise WorkerError("invalid worker marker")
+    if not isinstance(token, str) or TOKEN.fullmatch(token) is None:
+        raise WorkerError("invalid worker token")
     return document
 
 
@@ -63,29 +64,9 @@ def park() -> None:
         threading.Event().wait(3600)
 
 
-def failed(marker: str, error: Exception) -> None:
-    print(f"\r\n{marker.replace('_EXIT_', '_START_', 1)}", flush=True)
+def failed(error: Exception) -> None:
+    os.write(1, CLEAR_TERMINAL)
     print(f"worker Link: {error}", file=sys.stderr, flush=True)
-    print(f"\r\n{marker}125", flush=True)
-
-
-def ready_marker(marker: str) -> bytes:
-    return marker.replace("_EXIT_", "_READY_", 1).encode()
-
-
-def receive_ready(marker: str) -> None:
-    expected = ready_marker(marker)
-    received = bytearray()
-    while len(received) <= len(expected):
-        byte = os.read(0, 1)
-        if not byte:
-            raise WorkerError("worker readiness ended early")
-        if byte in (b"\r", b"\n"):
-            if bytes(received) == expected:
-                return
-            break
-        received.extend(byte)
-    raise WorkerError("invalid worker readiness")
 
 
 def receive(connection: socket.socket, size: int) -> bytes:
@@ -98,6 +79,16 @@ def receive(connection: socket.socket, size: int) -> bytes:
     return bytes(result)
 
 
+def terminal_size() -> tuple[int, int]:
+    try:
+        size = os.get_terminal_size(0)
+    except OSError:
+        return 24, 80
+    rows = size.lines if 1 <= size.lines <= 1000 else 24
+    columns = size.columns if 1 <= size.columns <= 1000 else 80
+    return rows, columns
+
+
 def run(raw: str) -> int:
     document = decode(raw)
     connection = None
@@ -105,20 +96,26 @@ def run(raw: str) -> int:
         path = checked_socket(document["socket"])
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         connection.connect(os.fspath(path))
-        request = json.dumps({"argv": document["argv"]}, separators=(",", ":")).encode()
+        rows, columns = terminal_size()
+        request = json.dumps(
+            {
+                "argv": document["argv"], "token": document["token"],
+                "rows": rows, "columns": columns,
+            },
+            separators=(",", ":"),
+        ).encode()
         if len(request) > MAX_REQUEST:
             raise WorkerError("worker request exceeds 64 KiB")
         connection.sendall(HEADER.pack(len(request)) + request)
     except (OSError, WorkerError) as error:
         if connection is not None:
             connection.close()
-        failed(document["marker"], error)
+        failed(error)
         park()
 
     saved = termios.tcgetattr(0) if os.isatty(0) else None
     if saved is not None:
         tty.setraw(0)
-    print(f"\r\n{document['marker'].replace('_EXIT_', '_START_', 1)}", flush=True)
     stopping = threading.Event()
 
     def send_input() -> None:
@@ -134,7 +131,10 @@ def run(raw: str) -> int:
 
     try:
         try:
-            receive_ready(document["marker"])
+            kind, size = FRAME.unpack(receive(connection, FRAME.size))
+            if kind != b"S" or size != 0:
+                raise WorkerError("Agent did not confirm private readiness")
+            os.write(1, CLEAR_TERMINAL)
             thread = threading.Thread(target=send_input, daemon=True)
             thread.start()
             while True:
@@ -145,13 +145,11 @@ def run(raw: str) -> int:
                         view = view[os.write(1, view):]
                     continue
                 if kind == b"E" and size == 1:
-                    code = receive(connection, 1)[0]
-                    print(f"\r\n{document['marker']}{code}", flush=True)
+                    receive(connection, 1)
                     break
                 raise WorkerError("invalid Agent frame")
         except (OSError, WorkerError) as error:
             print(f"worker Link: {error}", file=sys.stderr, flush=True)
-            print(f"\r\n{document['marker']}125", flush=True)
     finally:
         stopping.set()
         connection.close()

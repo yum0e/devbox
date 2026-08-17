@@ -35,7 +35,11 @@ MAX_ENV_NAME = 255
 MAX_ENV_VALUE = 64 * 1024
 MAX_ROUTES = 16
 MAX_PROXY_HEADERS = 16 * 1024
-MAX_HANDLERS = 16
+# The scoped child inherits this adapter for all HTTPS traffic, including
+# ordinary package restores forwarded to the Island's existing proxy. Package
+# clients can open 16 registry tunnels while the projected command retains
+# several long-lived tunnels, so keep bounded headroom above that baseline.
+MAX_HANDLERS = 64
 MAX_PENDING = 1024 * 1024
 CHUNK = 64 * 1024
 

@@ -85,9 +85,11 @@ RUN set -eux; \
     jj --version
 
 COPY devbox/entrypoint.sh /usr/local/bin/devc2-entrypoint
+COPY devbox/configure-pi.sh /usr/local/libexec/devc2/configure-pi
 COPY devbox/github-known-hosts /etc/ssh/ssh_known_hosts
 COPY devbox/pi-wrapper.sh /usr/local/share/pnpm/bin/pi
 RUN chmod 0755 /usr/local/bin/devc2-entrypoint /usr/local/bin/tact /usr/local/libexec/devc2/tact-upstream \
+      /usr/local/libexec/devc2/configure-pi \
       /usr/local/share/pnpm/bin/pi /usr/local/share/pnpm/bin/pi-upstream \
  && groupadd --gid 1000 devbox \
  && useradd --uid 1000 --gid devbox --create-home --shell /bin/zsh devbox \

@@ -4,6 +4,7 @@ import base64
 import importlib.machinery
 import importlib.util
 import json
+import os
 import shlex
 import socket
 import stat
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import zipfile
 from pathlib import Path
@@ -25,6 +27,7 @@ REGISTER = EXAMPLE / "register.py"
 AGENT_PATH = EXAMPLE / "docker_agent.py"
 WORKER_PATH = EXAMPLE / "worker_link.py"
 BUNDLE_PATH = EXAMPLE / "bundle.py"
+SUPERVISOR_PATH = EXAMPLE / "island_supervisor.py"
 
 
 def load(path: Path, name: str):
@@ -37,6 +40,7 @@ def load(path: Path, name: str):
 
 
 H = load(PROVIDER_PATH, "herdr_span_example")
+S = load(EXAMPLE / "island_supervisor.py", "island_supervisor")
 D = load(AGENT_PATH, "herdr_docker_agent")
 W = load(WORKER_PATH, "herdr_worker_link")
 sys.modules.update({"herdr_world": H, "docker_agent": D, "worker_link": W})
@@ -47,13 +51,31 @@ class FakeHerdr:
     def __init__(self):
         self.calls = []
         self.output = ""
+        self.panes = {
+            "w1:p1": "terminal-anchor",
+            "w1:p2": "terminal-new",
+        }
+        self.world = None
 
     def call(self, method, params, timeout=10):
         self.calls.append((method, params, timeout))
         if method == "pane.split":
+            self.panes["w1:p2"] = "terminal-new"
             return {"pane": {"pane_id": "w1:p2", "terminal_id": "terminal-new"}}
         if method == "pane.get":
-            return {"pane": {"pane_id": params["pane_id"], "terminal_id": "terminal-new"}}
+            pane_id = params["pane_id"]
+            if pane_id not in self.panes:
+                raise H.HerdrRejected("not_found", "pane not found")
+            return {"pane": {"pane_id": pane_id, "terminal_id": self.panes[pane_id]}}
+        if method == "pane.close":
+            self.panes.pop(params["pane_id"], None)
+            return {"type": "ok"}
+        if method == "pane.send_input" and self.world is not None:
+            with self.world.status_condition:
+                pending = [job for job in self.world.tokens.values() if not job.started]
+                if pending:
+                    pending[-1].started = True
+                    self.world.status_condition.notify_all()
         if method == "pane.read":
             return {"read": {"text": self.output}}
         if method == "pane.wait_for_output":
@@ -69,8 +91,13 @@ def provider() -> H.World:
     item.worker_socket = Path("/private/worker.sock")
     item.jobs = {}
     item.owned = {}
+    item.tokens = {}
     item.lock = threading.RLock()
+    item.status_condition = threading.Condition(item.lock)
     item.stopping = threading.Event()
+    item.status = mock.Mock()
+    item.status_thread = mock.Mock()
+    item.herdr.world = item
     return item
 
 
@@ -86,12 +113,14 @@ class WorldAuthorityTests(unittest.TestCase):
         self.assertEqual(H.Herdr(Path("/host/herdr.sock")).path, "/host/herdr.sock")
 
     def test_upstream_validation_is_lazy_retryable_and_nonfatal(self):
+        status_world, status_agent = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
         environment = {
             "HERDR_ENV": "1",
             "HERDR_SOCKET_PATH": "/host/herdr.sock",
             "HERDR_PANE_ID": "w1:p1",
             "DEVC2_HERDR_WORKER": "/trusted/herdr-span",
             "DEVC2_HERDR_WORKER_SOCKET": "/private/worker.sock",
+            "DEVC2_HERDR_STATUS_FD": str(status_world.detach()),
         }
         responses = [H.SpanError("Herdr is offline"), {"pane": {"pane_id": "w1:p1"}}]
         with mock.patch.dict(H.os.environ, environment, clear=True), \
@@ -103,6 +132,8 @@ class WorldAuthorityTests(unittest.TestCase):
             with self.assertRaisesRegex(H.SpanError, "offline"):
                 item.handle({"op": "list"})
             self.assertEqual(item.handle({"op": "list"}), [])
+            item.cleanup()
+        status_agent.close()
 
     def test_spawn_constructs_only_a_worker_invocation(self):
         item = provider()
@@ -115,24 +146,50 @@ class WorldAuthorityTests(unittest.TestCase):
         self.assertEqual(method, "pane.send_input")
         self.assertEqual(params["pane_id"], "w1:p2")
         self.assertEqual(params["keys"], ["Enter"])
+        self.assertTrue(params["text"].startswith("printf '\\033[2J\\033[3J\\033[H'; exec "))
         host_argv = shlex.split(params["text"])
-        self.assertEqual(host_argv[:4], ["exec", "/usr/bin/env", "-i", "PATH=/usr/local/bin:/usr/bin:/bin"])
+        exec_index = host_argv.index("exec")
+        self.assertEqual(host_argv[exec_index:exec_index + 4], [
+            "exec", "/usr/bin/env", "-i", "PATH=/usr/local/bin:/usr/bin:/bin",
+        ])
         self.assertEqual(host_argv[-3:-1], ["/trusted/herdr-span", "worker"])
         task = W.decode(host_argv[-1])
         self.assertEqual(task["socket"], "/private/worker.sock")
         self.assertEqual(task["argv"], argv)
-        self.assertRegex(task["marker"], r"^__DEVC2_HERDR_[0-9a-f]{32}_EXIT_$")
+        self.assertRegex(task["token"], r"^[0-9a-f]{32}$")
         self.assertEqual(item.herdr.calls[2][0], "pane.rename")
-        self.assertEqual(item.herdr.calls[3][0], "pane.wait_for_output")
-        self.assertEqual(item.herdr.calls[3][1]["match"]["value"], H.start_marker(task["marker"]))
-        self.assertEqual(item.herdr.calls[4], (
-            "pane.send_input",
-            {"pane_id": "w1:p2", "text": H.ready_marker(task["marker"]), "keys": ["Enter"]},
-            10,
-        ))
+        self.assertNotIn("pane.wait_for_output", [call[0] for call in item.herdr.calls])
         self.assertTrue(item.jobs["reviewer"].started)
         self.assertEqual(set(item.jobs), {"reviewer"})
         self.assertEqual(set(item.owned), {"w1:p2"})
+
+    def test_private_status_channel_drives_lifecycle_without_terminal_markers(self):
+        item = provider()
+        world_status, agent_status = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+        item.status = world_status
+        item.status.settimeout(0.05)
+        job = H.Job("worker", "w1:p2", "terminal-new", "6" * 32)
+        item.jobs[job.name] = job
+        item.owned[job.pane_id] = job
+        item.tokens[job.token] = job
+        thread = threading.Thread(target=item.receive_status)
+        thread.start()
+        try:
+            agent_status.send(H.STATUS.pack(b"R", job.token.encode(), 0))
+            deadline = time.monotonic() + 1
+            while not job.started and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(job.started)
+            agent_status.send(H.STATUS.pack(b"E", job.token.encode(), 23))
+            deadline = time.monotonic() + 1
+            while job.exit_code is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(job.exit_code, 23)
+        finally:
+            item.stopping.set()
+            world_status.close()
+            agent_status.close()
+            thread.join(1)
 
     def test_spawn_rolls_back_a_split_when_submission_fails(self):
         item = provider()
@@ -152,18 +209,18 @@ class WorldAuthorityTests(unittest.TestCase):
 
     def test_failed_spawn_keeps_only_private_cleanup_authority_when_close_fails(self):
         item = provider()
+        item.herdr.world = None
         original = item.herdr.call
 
         def fail(method, params, timeout=10):
-            if method == "pane.wait_for_output":
-                raise H.SpanError("startup failed")
             if method == "pane.close":
                 raise H.SpanError("close failed")
             return original(method, params, timeout)
 
         item.herdr.call = fail
-        with self.assertRaisesRegex(H.SpanError, "startup failed"):
-            item.spawn({"op": "spawn", "name": "worker", "argv": ["true"]})
+        with mock.patch.object(H, "START_TIMEOUT_MS", 1), \
+             self.assertRaisesRegex(H.SpanError, "private readiness"):
+                item.spawn({"op": "spawn", "name": "worker", "argv": ["true"]})
         self.assertFalse(item.jobs)
         self.assertEqual(set(item.owned), {"w1:p2"})
 
@@ -192,30 +249,19 @@ class WorldAuthorityTests(unittest.TestCase):
 
     def test_wait_returns_the_worker_exit_code(self):
         item = provider()
-        marker = "__DEVC2_HERDR_" + "1" * 32 + "_EXIT_"
-        item.jobs["tests"] = H.Job("tests", "w1:p2", "terminal-new", marker)
-        item.herdr.output = f"some output\n{marker}17\n"
+        item.jobs["tests"] = H.Job("tests", "w1:p2", "terminal-new", "1" * 32, exit_code=17)
         self.assertEqual(item.handle({"op": "wait", "name": "tests", "timeout_ms": 1000}), {"exit_code": 17})
 
     def test_read_returns_only_worker_output(self):
         item = provider()
-        marker = "__DEVC2_HERDR_" + "5" * 32 + "_EXIT_"
-        item.jobs["clean"] = H.Job("clean", "w1:p2", "terminal-new", marker)
-        item.herdr.output = (
-            "exec /private/host/herdr worker PRIVATE_PAYLOAD\n"
-            "devbox ➜ exec /private/host/herdr worker PRIVATE_PAYLOAD\n"
-            f"{H.start_marker(marker)}\n"
-            "worker output\n"
-            f"{marker}0\n"
-        )
+        item.jobs["clean"] = H.Job("clean", "w1:p2", "terminal-new", "5" * 32, started=True)
+        item.herdr.output = "worker output\n"
         self.assertEqual(item.handle({"op": "read", "name": "clean", "lines": 10}), "worker output\n")
         self.assertNotIn("PRIVATE_PAYLOAD", item.handle({"op": "read", "name": "clean", "lines": 10}))
 
     def test_finished_worker_rejects_input(self):
         item = provider()
-        marker = "__DEVC2_HERDR_" + "2" * 32 + "_EXIT_"
-        item.jobs["done"] = H.Job("done", "w1:p2", "terminal-new", marker)
-        item.herdr.output = marker + "0"
+        item.jobs["done"] = H.Job("done", "w1:p2", "terminal-new", "2" * 32, exit_code=0)
         with self.assertRaisesRegex(H.SpanError, "has exited"):
             item.handle({"op": "send", "name": "done", "text": "touch /tmp/host"})
 
@@ -227,7 +273,8 @@ class WorldAuthorityTests(unittest.TestCase):
         self.assertIsNone(item.handle({"op": "close", "name": "done"}))
         self.assertFalse(item.jobs)
         self.assertFalse(item.owned)
-        self.assertEqual(item.herdr.calls[-1][:2], ("pane.close", {"pane_id": "w1:p2"}))
+        self.assertEqual(item.herdr.calls[-2][0], "pane.close")
+        self.assertEqual(item.herdr.calls[-1][:2], ("pane.get", {"pane_id": "w1:p2"}))
 
     def test_close_failure_retains_public_and_cleanup_ownership(self):
         item = provider()
@@ -244,6 +291,26 @@ class WorldAuthorityTests(unittest.TestCase):
         item.herdr.call = fail
         with self.assertRaisesRegex(H.SpanError, "close failed"):
             item.handle({"op": "close", "name": "live"})
+        self.assertIs(item.jobs["live"], job)
+        self.assertIs(item.owned["w1:p2"], job)
+
+    def test_close_success_without_disappearance_retains_ownership(self):
+        item = provider()
+        job = H.Job("live", "w1:p2", "terminal-new", "__DEVC2_HERDR_" + "c" * 32 + "_EXIT_")
+        item.jobs[job.name] = job
+        item.owned[job.pane_id] = job
+        original = item.herdr.call
+
+        def acknowledge_without_closing(method, params, timeout=10):
+            if method == "pane.close":
+                return {"type": "ok"}
+            return original(method, params, timeout)
+
+        item.herdr.call = acknowledge_without_closing
+        with mock.patch.object(H.time, "sleep", return_value=None), \
+             mock.patch.object(H.time, "monotonic", side_effect=[0, 0, 3]):
+            with self.assertRaisesRegex(H.SpanError, "close was not confirmed"):
+                item.handle({"op": "close", "name": "live"})
         self.assertIs(item.jobs["live"], job)
         self.assertIs(item.owned["w1:p2"], job)
 
@@ -265,6 +332,29 @@ class WorldAuthorityTests(unittest.TestCase):
             return original(method, params, timeout)
 
         item.herdr.call = lose_response
+        self.assertIsNone(item.handle({"op": "close", "name": "gone"}))
+        self.assertTrue(job.closed)
+        self.assertFalse(item.jobs)
+        self.assertFalse(item.owned)
+
+    def test_close_accepts_herdrs_pane_specific_not_found_code(self):
+        item = provider()
+        job = H.Job("gone", "w1:p2", "terminal-new", "8" * 32)
+        item.jobs[job.name] = job
+        item.owned[job.pane_id] = job
+        original = item.herdr.call
+        closed = False
+
+        def close_then_report_missing(method, params, timeout=10):
+            nonlocal closed
+            if method == "pane.close":
+                closed = True
+                return {"type": "ok"}
+            if method == "pane.get" and params["pane_id"] == job.pane_id and closed:
+                raise H.HerdrRejected("pane_not_found", f"pane {job.pane_id} not found")
+            return original(method, params, timeout)
+
+        item.herdr.call = close_then_report_missing
         self.assertIsNone(item.handle({"op": "close", "name": "gone"}))
         self.assertTrue(job.closed)
         self.assertFalse(item.jobs)
@@ -367,21 +457,20 @@ class WorldAuthorityTests(unittest.TestCase):
         item.spawn({"op": "spawn", "name": "starting", "argv": ["sh"]})
         self.assertIsNone(item.handle({"op": "send", "name": "starting", "text": "hello"}))
         methods = [call[0] for call in item.herdr.calls]
-        wait = methods.index("pane.wait_for_output")
         sent = len(methods) - 1
         self.assertEqual(methods[sent], "pane.send_input")
-        self.assertLess(wait, sent)
-        self.assertEqual(methods[wait + 1], "pane.send_input")
-        self.assertIn("_READY_", item.herdr.calls[wait + 1][1]["text"])
+        self.assertEqual(methods.count("pane.send_input"), 2)
+        self.assertNotIn("pane.wait_for_output", methods)
 
-    def test_worker_requires_the_world_ready_token_before_relay(self):
-        marker = "__DEVC2_HERDR_" + "8" * 32 + "_EXIT_"
-        payload = W.ready_marker(marker) + b"\r"
-        with mock.patch.object(W.os, "read", side_effect=[bytes([byte]) for byte in payload]):
-            self.assertIsNone(W.receive_ready(marker))
-        with mock.patch.object(W.os, "read", side_effect=[b"x", b"\r"]), \
-             self.assertRaisesRegex(W.WorkerError, "invalid worker readiness"):
-            W.receive_ready(marker)
+    def test_worker_uses_private_readiness_and_clears_bootstrap_ui(self):
+        self.assertEqual(W.CLEAR_TERMINAL, b"\x1b[2J\x1b[3J\x1b[H")
+        self.assertNotIn(b"DEVC2_HERDR", WORKER_PATH.read_bytes())
+
+    def test_worker_projects_a_bounded_initial_terminal_size(self):
+        with mock.patch.object(W.os, "get_terminal_size", return_value=os.terminal_size((132, 43))):
+            self.assertEqual(W.terminal_size(), (43, 132))
+        with mock.patch.object(W.os, "get_terminal_size", side_effect=OSError):
+            self.assertEqual(W.terminal_size(), (24, 80))
 
     def test_send_rejects_terminal_control_characters(self):
         item = provider()
@@ -477,7 +566,7 @@ class WorldAuthorityTests(unittest.TestCase):
         task = {
             "socket": "/private/worker.sock",
             "argv": ["sh", "-lc", "echo $HOME; $(id)"],
-            "marker": "__DEVC2_HERDR_" + "3" * 32 + "_EXIT_",
+            "token": "3" * 32,
         }
         raw = base64.urlsafe_b64encode(json.dumps(task).encode()).decode()
         self.assertEqual(W.decode(raw), task)
@@ -490,13 +579,18 @@ class WorldAuthorityTests(unittest.TestCase):
     def test_agent_owns_the_fixed_docker_invocation(self):
         item = docker_backend()
         item.container = lambda: "b" * 64
-        self.assertEqual(item.command(["sh", "-lc", "echo ok"]), [
-            "/bin/true", "exec", "--interactive", "--tty", "--user", "1000:1000",
-            "--workdir", "/workspace", "b" * 64, "sh", "-lc", "echo ok",
+        self.assertEqual(item.command(["sh", "-lc", "echo ok"], 43, 132), [
+            "/bin/true", "exec", "--interactive", "--user", "1000:1000",
+            "--workdir", "/workspace", "b" * 64,
+            "/usr/bin/python3", "-c", D.SUPERVISOR_SOURCE,
+            "43", "132", "--", "sh", "-lc", "echo ok",
         ])
 
     def test_agent_worker_request_is_exact_and_bounded(self):
-        valid = {"argv": ["printf", "ok"]}
+        valid = {
+            "argv": ["printf", "ok"], "token": "1" * 32,
+            "rows": 43, "columns": 132,
+        }
 
         def decode(document):
             left, right = socket.socketpair()
@@ -515,14 +609,88 @@ class WorldAuthorityTests(unittest.TestCase):
 
     def test_agent_relays_a_real_pty_and_publishes_exit(self):
         class LocalBackend:
-            def command(self, argv):
+            def command(self, argv, rows, columns):
                 return argv
 
         listener = socket.socket()
         agent = D.Agent(listener, LocalBackend())
         worker, projection = socket.socketpair()
         thread = threading.Thread(target=agent.run_worker, args=(worker, {
-            "argv": ["/bin/sh", "-c", "printf pty-proof"],
+            "argv": ["/bin/sh", "-c", "printf 'pty-proof:%s:' \"$TERM\"; stty size"],
+            "token": "2" * 32,
+            "rows": 31,
+            "columns": 97,
+        }))
+        thread.start()
+        projection.settimeout(3)
+        output = bytearray()
+        exit_code = None
+        try:
+            while exit_code is None:
+                kind, size = D.FRAME.unpack(D.receive(projection, D.FRAME.size))
+                payload = D.receive(projection, size)
+                if kind == b"S":
+                    self.assertEqual(payload, b"")
+                elif kind == b"O":
+                    output.extend(payload)
+                elif kind == b"E":
+                    exit_code = payload[0]
+        finally:
+            projection.close()
+            worker.close()
+            thread.join(3)
+            listener.close()
+        self.assertFalse(thread.is_alive())
+        self.assertIn(b"pty-proof:xterm-256color:31 97", output)
+        self.assertEqual(exit_code, 0)
+
+    def test_agent_stops_the_pty_process_when_the_worker_disconnects(self):
+        class LocalBackend:
+            def command(self, argv, rows, columns):
+                return argv
+
+        listener = socket.socket()
+        agent = D.Agent(listener, LocalBackend())
+        worker, projection = socket.socketpair()
+        errors = []
+
+        def relay():
+            try:
+                agent.run_worker(worker, {
+                    "argv": ["/bin/sh", "-c", "sleep 30"], "token": "3" * 32,
+                    "rows": 24, "columns": 80,
+                })
+            except OSError as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=relay)
+        thread.start()
+        projection.close()
+        thread.join(4)
+        worker.close()
+        listener.close()
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(errors), 1)
+
+    def test_supervisor_projects_terminal_identity_and_initial_size(self):
+        class SupervisedBackend:
+            supervised = True
+
+            def command(self, argv, rows, columns):
+                return [
+                    sys.executable, str(SUPERVISOR_PATH),
+                    str(rows), str(columns), "--", *argv,
+                ]
+
+        listener = socket.socket()
+        agent = D.Agent(listener, SupervisedBackend())
+        worker, projection = socket.socketpair()
+        thread = threading.Thread(target=agent.run_worker, args=(worker, {
+            "argv": [
+                "/bin/sh", "-c",
+                "printf 'terminal:%s:' \"$TERM\"; stty size",
+            ],
+            "token": "9" * 32, "rows": 37, "columns": 101,
         }))
         thread.start()
         projection.settimeout(3)
@@ -542,33 +710,55 @@ class WorldAuthorityTests(unittest.TestCase):
             thread.join(3)
             listener.close()
         self.assertFalse(thread.is_alive())
-        self.assertIn(b"pty-proof", output)
         self.assertEqual(exit_code, 0)
+        self.assertIn(b"terminal:xterm-256color:37 101", output)
 
-    def test_agent_stops_the_pty_process_when_the_worker_disconnects(self):
-        class LocalBackend:
-            def command(self, argv):
-                return argv
+    def test_supervisor_reaps_the_exact_worker_after_link_disconnect(self):
+        class SupervisedBackend:
+            supervised = True
 
-        listener = socket.socket()
-        agent = D.Agent(listener, LocalBackend())
-        worker, projection = socket.socketpair()
-        errors = []
+            def command(self, argv, rows, columns):
+                return [
+                    sys.executable, str(SUPERVISOR_PATH),
+                    str(rows), str(columns), "--", *argv,
+                ]
 
-        def relay():
-            try:
-                agent.run_worker(worker, {"argv": ["/bin/sh", "-c", "sleep 30"]})
-            except OSError as error:
-                errors.append(error)
-
-        thread = threading.Thread(target=relay)
-        thread.start()
-        projection.close()
-        thread.join(4)
-        worker.close()
-        listener.close()
-        self.assertFalse(thread.is_alive())
-        self.assertEqual(len(errors), 1)
+        with tempfile.TemporaryDirectory() as raw:
+            pid_file = Path(raw) / "worker.pid"
+            listener = socket.socket()
+            agent = D.Agent(listener, SupervisedBackend())
+            worker, projection = socket.socketpair()
+            command = [
+                sys.executable, "-c",
+                ("import os,sys,time; child=os.fork(); "
+                 "(os.setsid(), open(sys.argv[1],'a').write(str(os.getpid())+'\\n'), time.sleep(30)) "
+                 "if child == 0 else "
+                 "(open(sys.argv[1],'a').write(str(os.getpid())+'\\n'), time.sleep(30))"),
+                str(pid_file),
+            ]
+            thread = threading.Thread(
+                target=agent.run_worker,
+                args=(worker, {
+                    "argv": command, "token": "4" * 32,
+                    "rows": 24, "columns": 80,
+                }),
+            )
+            thread.start()
+            deadline = time.monotonic() + 3
+            while (not pid_file.exists() or len(pid_file.read_text().splitlines()) < 2) \
+                    and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(pid_file.exists())
+            worker_pids = [int(value) for value in pid_file.read_text().splitlines()]
+            self.assertEqual(len(worker_pids), 2)
+            projection.close()
+            thread.join(6)
+            worker.close()
+            listener.close()
+            self.assertFalse(thread.is_alive())
+            for worker_pid in worker_pids:
+                with self.subTest(worker_pid=worker_pid), self.assertRaises(ProcessLookupError):
+                    os.kill(worker_pid, 0)
 
 
 class InstallerTests(unittest.TestCase):
@@ -601,7 +791,8 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(set(world.parent.iterdir()), {world})
             with zipfile.ZipFile(world) as archive:
                 self.assertEqual(set(archive.namelist()), {
-                    "__main__.py", "herdr_world.py", "docker_agent.py", "worker_link.py",
+                    "__main__.py", "herdr_world.py", "docker_agent.py",
+                    "island_supervisor.py", "worker_link.py",
                 })
                 herdr_source = archive.read("herdr_world.py").lower()
             for backend_word in (b"docker", b"container", b"compose"):

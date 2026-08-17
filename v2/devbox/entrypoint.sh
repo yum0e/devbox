@@ -3,6 +3,7 @@ set -euo pipefail
 
 readonly workspace="${TACT_WORKSPACE:-/workspace}"
 mkdir -p "$TACT_HOME"
+/usr/local/libexec/devc2/configure-pi
 
 report_span_diagnostics() {
   if command -v diagnostics >/dev/null 2>&1; then
@@ -190,6 +191,11 @@ if [[ "${DEVC2_RUNTIME_DOCTOR:-}" == "1" ]]; then
       rm -f -- "$response"
     '
     echo "✓ OpenAI Span: authenticated models request"
+    pi_probe="$(timeout 90 pi --print --no-session --no-tools \
+      --no-extensions --no-skills --no-prompt-templates --no-context-files \
+      --thinking minimal 'Reply with exactly: devc2-pi-ok')"
+    test "$(printf '%s' "$pi_probe" | tr -d '\r\n')" = devc2-pi-ok
+    echo "✓ Pi OpenAI Span: completed response"
   fi
   echo "✓ runtime doctor passed"
   exit 0

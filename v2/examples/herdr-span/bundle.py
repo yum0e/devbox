@@ -50,12 +50,15 @@ def provider() -> int:
     agent_listener.bind(os.fspath(worker_path))
     worker_path.chmod(0o600)
     agent_listener.listen(16)
+    world_status, agent_status = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
     agent_environment = environment(*AGENT_ENVIRONMENT)
     agent_environment["DEVC2_HERDR_AGENT_FD"] = str(agent_listener.fileno())
+    agent_environment["DEVC2_HERDR_STATUS_FD"] = str(agent_status.fileno())
     herdr_environment = environment(*HERDR_ENVIRONMENT)
     herdr_environment.update({
         "DEVC2_HERDR_WORKER": os.fspath(archive),
         "DEVC2_HERDR_WORKER_SOCKET": os.fspath(worker_path),
+        "DEVC2_HERDR_STATUS_FD": str(world_status.fileno()),
     })
     agent = herdr = None
     stopping = threading.Event()
@@ -69,14 +72,16 @@ def provider() -> int:
         agent = subprocess.Popen(
             [sys.executable, os.fspath(archive), "agent"],
             env=agent_environment, stdin=subprocess.DEVNULL,
-            pass_fds=(agent_listener.fileno(),),
+            pass_fds=(agent_listener.fileno(), agent_status.fileno()),
         )
         agent_listener.close()
+        agent_status.close()
         herdr = subprocess.Popen(
             [sys.executable, os.fspath(archive), "herdr"],
             env=herdr_environment, stdin=subprocess.DEVNULL,
-            pass_fds=(span_descriptor,),
+            pass_fds=(span_descriptor, world_status.fileno()),
         )
+        world_status.close()
         os.close(span_descriptor)
         span_descriptor = -1
         while not stopping.wait(0.1):
@@ -90,6 +95,8 @@ def provider() -> int:
         stop(herdr)
         stop(agent)
         agent_listener.close()
+        world_status.close()
+        agent_status.close()
         if span_descriptor >= 0:
             os.close(span_descriptor)
         worker_path.unlink(missing_ok=True)

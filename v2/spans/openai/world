@@ -54,6 +54,10 @@ def jwt(claims: dict) -> str:
 FAKE_ACCESS = jwt({
     "aud": ["https://api.openai.com/v1", "https://chatgpt.com/backend-api"],
     "exp": 4102444800,
+    "https://api.openai.com/auth": {
+        "chatgpt_account_id": FAKE_ACCOUNT,
+        "chatgpt_plan_type": "plus",
+    },
     "sub": "devc2",
 })
 
@@ -106,6 +110,7 @@ def bootstrap(certificate: bytes) -> bytes:
             "TACT_AUTH": "chatgpt",
             "TACT_AUTH_FILE": "${ROOT}/auth.json",
             "CODEX_HOME": "${ROOT}/codex",
+            "DEVC2_PI_OPENAI_TOKEN": FAKE_ACCESS,
         },
         "routes": ["chatgpt.com:443"],
     }
@@ -510,7 +515,11 @@ def read_connect(connection: socket.socket) -> tuple[bytes, bytes]:
             raise ProviderError("CONNECT contains an invalid header")
         if name.lower() == b"host":
             host_headers += 1
-            if host_headers > 1 or value.strip(b" \t") != b"chatgpt.com:443":
+            # HTTP/1.1 permits a CONNECT Host header to omit the default
+            # scheme port. Undici does so even though the request target
+            # remains the explicit chatgpt.com:443 authority.
+            if (host_headers > 1
+                    or value.strip(b" \t") not in (b"chatgpt.com", b"chatgpt.com:443")):
                 raise ProviderError("CONNECT Host does not match its target")
     return request, bytes(data[end:])
 
@@ -548,7 +557,14 @@ def handle(connection: socket.socket, manager: ProxyManager) -> None:
             return
         if operation != b"T":
             return
-        request, trailing = read_connect(connection)
+        try:
+            request, trailing = read_connect(connection)
+        except ProviderError:
+            connection.sendall(
+                b"HTTP/1.1 400 Bad Request\r\n"
+                b"Connection: close\r\nContent-Length: 0\r\n\r\n"
+            )
+            return
         proxy = manager.get()
         with socket.create_connection(("127.0.0.1", proxy.port), timeout=10) as upstream:
             upstream.sendall(request)

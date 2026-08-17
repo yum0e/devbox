@@ -203,37 +203,59 @@ class CliTests(unittest.TestCase):
                 f"openai:run -- {upstream} run task", "upstream:run task",
             ])
 
-    def test_pi_wrapper_uses_openai_span_without_persisting_subscription_auth(self):
+    def test_pi_wrapper_only_routes_through_the_openai_span(self):
         wrapper_source = (PATH.parents[1] / "devbox" / "pi-wrapper.sh").read_text()
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             upstream, openai, wrapper = root / "pi-upstream", root / "openai", root / "pi"
-            auth, result = root / "auth.json", root / "result"
-            auth.write_text(json.dumps({"tokens": {"access_token": "projected-token"}}))
-            upstream.write_text("#!/bin/sh\n" f"printf 'upstream:%s\\n' \"$*\" >>{result}\n" "exit 17\n")
+            result = root / "result"
+            upstream.write_text(
+                "#!/bin/sh\n"
+                f"printf 'upstream:%s\\n' \"$*\" >>{result}\n"
+                f"if [ \"${{1:-}}\" != --version ]; then "
+                f"test \"$DEVC2_PI_OPENAI_TOKEN\" = projected-token || echo token-missing >>{result}; fi\n"
+                "exit 17\n"
+            )
             upstream.chmod(0o755)
             openai.write_text(
                 "#!/bin/sh\n"
                 f"printf 'openai:%s\\n' \"$*\" >>{result}\n"
-                "shift 2\nexec \"$@\"\n"
+                "shift 2\n"
+                "export DEVC2_PI_OPENAI_TOKEN=projected-token\n"
+                "exec \"$@\"\n"
             )
             openai.chmod(0o755)
             wrapper.write_text(
                 wrapper_source
                 .replace("/usr/local/share/pnpm/bin/pi-upstream", str(upstream))
                 .replace("/run/devc2/bin/openai", str(openai))
-                .replace("/usr/local/share/pnpm/bin/pi", str(wrapper))
             )
             wrapper.chmod(0o755)
             self.assertEqual(subprocess.run([str(wrapper), "--version"]).returncode, 17)
-            environment = {**os.environ, "TACT_AUTH_FILE": str(auth)}
-            self.assertEqual(subprocess.run([str(wrapper), "task"], env=environment).returncode, 17)
+            self.assertEqual(subprocess.run([str(wrapper), "task"]).returncode, 17)
             self.assertEqual(result.read_text().splitlines(), [
                 "upstream:--version",
-                f"openai:run -- env DEVC2_PI_OPENAI_SCOPE=1 {wrapper} task",
-                "upstream:--provider openai-codex --model gpt-5.5 --api-key projected-token task",
+                f"openai:run -- {upstream} task",
+                "upstream:task",
             ])
-            self.assertFalse((root / ".pi" / "agent" / "auth.json").exists())
+
+    def test_pi_provider_configuration_is_initialized_without_credentials(self):
+        configure = PATH.parents[1] / "devbox" / "configure-pi.sh"
+        with tempfile.TemporaryDirectory() as td:
+            agent_dir = Path(td) / ".pi" / "agent"
+            agent_dir.mkdir(parents=True)
+            models = agent_dir / "models.json"
+            models.write_text(json.dumps({"providers": {"local": {"apiKey": "local-key"}}}))
+            environment = {**os.environ, "PI_CODING_AGENT_DIR": str(agent_dir)}
+            subprocess.run([str(configure)], env=environment, check=True)
+            self.assertEqual(json.loads(models.read_text()), {
+                "providers": {
+                    "local": {"apiKey": "local-key"},
+                    "openai-codex": {"apiKey": "$DEVC2_PI_OPENAI_TOKEN"},
+                },
+            })
+            self.assertEqual(stat.S_IMODE(models.stat().st_mode), 0o644)
+            self.assertFalse((agent_dir / "auth.json").exists())
 
     def test_external_build_images_are_content_pinned(self):
         dockerfile = (PATH.parents[1] / "Dockerfile").read_text()
@@ -264,6 +286,8 @@ class CliTests(unittest.TestCase):
         self.assertIn("@earendil-works/pi-coding-agent@0.84.2", dockerfile)
         self.assertIn("--ignore-scripts --no-optional", dockerfile)
         self.assertIn('mv "$PNPM_HOME/bin/pi" "$PNPM_HOME/bin/pi-upstream"', dockerfile)
+        self.assertIn("COPY devbox/configure-pi.sh /usr/local/libexec/devc2/configure-pi", dockerfile)
+        self.assertIn("/usr/local/libexec/devc2/configure-pi", entrypoint)
         island,auth=dockerfile.split("FROM island AS auth",1)
         self.assertNotIn("@openai/codex", island)
         self.assertIn("pnpm add --global @openai/codex@0.147.0", auth)
@@ -313,6 +337,8 @@ class CliTests(unittest.TestCase):
         self.assertIn("openai run -- /bin/sh -ceu", entrypoint)
         self.assertIn("backend-api/codex/models?client_version=0.147.0", entrypoint)
         self.assertIn("OpenAI Span: authenticated models request", entrypoint)
+        self.assertIn("timeout 90 pi --print --no-session --no-tools", entrypoint)
+        self.assertIn("Pi OpenAI Span: completed response", entrypoint)
         self.assertIn("github run -- gh api user", entrypoint)
         self.assertIn("tact config show", entrypoint)
         self.assertNotIn("set -x", entrypoint)
@@ -384,24 +410,25 @@ class AuthTests(unittest.TestCase):
             def auth_run(argv,**_kwargs):
                 if argv[:3]==["docker","image","inspect"]: return subprocess.CompletedProcess(argv,1,"","")
                 return completed
-            with mock.patch.object(D, "AUTH", auth), mock.patch.object(D, "require_docker"), mock.patch.object(D, "read_codex", side_effect=[RuntimeError("missing"), ("access", "account")]) as read_codex, mock.patch.object(D, "validate_github_token", side_effect=[RuntimeError("missing"), "user"]) as github_token, mock.patch.object(D, "select_key", side_effect=[RuntimeError("missing"), "ssh-key"]) as select_key, mock.patch.object(D, "run", side_effect=auth_run) as run, contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch.object(D, "AUTH", auth), mock.patch.object(D, "require_docker"), mock.patch.object(D, "read_codex", side_effect=[RuntimeError("missing"), ("access", "account")]) as read_codex, mock.patch.object(D, "validate_github_token", return_value="user") as github_token, mock.patch.object(D, "select_key", side_effect=[RuntimeError("missing"), "ssh-key"]) as select_key, mock.patch.object(D, "run", side_effect=auth_run) as run, contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(D.authenticate(), 0)
             self.assertEqual(read_codex.call_count, 2)
-            self.assertEqual(github_token.call_count, 2)
+            self.assertEqual(github_token.call_count, 1)
             self.assertEqual(select_key.call_args_list, [mock.call(False), mock.call(True)])
 
             commands = [call.args[0] for call in run.call_args_list]
-            self.assertEqual(len(commands), 4)
+            self.assertEqual(len(commands), 5)
             self.assertTrue(all(command[0] in {"docker", "gh"} for command in commands))
-            self.assertEqual(commands[0][:3], ["docker", "image", "inspect"])
-            self.assertEqual(commands[1][:5], ["docker", "build", "--target", "auth", "--tag"])
-            self.assertEqual(commands[1][5], "devc2-auth:0.2.0")
-            self.assertIn(f"{auth / 'codex'}:/home/devbox/.codex", commands[2])
-            self.assertIn("codex", commands[2])
-            self.assertEqual(commands[2][-2:], ["login", "--device-auth"])
-            self.assertIn(f"{auth / 'gh'}:/run/devc2-gh", commands[3])
-            self.assertIn("gh", commands[3])
-            self.assertEqual(commands[3][-7:], ["auth", "login", "--hostname", "github.com", "--git-protocol", "ssh", "--web"])
+            self.assertEqual(commands[0], ["gh", "auth", "token"])
+            self.assertEqual(commands[1][:3], ["docker", "image", "inspect"])
+            self.assertEqual(commands[2][:5], ["docker", "build", "--target", "auth", "--tag"])
+            self.assertEqual(commands[2][5], "devc2-auth:0.2.0")
+            self.assertIn(f"{auth / 'codex'}:/home/devbox/.codex", commands[3])
+            self.assertIn("codex", commands[3])
+            self.assertEqual(commands[3][-2:], ["login", "--device-auth"])
+            self.assertIn(f"{auth / 'gh'}:/run/devc2-gh", commands[4])
+            self.assertIn("gh", commands[4])
+            self.assertEqual(commands[4][-7:], ["auth", "login", "--hostname", "github.com", "--git-protocol", "ssh", "--web"])
             config = auth / "codex" / "config.toml"
             self.assertEqual(config.read_text(), 'cli_auth_credentials_store = "file"\n')
             self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o600)
@@ -440,6 +467,39 @@ class AuthTests(unittest.TestCase):
                 "--entrypoint", "gh", D.RUNTIME_IMAGE, "auth", "token",
             ], timeout=30))
 
+    def test_host_gh_login_is_atomically_imported_for_the_span(self):
+        with tempfile.TemporaryDirectory() as td:
+            auth = Path(td) / "auth"
+            with mock.patch.object(D, "AUTH", auth), \
+                 mock.patch.object(D, "host_github_token", return_value="host-token"), \
+                 mock.patch.object(D, "validate_github_token", return_value="octocat") as validate:
+                self.assertEqual(D.import_host_github_auth(), "octocat")
+            validate.assert_called_once_with("host-token")
+            hosts = auth / "gh" / "hosts.yml"
+            self.assertEqual(stat.S_IMODE(hosts.stat().st_mode), 0o600)
+            self.assertEqual(hosts.read_text(), (
+                "github.com:\n"
+                "  git_protocol: ssh\n"
+                "  oauth_token: host-token\n"
+                "  user: octocat\n"
+            ))
+            self.assertEqual(list((auth / "gh").glob(".hosts.yml.*")), [])
+
+    def test_github_validation_distinguishes_auth_from_service_failures(self):
+        def failure(status):
+            return D.urllib.error.HTTPError(
+                "https://api.github.com/user", status, "failed", {}, None,
+            )
+
+        with mock.patch.object(D, "github_token", return_value="token"), \
+             mock.patch.object(D.urllib.request, "urlopen", side_effect=failure(401)):
+            with self.assertRaisesRegex(RuntimeError, "credential was rejected"):
+                D.validate_github_token()
+        with mock.patch.object(D, "github_token", return_value="token"), \
+             mock.patch.object(D.urllib.request, "urlopen", side_effect=failure(503)):
+            with self.assertRaisesRegex(RuntimeError, "HTTP 503; retry later"):
+                D.validate_github_token()
+
     def test_bootstrapped_auth_needs_no_host_codex_or_gh(self):
         access = jwt({"exp": 4102444800})
         completed = lambda argv, stdout="": subprocess.CompletedProcess(argv, 0, stdout, "")
@@ -464,7 +524,7 @@ class AuthTests(unittest.TestCase):
                     return completed(argv, "docker-gh-token\n")
                 return completed(argv)
 
-            with mock.patch.object(D, "AUTH", auth), mock.patch.object(D, "require_docker"), mock.patch.object(D, "validate_github_token", side_effect=[RuntimeError("missing"), "user"]), mock.patch.object(D, "select_key", side_effect=[RuntimeError("missing"), "ssh-key"]), mock.patch.object(D, "run", side_effect=docker_only), mock.patch.dict(os.environ, {"CODEX_HOME": str(host_codex), "PATH": ""}), contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch.object(D, "AUTH", auth), mock.patch.object(D, "require_docker"), mock.patch.object(D, "validate_github_token", return_value="user"), mock.patch.object(D, "select_key", side_effect=[RuntimeError("missing"), "ssh-key"]), mock.patch.object(D, "run", side_effect=docker_only), mock.patch.dict(os.environ, {"CODEX_HOME": str(host_codex), "PATH": ""}), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(D.authenticate(), 0)
                 self.assertEqual(D.read_codex(), (access, "bootstrapped"))
                 self.assertEqual(D.github_token(), "docker-gh-token")

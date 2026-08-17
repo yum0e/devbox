@@ -23,6 +23,7 @@ BUNDLE_FILES = {
     "__main__.py": "bundle.py",
     "herdr_world.py": "herdr-span",
     "docker_agent.py": "docker_agent.py",
+    "island_supervisor.py": "island_supervisor.py",
     "worker_link.py": "worker_link.py",
 }
 

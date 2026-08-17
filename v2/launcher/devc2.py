@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Trusted macOS launcher for devbox v2."""
 from __future__ import annotations
-import argparse, base64, contextlib, fcntl, gzip, hashlib, json, os, platform, secrets, shlex, shutil, signal, stat, subprocess, sys, tarfile, tempfile, time, unicodedata, urllib.error, urllib.parse, urllib.request
+import argparse, base64, contextlib, fcntl, gzip, hashlib, json, os, platform, re, secrets, shlex, shutil, signal, stat, subprocess, sys, tarfile, tempfile, time, unicodedata, urllib.error, urllib.parse, urllib.request
 from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 
@@ -129,7 +129,7 @@ def source_version(source):
     return match.group(1)
 
 def validate_asset_tree(source,strict=False):
-    required=("Dockerfile","compose.yaml","devbox/entrypoint.sh","devbox/tact-wrapper.sh","devbox/pi-wrapper.sh","launcher/devc2.py","launcher/span_runtime.py","launcher/span_supervisor.py","launcher/dispatcher.py","launcher/command_projection.py","launcher/scoped_exec_projection.py","credential_proxy/span_bridge.py","credential_proxy/stream_relay.py","spans/openai/world","spans/github/world","spans/ssh-agent/world","spans/diagnostics/world")
+    required=("Dockerfile","compose.yaml","devbox/entrypoint.sh","devbox/configure-pi.sh","devbox/tact-wrapper.sh","devbox/pi-wrapper.sh","launcher/devc2.py","launcher/span_runtime.py","launcher/span_supervisor.py","launcher/dispatcher.py","launcher/command_projection.py","launcher/scoped_exec_projection.py","credential_proxy/span_bridge.py","credential_proxy/stream_relay.py","spans/openai/world","spans/github/world","spans/ssh-agent/world","spans/diagnostics/world")
     if not source.is_dir() or source.is_symlink(): raise RuntimeError("release asset root must be a directory")
     total=0; count=0; allowed={"Dockerfile","compose.yaml","README.md","install.sh","devbox","credential_proxy","launcher","spans"}
     for path in source.rglob("*"):
@@ -188,14 +188,14 @@ def copy_release_assets(source,destination):
     for path in destination.rglob("*"):
         if path.is_dir(): path.chmod(0o755)
         elif path.is_file(): path.chmod(0o644)
-    for relative in ("launcher/devc2.py","launcher/dispatcher.py","launcher/command_projection.py","launcher/scoped_exec_projection.py","devbox/entrypoint.sh","devbox/tact-wrapper.sh","devbox/pi-wrapper.sh","spans/openai/world","spans/github/world","spans/ssh-agent/world","spans/diagnostics/world"):
+    for relative in ("launcher/devc2.py","launcher/dispatcher.py","launcher/command_projection.py","launcher/scoped_exec_projection.py","devbox/entrypoint.sh","devbox/configure-pi.sh","devbox/tact-wrapper.sh","devbox/pi-wrapper.sh","spans/openai/world","spans/github/world","spans/ssh-agent/world","spans/diagnostics/world"):
         (destination/relative).chmod(0o755)
 
 def freeze_asset_tree(destination):
     for path in destination.rglob("*"):
         if path.is_dir(): path.chmod(0o555)
         elif path.is_file(): path.chmod(0o444)
-    for relative in ("launcher/devc2.py","launcher/dispatcher.py","launcher/command_projection.py","launcher/scoped_exec_projection.py","devbox/entrypoint.sh","devbox/tact-wrapper.sh","devbox/pi-wrapper.sh","spans/openai/world","spans/github/world","spans/ssh-agent/world","spans/diagnostics/world"):
+    for relative in ("launcher/devc2.py","launcher/dispatcher.py","launcher/command_projection.py","launcher/scoped_exec_projection.py","devbox/entrypoint.sh","devbox/configure-pi.sh","devbox/tact-wrapper.sh","devbox/pi-wrapper.sh","spans/openai/world","spans/github/world","spans/ssh-agent/world","spans/diagnostics/world"):
         (destination/relative).chmod(0o555)
     destination.chmod(0o555)
 
@@ -688,8 +688,18 @@ def github_token():
     return value
 
 
-def validate_github_token():
-    token = github_token()
+def host_github_token():
+    try:
+        value = run(["gh", "auth", "token"], timeout=15).stdout.strip()
+    except RuntimeError as error:
+        raise RuntimeError("host GitHub CLI is not authenticated") from error
+    if not value or any(c.isspace() for c in value):
+        raise RuntimeError("host GitHub CLI returned an invalid token")
+    return value
+
+
+def validate_github_token(token=None):
+    token = token or github_token()
     request = urllib.request.Request(
         "https://api.github.com/user",
         headers={
@@ -702,11 +712,40 @@ def validate_github_token():
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
             document = json.load(response)
-    except (OSError, urllib.error.HTTPError, urllib.error.URLError, ValueError) as error:
-        raise RuntimeError("credential was rejected by GitHub; run `devc2 auth`") from error
+    except urllib.error.HTTPError as error:
+        if error.code in (401, 403):
+            raise RuntimeError("credential was rejected by GitHub; run `devc2 auth`") from error
+        raise RuntimeError(f"GitHub API returned HTTP {error.code}; retry later") from error
+    except (OSError, urllib.error.URLError) as error:
+        raise RuntimeError("GitHub API is unavailable; retry later") from error
+    except ValueError as error:
+        raise RuntimeError("GitHub returned an invalid authenticated identity") from error
     login = document.get("login")
     if not isinstance(login, str) or not login:
         raise RuntimeError("GitHub returned an invalid authenticated identity")
+    return login
+
+
+def import_host_github_auth():
+    token = host_github_token()
+    login = validate_github_token(token)
+    if (not re.fullmatch(r"[A-Za-z0-9_-]+", token)
+            or not re.fullmatch(r"[A-Za-z0-9-]+", login)):
+        raise RuntimeError("host GitHub CLI returned an unsupported credential")
+    directory = AUTH / "gh"
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = directory / (".hosts.yml." + secrets.token_hex(8))
+    try:
+        private_write(temporary, (
+            "github.com:\n"
+            "  git_protocol: ssh\n"
+            f"  oauth_token: {token}\n"
+            f"  user: {login}\n"
+        ))
+        os.replace(temporary, directory / "hosts.yml")
+    finally:
+        try: temporary.unlink()
+        except FileNotFoundError: pass
     return login
 
 
@@ -946,11 +985,22 @@ def authenticate():
         codex_ready = True
     except RuntimeError:
         pass
-    try:
-        validate_github_token()
-        github_ready = True
-    except RuntimeError:
-        pass
+    if (gh_home / "hosts.yml").exists():
+        try:
+            validate_github_token()
+            github_ready = True
+        except RuntimeError:
+            try:
+                import_host_github_auth()
+                github_ready = True
+            except RuntimeError:
+                pass
+    else:
+        try:
+            import_host_github_auth()
+            github_ready = True
+        except RuntimeError:
+            pass
     try:
         select_key(False)
         ssh_ready = True

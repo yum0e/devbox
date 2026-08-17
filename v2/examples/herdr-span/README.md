@@ -73,11 +73,19 @@ option, or host command. The Herdr World targets only the pane inherited from th
 host launch, remembers only panes it created, and rechecks each pane's terminal
 identity before using it. The host shell `exec`s the trusted worker, so there is
 no host prompt underneath it; a completed worker stays parked for inspection.
-`close` removes only a named pane owned by this World.
+The private worker Link projects the pane's bounded initial rows and columns;
+the backend supplies a fixed `xterm-256color` identity to the Island process.
+`close` removes only a named pane owned by this World. Each Docker worker runs
+under an in-Island supervisor that owns its process tree; terminal disconnect,
+an explicit close, or loss of bounded heartbeats triggers TERM, then KILL and
+reaping before the worker exits.
 World teardown makes bounded best-effort attempts to close its panes.
-`herdr read` returns only content between private worker boundaries; it does not
-expose the host bootstrap command, executable path, container identity, payload,
-or completion marker.
+Readiness and completion travel over a private datagram channel between the
+Docker Agent and Herdr World, never through terminal markers. The host command
+clears the pane immediately, and the worker clears it again before relaying
+application output. Consequently, `herdr read` and the visible pane retain only
+the worker interface, not the bootstrap command, executable path, container
+identity, payload, or lifecycle protocol.
 
 The Herdr installation and catalog contribute only one immutable bundle path.
 The host resolves the granted name and supplies one generic Link shim, which

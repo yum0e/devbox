@@ -70,9 +70,10 @@ removes the checkout or v1 resources.
 The first-party `openai`, `github`, `ssh-agent`, and `diagnostics` Spans ship with devc2 but are
 still inert until named. `tact` and Pi automatically run authenticated
 operations through `openai`; local version and help commands need no grant. Pi
-uses its upstream `openai-codex` default (`gpt-5.5`) without storing ChatGPT
-credentials in the Island. Its settings, extensions, and sessions remain normal
-persistent Island state. `github run -- gh …` scopes GitHub authentication to one child command.
+sees a normal `openai-codex` provider backed by a non-secret Span capability;
+the Span owns the connection, account identity, and host ChatGPT credentials.
+Pi retains control of its model choice, settings, extensions, and sessions as
+normal persistent Island state. `github run -- gh …` scopes GitHub authentication to one child command.
 GitHub repository transport is deliberately SSH-only in this iteration and
 composes with `ssh-agent`; the GitHub Span does not grant a second Git HTTPS
 credential path. When `ssh-agent` is present, the Island configures Git and
@@ -90,10 +91,11 @@ lives. This makes transport failures self-observable without adding debugging
 tools or host authority to the Island.
 
 `devc2 doctor --runtime` creates a disposable temporary checkout and validates
+an end-to-end Pi response through the OpenAI Span, along with
 the real Docker Desktop path through all three first-party Spans: OpenAI
 transport, GitHub API authentication, the exact filtered SSH identity, signing,
 writable Tact config, and the pinned Tact binary. It may trigger a 1Password
-approval and makes authenticated read-only requests.
+approval and makes authenticated probes, including one minimal model response.
 It never mounts a real checkout and removes its project volumes during teardown.
 
 The image installs a trusted `tact` wrapper ahead of the persistent home PATH.
