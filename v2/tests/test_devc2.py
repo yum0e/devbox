@@ -33,6 +33,98 @@ class CliTests(unittest.TestCase):
         self.assertEqual(D.identity(repo),D.identity(repo))
         self.assertTrue(D.identity(repo)[1].startswith("devc2-"))
 
+    def test_linked_worktree_projects_only_its_pointer_and_common_git_metadata(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); main=root/"main repo"; checkout=root/"linked tree"
+            subprocess.run(["git","init",str(main)],check=True,capture_output=True)
+            subprocess.run(["git","-C",str(main),"config","user.name","Test"],check=True)
+            subprocess.run(["git","-C",str(main),"config","user.email","test@example.invalid"],check=True)
+            (main/"tracked").write_text("one\n")
+            subprocess.run(["git","-C",str(main),"add","tracked"],check=True)
+            subprocess.run(["git","-C",str(main),"commit","-m","initial"],check=True,capture_output=True)
+            subprocess.run(["git","-C",str(main),"worktree","add","-b","linked",str(checkout)],check=True,capture_output=True)
+
+            projection=D.linked_worktree(checkout)
+            self.assertEqual(projection.pointer,checkout/".git")
+            self.assertEqual(projection.backlink_target,checkout/".git")
+            self.assertEqual(projection.gitdir.parent,main/".git"/"worktrees")
+            self.assertEqual(projection.gitdir_target,projection.gitdir)
+            self.assertEqual(projection.common,main/".git")
+            self.assertEqual(projection.common_target,main/".git")
+            env=D.compose_env(checkout,root/"public")
+            self.assertNotIn("DEVC2_WORKTREE_GIT_FILE",env)
+            self.assertNotIn("DEVC2_GIT_COMMON_DIR",env)
+            override=D.worktree_compose_override(root,projection)
+            document=json.loads(override.read_text())
+            self.assertEqual(stat.S_IMODE(override.stat().st_mode),0o600)
+            mounts=document["services"]["devbox"]["volumes"]
+            self.assertEqual(mounts,[
+                {"type":"bind","source":str(main/".git"),"target":str(main/".git"),"bind":{"create_host_path":False}},
+                {"type":"bind","source":str(main/".git"/"worktrees"),"target":str(main/".git"/"worktrees"),"bind":{"create_host_path":False},"read_only":True},
+                {"type":"bind","source":str(projection.gitdir),"target":str(projection.gitdir),"bind":{"create_host_path":False}},
+                {"type":"bind","source":str(checkout/".git"),"target":"/workspace/.git","bind":{"create_host_path":False},"read_only":True},
+                {"type":"bind","source":str(checkout/".git"),"target":str(checkout/".git"),"read_only":True,"bind":{"create_host_path":False}},
+            ])
+            self.assertNotIn(str(main),{mount["source"] for mount in mounts})
+            command=D.compose_run_command(checkout,override)
+            self.assertEqual(command[4:8],["-f",str(D.ROOT/"compose.yaml"),"-f",str(override)])
+
+    def test_linked_worktree_requires_a_closed_git_backlink(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); main=root/"main"; checkout=root/"linked"
+            subprocess.run(["git","init",str(main)],check=True,capture_output=True)
+            subprocess.run(["git","-C",str(main),"config","user.name","Test"],check=True)
+            subprocess.run(["git","-C",str(main),"config","user.email","test@example.invalid"],check=True)
+            subprocess.run(["git","-C",str(main),"commit","--allow-empty","-m","initial"],check=True,capture_output=True)
+            subprocess.run(["git","-C",str(main),"worktree","add","-b","linked",str(checkout)],check=True,capture_output=True)
+            gitdir=Path((checkout/".git").read_text().strip().removeprefix("gitdir: "))
+            (gitdir/"gitdir").write_text(str(root/"other"/".git")+"\n")
+            (root/"other").mkdir()
+            (root/"other"/".git").write_text("unrelated\n")
+            with self.assertRaisesRegex(RuntimeError,"closed Git relationship"):
+                D.linked_worktree(checkout)
+
+    def test_linked_worktree_preserves_relative_git_paths_inside_the_island(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); main=root/"main"; checkout=root/"linked"
+            subprocess.run(["git","init",str(main)],check=True,capture_output=True)
+            subprocess.run(["git","-C",str(main),"config","user.name","Test"],check=True)
+            subprocess.run(["git","-C",str(main),"config","user.email","test@example.invalid"],check=True)
+            subprocess.run(["git","-C",str(main),"commit","--allow-empty","-m","initial"],check=True,capture_output=True)
+            subprocess.run(["git","-C",str(main),"worktree","add","-b","linked",str(checkout)],check=True,capture_output=True)
+            gitdir=main/".git"/"worktrees"/"linked"
+            (checkout/".git").write_text("gitdir: ../main/.git/worktrees/linked\n")
+            (gitdir/"gitdir").write_text("../../../../linked/.git\n")
+            self.assertEqual(D.linked_worktree(checkout),D.WorktreeProjection(
+                checkout/".git",Path("/linked/.git"),gitdir,Path("/main/.git/worktrees/linked"),
+                main/".git",Path("/main/.git"),
+            ))
+
+    def test_linked_worktree_rejects_symlink_metadata_and_external_object_stores(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); (root/"metadata").mkdir(); (root/".git").symlink_to(root/"metadata")
+            with self.assertRaisesRegex(RuntimeError,"must not be a symlink"):
+                D.linked_worktree(root)
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); main=root/"main"; checkout=root/"linked"; external=root/"external-objects"
+            subprocess.run(["git","init",str(main)],check=True,capture_output=True)
+            subprocess.run(["git","-C",str(main),"config","user.name","Test"],check=True)
+            subprocess.run(["git","-C",str(main),"config","user.email","test@example.invalid"],check=True)
+            subprocess.run(["git","-C",str(main),"commit","--allow-empty","-m","initial"],check=True,capture_output=True)
+            subprocess.run(["git","-C",str(main),"worktree","add","-b","linked",str(checkout)],check=True,capture_output=True)
+            external.mkdir(); alternates=main/".git"/"objects"/"info"/"alternates"
+            alternates.write_text(str(external)+"\n")
+            with self.assertRaisesRegex(RuntimeError,"external Git object store"):
+                D.linked_worktree(checkout)
+
+    def test_regular_git_and_jujutsu_checkouts_need_no_git_projection(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); (root/".git").mkdir()
+            self.assertIsNone(D.linked_worktree(root))
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); (root/".jj").mkdir()
+            self.assertIsNone(D.linked_worktree(root))
+
     def test_shared_tact_config_is_initialized_once(self):
         with tempfile.TemporaryDirectory() as td:
             config = Path(td) / "devc2" / "tact" / "config.toml"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 import argparse, base64, contextlib, fcntl, gzip, hashlib, json, os, platform, secrets, shlex, shutil, signal, stat, subprocess, sys, tarfile, tempfile, time, unicodedata, urllib.error, urllib.parse, urllib.request
 from pathlib import Path, PurePosixPath
+from typing import NamedTuple
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0,str(Path(__file__).resolve().parent))
@@ -515,6 +516,100 @@ def canonical_repo(raw):
             raise RuntimeError(f"credential directory would be exposed by workspace mount: {secret_root}")
     return path
 
+def git_admin_text(path,label):
+    try:
+        metadata=path.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode) or metadata.st_size>4096:
+            raise RuntimeError
+        value=path.read_text(encoding="utf-8").strip()
+    except (OSError,UnicodeError,RuntimeError) as error:
+        raise RuntimeError(f"linked worktree has an invalid {label}: {path}") from error
+    if not value or "\0" in value or "\n" in value or "\r" in value:
+        raise RuntimeError(f"linked worktree has an invalid {label}: {path}")
+    return value
+
+def resolved_git_admin_path(raw,base,label):
+    candidate=Path(raw)
+    if not candidate.is_absolute(): candidate=base/candidate
+    try: return candidate.resolve(strict=True)
+    except OSError as error: raise RuntimeError(f"linked worktree {label} is unavailable: {candidate}") from error
+
+def lexical_git_admin_path(raw,base):
+    candidate=Path(raw)
+    if not candidate.is_absolute(): candidate=base/candidate
+    return Path(os.path.normpath(candidate))
+
+def validate_git_mount_target(path):
+    reserved=(Path("/workspace"),Path("/home/devbox"),Path("/run"),Path("/proc"),Path("/sys"),Path("/dev"),Path("/etc"),Path("/usr"),Path("/bin"),Path("/sbin"),Path("/lib"),Path("/lib64"))
+    if not path.is_absolute() or any(path==item or path.is_relative_to(item) or item.is_relative_to(path) for item in reserved):
+        raise RuntimeError(f"linked worktree Git metadata targets a reserved Island path: {path}")
+
+def validate_git_object_store(common):
+    objects=common/"objects"
+    if not objects.is_dir() or objects.is_symlink():
+        raise RuntimeError("linked worktree uses an unsupported Git object store")
+    alternates=objects/"info"/"alternates"
+    if not alternates.exists(): return
+    for raw in git_admin_text(alternates,"objects/info/alternates").splitlines():
+        target=resolved_git_admin_path(raw,objects,"alternate Git object store")
+        if not target.is_relative_to(common):
+            raise RuntimeError(f"linked worktree uses an external Git object store: {target}")
+
+class WorktreeProjection(NamedTuple):
+    pointer: Path
+    backlink_target: Path
+    gitdir: Path
+    gitdir_target: Path
+    common: Path
+    common_target: Path
+
+def linked_worktree(repo):
+    pointer=repo/".git"
+    try: pointer_metadata=pointer.lstat()
+    except FileNotFoundError: return None
+    if stat.S_ISLNK(pointer_metadata.st_mode):
+        raise RuntimeError(f"Git metadata must not be a symlink: {pointer}")
+    if stat.S_ISDIR(pointer_metadata.st_mode): return None
+    line=git_admin_text(pointer,".git pointer")
+    if not line.startswith("gitdir: "):
+        raise RuntimeError(f"unsupported Git metadata file: {pointer}")
+    gitdir_raw=line[8:]
+    gitdir=resolved_git_admin_path(gitdir_raw,repo,"Git directory")
+    gitdir_target=lexical_git_admin_path(gitdir_raw,Path("/workspace"))
+    if not gitdir.is_dir(): raise RuntimeError(f"linked worktree Git directory is invalid: {gitdir}")
+    git_admin_text(gitdir/"HEAD","worktree HEAD")
+    commondir_raw=git_admin_text(gitdir/"commondir","commondir")
+    common=resolved_git_admin_path(
+        commondir_raw,gitdir,"common Git directory",
+    )
+    common_target=lexical_git_admin_path(commondir_raw,gitdir_target)
+    backlink_raw=git_admin_text(gitdir/"gitdir","gitdir backlink")
+    backlink=resolved_git_admin_path(
+        backlink_raw,gitdir,"gitdir backlink",
+    )
+    backlink_target=lexical_git_admin_path(backlink_raw,gitdir_target)
+    if (common.name!=".git" or gitdir.parent!=common/"worktrees"
+            or gitdir_target.parent!=common_target/"worktrees"
+            or backlink!=pointer.resolve(strict=True)):
+        raise RuntimeError("linked worktree metadata does not form a closed Git relationship")
+    validate_git_mount_target(common_target)
+    validate_git_mount_target(backlink_target)
+    git_admin_text(common/"HEAD","common HEAD")
+    validate_git_object_store(common)
+    home=Path.home().resolve()
+    main_checkout=common.parent
+    if main_checkout==home or home.is_relative_to(main_checkout):
+        raise RuntimeError("refusing linked worktree metadata rooted at the host home or one of its parents")
+    for secret_root in (
+        Path(os.environ.get("CODEX_HOME",home/".codex")).expanduser().resolve(),
+        (home/".config"/"gh").resolve(), CONFIG.resolve(),
+    ):
+        if secret_root==common or secret_root.is_relative_to(common) or common.is_relative_to(secret_root):
+            raise RuntimeError(f"credential directory would be exposed by Git metadata mount: {secret_root}")
+    return WorktreeProjection(
+        pointer.resolve(strict=True),backlink_target,gitdir,gitdir_target,common,common_target,
+    )
+
 def identity(repo):
     digest=hashlib.sha256(os.fsencode(repo)).hexdigest()[:16]
     return digest, f"devc2-{digest}"
@@ -690,6 +785,24 @@ def compose_env(repo,public,relay_tls_dir=None,span_client_dir=None,spans=False)
     if spans: values['COMPOSE_PROFILES']='spans'
     return docker_env(values)
 
+def worktree_compose_override(temp,worktree):
+    path=temp/"compose.worktree.yaml"
+    def mount(source,target,read_only=False):
+        result={"type":"bind","source":str(source),"target":str(target),"bind":{"create_host_path":False}}
+        if read_only: result["read_only"]=True
+        return result
+    volumes=[
+        mount(worktree.common,worktree.common_target),
+        mount(worktree.common/"worktrees",worktree.common_target/"worktrees",True),
+        mount(worktree.gitdir,worktree.gitdir_target),
+        mount(worktree.pointer,Path("/workspace/.git"),True),
+    ]
+    volumes.append(mount(worktree.pointer,worktree.backlink_target,True))
+    document={"services":{"devbox":{"volumes":volumes}}}
+    path.write_text(json.dumps(document,separators=(",",":"))+"\n",encoding="utf-8")
+    path.chmod(0o600)
+    return path
+
 def prepare(temp):
     public=temp/'public'; public.mkdir(0o700)
     shutil.copyfile(TACT_CONFIG, public / 'tact-config.toml')
@@ -699,6 +812,12 @@ def prepare(temp):
 def compose(repo,env,*args,capture=False,check=True):
     cmd=['docker','compose','--project-name',identity(repo)[1],'-f',str(ROOT/'compose.yaml'),*args]
     return run(cmd,env=env,capture=capture,check=check,timeout=1800)
+
+def compose_run_command(repo,override=None):
+    command=['docker','compose','--project-name',identity(repo)[1],'-f',str(ROOT/'compose.yaml')]
+    if override: command.extend(['-f',str(override)])
+    command.extend(['run','--rm','--no-deps'])
+    return command
 
 def remove_span_volume(name):
     if not isinstance(name,str) or not name.startswith("devc2-") or not name.endswith("-span-sockets-v2"):
@@ -717,10 +836,12 @@ def _start_unlocked(repo, runtime_doctor=False, span_names=()):
     require_docker()
     ensure_v1_not_running(repo)
     ensure_tact_config()
+    worktree=linked_worktree(repo)
     digest, _project = identity(repo)
     with repository_lock(repo):
         with tempfile.TemporaryDirectory(prefix='devc2-') as raw:
             temp=Path(raw); temp.chmod(0o700)
+            worktree_override=worktree_compose_override(temp,worktree) if worktree else None
             span_clients=temp/'span-clients'; span_providers=temp/'span-providers'
             granted_spans=span_runtime.load_catalog(SPAN_CATALOG,span_names,repo,span_clients,span_providers,ROOT/'spans',ROOT/'launcher'/'command_projection.py',ROOT/'launcher'/'scoped_exec_projection.py')
             empty=temp/'empty'; empty.mkdir(0o700)
@@ -765,7 +886,7 @@ def _start_unlocked(repo, runtime_doctor=False, span_names=()):
                     print("devc2: sanitized startup diagnostics:",file=sys.stderr)
                     if granted_spans: compose(repo,env,'logs','--no-color','--tail','100','span-proxy',capture=False,check=False)
                     raise
-                command=['docker','compose','--project-name',identity(repo)[1],'-f',str(ROOT/'compose.yaml'),'run','--rm','--no-deps']
+                command=compose_run_command(repo,worktree_override)
                 if runtime_doctor: command.extend(['--env','DEVC2_RUNTIME_DOCTOR=1'])
                 command.append('devbox')
                 result=subprocess.run(command,env=env).returncode

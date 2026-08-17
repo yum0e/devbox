@@ -10,6 +10,16 @@ v1 files, resources, volumes, or a target repository's `.devcontainer/`.
 
 The selected host checkout is mounted read/write and outbound network access is
 unrestricted. Treat everything readable in the checkout as visible to the agent.
+For a linked Git worktree, devc2 additionally projects the repository's shared
+Git metadata. Shared refs, objects, config, and hooks remain writable; all
+sibling worktree administrative records and `.git` pointer paths are read-only,
+while the selected worktree's complete administrative directory remains
+writable for its index, `HEAD`, logs, locks, and in-progress operations. The
+parent checkout's files are never mounted. Exotic external object stores are
+rejected rather than broadening the mount. devc2 never creates, lists, prunes,
+or removes worktrees; Herdr remains the intended lifecycle orchestrator. As with
+any writable checkout, Island code can still corrupt its own selected Git
+metadata.
 The runtime is non-root, drops Linux capabilities, sets `no-new-privileges`, and
 has limits of 16 GiB memory, 8 CPUs, and 4096 PIDs. The Docker socket, host home,
 raw OAuth credentials, raw SSH-agent socket, and Span transport keys are never
