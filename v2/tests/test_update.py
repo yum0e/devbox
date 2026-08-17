@@ -26,18 +26,20 @@ class UpdateTests(unittest.TestCase):
 
     def test_current_tree_satisfies_bridge_updater_asset_contract(self):
         bridge_required=(
-            "Dockerfile", "compose.yaml", "devbox/entrypoint.sh", "devbox/configure-pi.sh", "devbox/tact-wrapper.sh",
-            "devbox/pi-wrapper.sh",
+            "Dockerfile", "compose.yaml", "devbox/entrypoint.sh", "devbox/configure-pi.sh",
             "launcher/devc2.py", "launcher/span_runtime.py", "launcher/span_supervisor.py",
             "launcher/dispatcher.py", "launcher/command_projection.py",
-            "launcher/scoped_exec_projection.py", "credential_proxy/span_bridge.py",
-            "credential_proxy/stream_relay.py", "spans/openai/world", "spans/github/world",
+            "launcher/world_attachment.py",
+            "credential_proxy/span_bridge.py", "credential_proxy/stream_relay.py",
+            "credential_proxy/http_projection.py", "spans/openai/world", "spans/github/world",
             "spans/ssh-agent/world", "spans/diagnostics/world",
         )
         for relative in bridge_required:
             self.assertTrue((ROOT/relative).is_file(),relative)
         for relative in (
-            "devbox/herdr-wrapper.py", "credential_proxy/ssh_agent_proxy.py",
+            "devbox/herdr-wrapper.py", "devbox/tact-wrapper.sh", "devbox/pi-wrapper.sh",
+            "launcher/scoped_exec_projection.py",
+            "credential_proxy/ssh_agent_proxy.py",
             "spans/openai/provider", "spans/openai/client",
             "spans/github/provider", "spans/github/client",
             "spans/ssh-agent/provider", "spans/ssh-agent/client",

@@ -17,6 +17,8 @@ services:
       DB_HOST: ${DEVC2_DB_HOST:-postgres-primary.internal}
       DB_PORT: ${DEVC2_DB_PORT:-5432}
       DB_NAME: ${DEVC2_DB_NAME:-app}
+    env_file:
+      - ${DEVC2_WORLD_ENV_FILE:?set DEVC2_WORLD_ENV_FILE}
     volumes:
       - type: bind
         source: ${DEVC2_WORKSPACE:?set DEVC2_WORKSPACE}
@@ -64,6 +66,10 @@ services:
       - /run/devc2-span-tls/client.key
       - --ready-token-file
       - /run/devc2-public/span-ready
+      - --http-config
+      - /run/devc2-public/http-routes.json
+      - --http-port
+      - "3128"
     init: true
     volumes:
       - type: bind

@@ -5,9 +5,46 @@ import selectors
 import socket
 import ssl
 import threading
+import time
 
 
 MAX_PENDING = 1024 * 1024
+KEEPALIVE_IDLE_SECONDS = 30
+KEEPALIVE_INTERVAL_SECONDS = 10
+KEEPALIVE_PROBES = 3
+
+
+def suspend_clock() -> float:
+    """Elapsed time including Linux suspend; wall time is only a portability fallback."""
+    clock = getattr(time, "CLOCK_BOOTTIME", None)
+    if clock is not None:
+        return time.clock_gettime(clock)
+    return time.time()
+
+
+def enable_tcp_keepalive(connection: socket.socket) -> None:
+    """Best-effort detection for a TCP peer lost across host sleep or network change."""
+    try:
+        connection.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        return
+    idle_option = getattr(socket, "TCP_KEEPIDLE", None)
+    if idle_option is None:
+        idle_option = getattr(socket, "TCP_KEEPALIVE", None)
+    for option, value in (
+        (idle_option, KEEPALIVE_IDLE_SECONDS),
+        (getattr(socket, "TCP_KEEPINTVL", None), KEEPALIVE_INTERVAL_SECONDS),
+        (getattr(socket, "TCP_KEEPCNT", None), KEEPALIVE_PROBES),
+    ):
+        if option is None:
+            continue
+        try:
+            connection.setsockopt(socket.IPPROTO_TCP, option, value)
+        except OSError:
+            # Some kernels expose an option but reject changing it for an
+            # unprivileged process. Preserve every independently supported
+            # setting instead of falling back as one all-or-nothing group.
+            pass
 
 
 def duplex_stream(

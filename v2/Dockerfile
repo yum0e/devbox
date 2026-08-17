@@ -26,8 +26,7 @@ RUN apt-get update \
  && ln -s /usr/bin/fdfind /usr/local/bin/fd \
  && rm -rf /var/lib/apt/lists/*
 
-COPY --from=tact /tact /usr/local/libexec/devc2/tact-upstream
-COPY devbox/tact-wrapper.sh /usr/local/bin/tact
+COPY --from=tact /tact /usr/local/bin/tact
 COPY --from=ghcr.io/astral-sh/uv:0.9.26@sha256:9a23023be68b2ed09750ae636228e903a54a05ea56ed03a934d00fe9fbeded4b /uv /uvx /usr/local/bin/
 
 # Bootstrap the latest standalone pnpm without Node, then let pnpm install and
@@ -47,11 +46,10 @@ RUN install -d -m 0755 "$PNPM_HOME" \
  && node --version \
  && pnpm store prune
 
-# Pi keeps its settings and sessions in the Island, but authenticated model
-# requests cross the OpenAI Span through the wrapper installed below.
+# Pi keeps its settings and sessions in the Island. When the OpenAI World is
+# granted, its standard provider environment is attached for the whole launch.
 RUN pnpm add --global --ignore-scripts --no-optional \
       @earendil-works/pi-coding-agent@0.84.2 \
- && mv "$PNPM_HOME/bin/pi" "$PNPM_HOME/bin/pi-upstream" \
  && pnpm store prune
 
 # Match v1's managed Python and Ethereum development toolchain without placing
@@ -87,10 +85,9 @@ RUN set -eux; \
 COPY devbox/entrypoint.sh /usr/local/bin/devc2-entrypoint
 COPY devbox/configure-pi.sh /usr/local/libexec/devc2/configure-pi
 COPY devbox/github-known-hosts /etc/ssh/ssh_known_hosts
-COPY devbox/pi-wrapper.sh /usr/local/share/pnpm/bin/pi
-RUN chmod 0755 /usr/local/bin/devc2-entrypoint /usr/local/bin/tact /usr/local/libexec/devc2/tact-upstream \
+RUN chmod 0755 /usr/local/bin/devc2-entrypoint /usr/local/bin/tact \
       /usr/local/libexec/devc2/configure-pi \
-      /usr/local/share/pnpm/bin/pi /usr/local/share/pnpm/bin/pi-upstream \
+      /usr/local/share/pnpm/bin/pi \
  && groupadd --gid 1000 devbox \
  && useradd --uid 1000 --gid devbox --create-home --shell /bin/zsh devbox \
  && mkdir -p /workspace /home/devbox/.cache /home/devbox/.local/share/tact \

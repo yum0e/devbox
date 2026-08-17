@@ -18,8 +18,10 @@ NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 READY_TOKEN = re.compile(r"^[a-f0-9]{32}$")
 MAX_CONNECTIONS = 16
 MAX_SPANS = 16
+RESUME_GAP_SECONDS = 15
 
-from .stream_relay import duplex_stream
+from .http_projection import HttpProjection, load_routes
+from .stream_relay import duplex_stream, enable_tcp_keepalive, suspend_clock
 
 
 class Bridge:
@@ -32,6 +34,7 @@ class Bridge:
         self.connections_lock = threading.Lock()
         self.reported_failures: set[tuple[str, str]] = set()
         self.failure_lock = threading.Lock()
+        self.last_observed_time = suspend_clock()
         try:
             metadata = self.path.lstat()
         except FileNotFoundError:
@@ -66,14 +69,18 @@ class Bridge:
 
     def _serve(self) -> None:
         while not self.stopping.is_set():
+            client = None
             try:
                 client, _address = self.server.accept()
             except socket.timeout:
-                continue
+                pass
             except OSError:
                 if self.stopping.is_set():
                     return
                 raise
+            self._retire_after_resume(suspend_clock())
+            if client is None:
+                continue
             if not self.slots.acquire(blocking=False):
                 client.close()
                 continue
@@ -84,6 +91,27 @@ class Bridge:
                 client.close()
                 self.slots.release()
 
+    def _retire_after_resume(self, observed_time: float) -> bool:
+        gap = observed_time - self.last_observed_time
+        self.last_observed_time = observed_time
+        if gap <= RESUME_GAP_SECONDS:
+            return False
+        self._retire_connections()
+        return True
+
+    def _retire_connections(self) -> None:
+        with self.connections_lock:
+            connections = tuple(self.connections)
+        for connection in connections:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                connection.close()
+            except OSError:
+                pass
+
     def _connection(self, client: socket.socket) -> None:
         tracked: list[socket.socket] = [client]
         stage = "host connection"
@@ -93,10 +121,15 @@ class Bridge:
             with client:
                 try:
                     with socket.create_connection((self.host, self.port), timeout=10) as raw:
+                        tracked.append(raw)
+                        with self.connections_lock:
+                            self.connections.add(raw)
+                        enable_tcp_keepalive(raw)
                         stage = "TLS handshake"
                         with self.context.wrap_socket(raw, server_hostname=self.host) as remote:
                             tracked.append(remote)
                             with self.connections_lock:
+                                self.connections.discard(raw)
                                 self.connections.add(remote)
                             client.settimeout(None)
                             remote.settimeout(None)
@@ -115,13 +148,7 @@ class Bridge:
     def stop(self) -> None:
         self.stopping.set()
         self.server.close()
-        with self.connections_lock:
-            connections = list(self.connections)
-        for connection in connections:
-            try:
-                connection.close()
-            except OSError:
-                pass
+        self._retire_connections()
         self.thread.join(timeout=2)
         try:
             self.path.unlink()
@@ -161,6 +188,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tls-cert", required=True)
     parser.add_argument("--tls-key", required=True)
     parser.add_argument("--ready-token-file", required=True, type=Path)
+    parser.add_argument("--http-config", required=True, type=Path)
+    parser.add_argument("--http-port", type=int, default=3128)
     args = parser.parse_args(argv)
     args.socket_dir.mkdir(parents=True, exist_ok=True)
     ready_path = args.socket_dir / ".ready"
@@ -173,7 +202,9 @@ def main(argv: list[str] | None = None) -> int:
     context.options |= ssl.OP_NO_COMPRESSION
     context.load_cert_chain(certfile=args.tls_cert, keyfile=args.tls_key)
     slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
-    bridges = [Bridge(name, port, args.socket_dir, args.host, context, slots) for name, port in load_config(args.config)]
+    entries = load_config(args.config)
+    bridges = [Bridge(name, port, args.socket_dir, args.host, context, slots) for name, port in entries]
+    http = HttpProjection(load_routes(args.http_config, {name for name, _port in entries}), args.socket_dir, args.http_port)
     stopping = threading.Event()
     def stop(_signum=None, _frame=None):
         stopping.set()
@@ -182,11 +213,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         for bridge in bridges:
             bridge.start()
+        http.start()
         ready_path.write_text(token, encoding="ascii")
         ready_path.chmod(0o444)
         stopping.wait()
     finally:
         ready_path.unlink(missing_ok=True)
+        http.stop()
         for bridge in reversed(bridges):
             bridge.stop()
     return 0

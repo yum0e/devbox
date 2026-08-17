@@ -183,61 +183,21 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("BOUNDARY_", devbox_section)
         self.assertNotIn("BDX_", devbox_section)
 
-    def test_tact_wrapper_uses_openai_span_except_for_local_commands(self):
-        wrapper_source = (PATH.parents[1] / "devbox" / "tact-wrapper.sh").read_text()
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            upstream, openai, result = root / "upstream", root / "openai", root / "result"
-            upstream.write_text("#!/bin/sh\n" f"printf 'upstream:%s\\n' \"$*\" >>{result}\n" "exit 17\n")
-            upstream.chmod(0o755)
-            openai.write_text("#!/bin/sh\n" f"printf 'openai:%s\\n' \"$*\" >>{result}\n" "shift 2\nexec \"$@\"\n")
-            openai.chmod(0o755)
-            wrapper = root / "tact"
-            wrapper.write_text(wrapper_source.replace("/usr/local/libexec/devc2/tact-upstream", str(upstream)).replace("/run/devc2/bin/openai", str(openai)))
-            wrapper.chmod(0o755)
-            for arguments in (["config", "show"], ["--version"]):
-                self.assertEqual(subprocess.run([str(wrapper), *arguments]).returncode, 17)
-            self.assertEqual(subprocess.run([str(wrapper), "run", "task"]).returncode, 17)
-            self.assertEqual(result.read_text().splitlines(), [
-                "upstream:config show", "upstream:--version",
-                f"openai:run -- {upstream} run task", "upstream:run task",
-            ])
-
-    def test_pi_wrapper_only_routes_through_the_openai_span(self):
-        wrapper_source = (PATH.parents[1] / "devbox" / "pi-wrapper.sh").read_text()
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            upstream, openai, wrapper = root / "pi-upstream", root / "openai", root / "pi"
-            result = root / "result"
-            upstream.write_text(
-                "#!/bin/sh\n"
-                f"printf 'upstream:%s\\n' \"$*\" >>{result}\n"
-                f"if [ \"${{1:-}}\" != --version ]; then "
-                f"test \"$DEVC2_PI_OPENAI_TOKEN\" = projected-token || echo token-missing >>{result}; fi\n"
-                "exit 17\n"
-            )
-            upstream.chmod(0o755)
-            openai.write_text(
-                "#!/bin/sh\n"
-                f"printf 'openai:%s\\n' \"$*\" >>{result}\n"
-                "shift 2\n"
-                "export DEVC2_PI_OPENAI_TOKEN=projected-token\n"
-                "exec \"$@\"\n"
-            )
-            openai.chmod(0o755)
-            wrapper.write_text(
-                wrapper_source
-                .replace("/usr/local/share/pnpm/bin/pi-upstream", str(upstream))
-                .replace("/run/devc2/bin/openai", str(openai))
-            )
-            wrapper.chmod(0o755)
-            self.assertEqual(subprocess.run([str(wrapper), "--version"]).returncode, 17)
-            self.assertEqual(subprocess.run([str(wrapper), "task"]).returncode, 17)
-            self.assertEqual(result.read_text().splitlines(), [
-                "upstream:--version",
-                f"openai:run -- {upstream} task",
-                "upstream:task",
-            ])
+    def test_stock_gh_pi_and_tact_receive_lifetime_world_environment(self):
+        root = PATH.parents[1]
+        dockerfile = (root / "Dockerfile").read_text()
+        compose = (root / "compose.yaml").read_text()
+        self.assertIn("ca-certificates curl fd-find gh git jq", dockerfile)
+        self.assertIn("COPY --from=tact /tact /usr/local/bin/tact", dockerfile)
+        self.assertIn("@earendil-works/pi-coding-agent@0.84.2", dockerfile)
+        self.assertNotIn("tact-upstream", dockerfile)
+        self.assertNotIn("pi-upstream", dockerfile)
+        self.assertNotIn("tact-wrapper.sh", dockerfile)
+        self.assertNotIn("pi-wrapper.sh", dockerfile)
+        self.assertFalse((root / "devbox" / "tact-wrapper.sh").exists())
+        self.assertFalse((root / "devbox" / "pi-wrapper.sh").exists())
+        self.assertIn("env_file:", compose)
+        self.assertIn("${DEVC2_WORLD_ENV_FILE:?set DEVC2_WORLD_ENV_FILE}", compose)
 
     def test_pi_provider_configuration_is_initialized_without_credentials(self):
         configure = PATH.parents[1] / "devbox" / "configure-pi.sh"
@@ -265,7 +225,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("ghcr.io/astral-sh/uv:0.9.26@sha256:", dockerfile)
         self.assertIn("python:3.12-alpine@sha256:", proxy_dockerfile)
         self.assertNotIn("COPY credential_proxy /app/credential_proxy", proxy_dockerfile)
-        for source in ("__init__.py", "span_bridge.py", "stream_relay.py"):
+        for source in ("__init__.py", "span_bridge.py", "stream_relay.py", "http_projection.py"):
             self.assertIn(source, proxy_dockerfile)
         self.assertNotIn("ssh_agent_proxy.py", proxy_dockerfile)
 
@@ -285,7 +245,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("pnpm runtime set node latest --global", dockerfile)
         self.assertIn("@earendil-works/pi-coding-agent@0.84.2", dockerfile)
         self.assertIn("--ignore-scripts --no-optional", dockerfile)
-        self.assertIn('mv "$PNPM_HOME/bin/pi" "$PNPM_HOME/bin/pi-upstream"', dockerfile)
+        self.assertNotIn("pi-upstream", dockerfile)
         self.assertIn("COPY devbox/configure-pi.sh /usr/local/libexec/devc2/configure-pi", dockerfile)
         self.assertIn("/usr/local/libexec/devc2/configure-pi", entrypoint)
         island,auth=dockerfile.split("FROM island AS auth",1)
@@ -334,12 +294,13 @@ class CliTests(unittest.TestCase):
         self.assertIn("ssh-add -L", entrypoint)
         self.assertIn('test "${#doctor_identities[@]}" -eq 1', entrypoint)
         self.assertNotIn("grep -c '^ssh-'", entrypoint)
-        self.assertIn("openai run -- /bin/sh -ceu", entrypoint)
+        self.assertNotIn("openai run --", entrypoint)
         self.assertIn("backend-api/codex/models?client_version=0.147.0", entrypoint)
         self.assertIn("OpenAI Span: authenticated models request", entrypoint)
         self.assertIn("timeout 90 pi --print --no-session --no-tools", entrypoint)
         self.assertIn("Pi OpenAI Span: completed response", entrypoint)
-        self.assertIn("github run -- gh api user", entrypoint)
+        self.assertIn("gh api user", entrypoint)
+        self.assertNotIn("github run --", entrypoint)
         self.assertIn("tact config show", entrypoint)
         self.assertNotIn("set -x", entrypoint)
 
@@ -370,7 +331,8 @@ class CliTests(unittest.TestCase):
 
     def test_entrypoint_uses_optional_github_and_ssh_agent_spans_with_signing_readiness(self):
         entrypoint = (PATH.parents[1] / "devbox" / "entrypoint.sh").read_text()
-        self.assertIn("github run -- gh api user", entrypoint)
+        self.assertIn("gh api user", entrypoint)
+        self.assertNotIn("github run --", entrypoint)
         self.assertIn("ssh-keygen -Y sign", entrypoint)
         self.assertIn("ssh-keygen-with-agent", entrypoint)
         self.assertIn("gpg.ssh.program", entrypoint)
@@ -385,11 +347,12 @@ class CliTests(unittest.TestCase):
         self.assertIn("git config --global --unset-all core.sshCommand", entrypoint)
         self.assertIn("jj config unset --user signing.key", entrypoint)
         self.assertLess(entrypoint.index("--unset-all core.sshCommand"),entrypoint.index("if [[ -S /run/devc2/spans/ssh-agent.sock ]]"))
-        self.assertIn("if command -v github", entrypoint)
+        self.assertIn('if [[ -n "${GH_TOKEN:-}" ]]', entrypoint)
         self.assertNotIn('$HOME/.zshenv', entrypoint)
         self.assertNotIn('$HOME/.bashrc', entrypoint)
-        wrapper = (PATH.parents[1] / "devbox" / "tact-wrapper.sh").read_text()
-        self.assertIn('exec /run/devc2/bin/openai run -- /usr/local/libexec/devc2/tact-upstream "$@"', wrapper)
+        self.assertFalse((PATH.parents[1] / "devbox" / "tact-wrapper.sh").exists())
+        self.assertFalse((PATH.parents[1] / "devbox" / "pi-wrapper.sh").exists())
+        self.assertNotIn("openai run --", entrypoint)
         runtime_path=(PATH.parents[1]/"Dockerfile").read_text().split("ENV HOME=",1)[1]
         self.assertLess(runtime_path.index("/usr/local/bin"),runtime_path.index("/run/devc2/bin"))
         self.assertLess(runtime_path.index("/run/devc2/bin"),runtime_path.index("/home/devbox/.local/bin"))

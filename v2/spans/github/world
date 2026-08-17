@@ -288,8 +288,7 @@ class ProxyManager:
             if self.proxy is not None and self._running(self.proxy):
                 return self.proxy
             if self.proxy is not None:
-                self.proxy.stop()
-                self.proxy = None
+                raise ProviderError("GitHub credential proxy exited after its manifest was attached")
             self.proxy = self._start()
             return self.proxy
 

@@ -129,7 +129,7 @@ def source_version(source):
     return match.group(1)
 
 def validate_asset_tree(source,strict=False):
-    required=("Dockerfile","compose.yaml","devbox/entrypoint.sh","devbox/configure-pi.sh","devbox/tact-wrapper.sh","devbox/pi-wrapper.sh","launcher/devc2.py","launcher/span_runtime.py","launcher/span_supervisor.py","launcher/dispatcher.py","launcher/command_projection.py","launcher/scoped_exec_projection.py","credential_proxy/span_bridge.py","credential_proxy/stream_relay.py","spans/openai/world","spans/github/world","spans/ssh-agent/world","spans/diagnostics/world")
+    required=("Dockerfile","compose.yaml","devbox/entrypoint.sh","devbox/configure-pi.sh","launcher/devc2.py","launcher/span_runtime.py","launcher/span_supervisor.py","launcher/dispatcher.py","launcher/command_projection.py","launcher/world_attachment.py","credential_proxy/span_bridge.py","credential_proxy/stream_relay.py","credential_proxy/http_projection.py","spans/openai/world","spans/github/world","spans/ssh-agent/world","spans/diagnostics/world")
     if not source.is_dir() or source.is_symlink(): raise RuntimeError("release asset root must be a directory")
     total=0; count=0; allowed={"Dockerfile","compose.yaml","README.md","install.sh","devbox","credential_proxy","launcher","spans"}
     for path in source.rglob("*"):
@@ -188,14 +188,14 @@ def copy_release_assets(source,destination):
     for path in destination.rglob("*"):
         if path.is_dir(): path.chmod(0o755)
         elif path.is_file(): path.chmod(0o644)
-    for relative in ("launcher/devc2.py","launcher/dispatcher.py","launcher/command_projection.py","launcher/scoped_exec_projection.py","devbox/entrypoint.sh","devbox/configure-pi.sh","devbox/tact-wrapper.sh","devbox/pi-wrapper.sh","spans/openai/world","spans/github/world","spans/ssh-agent/world","spans/diagnostics/world"):
+    for relative in ("launcher/devc2.py","launcher/dispatcher.py","launcher/command_projection.py","devbox/entrypoint.sh","devbox/configure-pi.sh","spans/openai/world","spans/github/world","spans/ssh-agent/world","spans/diagnostics/world"):
         (destination/relative).chmod(0o755)
 
 def freeze_asset_tree(destination):
     for path in destination.rglob("*"):
         if path.is_dir(): path.chmod(0o555)
         elif path.is_file(): path.chmod(0o444)
-    for relative in ("launcher/devc2.py","launcher/dispatcher.py","launcher/command_projection.py","launcher/scoped_exec_projection.py","devbox/entrypoint.sh","devbox/configure-pi.sh","devbox/tact-wrapper.sh","devbox/pi-wrapper.sh","spans/openai/world","spans/github/world","spans/ssh-agent/world","spans/diagnostics/world"):
+    for relative in ("launcher/devc2.py","launcher/dispatcher.py","launcher/command_projection.py","devbox/entrypoint.sh","devbox/configure-pi.sh","spans/openai/world","spans/github/world","spans/ssh-agent/world","spans/diagnostics/world"):
         (destination/relative).chmod(0o555)
     destination.chmod(0o555)
 
@@ -817,10 +817,12 @@ def generate_relay_pki(root):
 
 def compose_env(repo,public,relay_tls_dir=None,span_client_dir=None,spans=False):
     digest,project=identity(repo)
+    world_env=public/'world.env'
     values={'DEVC2_PROJECT_NAME':project,'DEVC2_WORKSPACE':str(repo),'DEVC2_WORKSPACE_HASH':digest,'DEVC2_PUBLIC_DIR':str(public),'DEVC2_INSTALL_DIR':str(ROOT),'DEVC2_IMAGE':f'devc2:{VERSION}'}
     values['DEVC2_SPAN_RELAY_TLS_DIR']=str(relay_tls_dir or '/dev/null')
     values['DEVC2_SPAN_CLIENT_DIR']=str(span_client_dir or public)
     values['DEVC2_SPAN_VOLUME']=project+'-span-sockets-v2'
+    values['DEVC2_WORLD_ENV_FILE']=str(world_env)
     if spans: values['COMPOSE_PROFILES']='spans'
     return docker_env(values)
 
@@ -846,6 +848,8 @@ def prepare(temp):
     public=temp/'public'; public.mkdir(0o700)
     shutil.copyfile(TACT_CONFIG, public / 'tact-config.toml')
     (public / 'tact-config.toml').chmod(0o644)
+    (public / 'world.env').write_text('',encoding='utf-8')
+    (public / 'world.env').chmod(0o600)
     return public
 
 def compose(repo,env,*args,capture=False,check=True):
@@ -882,8 +886,10 @@ def _start_unlocked(repo, runtime_doctor=False, span_names=()):
             temp=Path(raw); temp.chmod(0o700)
             worktree_override=worktree_compose_override(temp,worktree) if worktree else None
             span_clients=temp/'span-clients'; span_providers=temp/'span-providers'
-            granted_spans=span_runtime.load_catalog(SPAN_CATALOG,span_names,repo,span_clients,span_providers,ROOT/'spans',ROOT/'launcher'/'command_projection.py',ROOT/'launcher'/'scoped_exec_projection.py')
+            granted_spans=span_runtime.load_catalog(SPAN_CATALOG,span_names,repo,span_clients,span_providers,ROOT/'spans',ROOT/'launcher'/'command_projection.py')
             empty=temp/'empty'; empty.mkdir(0o700)
+            (empty/'world.env').write_text('',encoding='utf-8')
+            (empty/'world.env').chmod(0o600)
             # A killed launcher may have left sidecars behind. Stop the old
             # project before projecting this launch's explicit grant set.
             cleanup_env=compose_env(repo,empty,span_client_dir=empty,spans=True)
@@ -896,6 +902,7 @@ def _start_unlocked(repo, runtime_doctor=False, span_names=()):
                 if granted_spans:
                     relay_server_dir,relay_client_dir=generate_relay_pki(temp/'span-relay-pki')
                     spans=span_runtime.SpanRuntime(granted_spans,repo,f'{digest}-{secrets.token_hex(8)}',relay_server_dir)
+                    spans.materialize_http_attachments(public)
                 if granted_spans:
                     (public/'span-ready').write_text(secrets.token_hex(16))
                     (public/'span-ready').chmod(0o444)

@@ -52,6 +52,23 @@ if [[ -e /run/devc2-public/spans.json ]]; then
   fi
 fi
 
+# HTTP Worlds attach only public/fake application state. Copy it into a fresh
+# launch-local writable tree so stock tools can use their normal configuration
+# paths, while the real credentials and routing policy remain in host Worlds.
+readonly attachment_root=/tmp/devc2-http-attachments
+readonly attachment_ca=/tmp/devc2-http-ca.pem
+rm -rf -- "$attachment_root"
+rm -f -- "$attachment_ca"
+if [[ -d /run/devc2-public/http-attachments ]]; then
+  cp -R /run/devc2-public/http-attachments "$attachment_root"
+  find "$attachment_root" -type d -exec chmod 0700 {} +
+  find "$attachment_root" -type f -exec chmod 0600 {} +
+fi
+if [[ -s /run/devc2-public/http-ca.pem ]]; then
+  umask 077
+  cat /etc/ssl/certs/ca-certificates.crt /run/devc2-public/http-ca.pem >"$attachment_ca"
+fi
+
 # Clear grant-managed state from the persistent home before applying this
 # launch's capabilities. A previous grant must never survive by configuration.
 git config --global --unset-all core.sshCommand >/dev/null 2>&1 || true
@@ -127,8 +144,8 @@ fi
 
 # GitHub identity is useful but not required to open an Island. It is learned
 # only through the explicitly granted GitHub Span and never from a raw token.
-if command -v github >/dev/null 2>&1; then
-  if github_identity="$(github run -- gh api user 2>/dev/null)"; then
+if [[ -n "${GH_TOKEN:-}" ]]; then
+  if github_identity="$(gh api user 2>/dev/null)"; then
     github_login="$(printf '%s' "$github_identity" | jq -r '.login // empty')"
     github_id="$(printf '%s' "$github_identity" | jq -r '.id // empty')"
     if [[ -n "$github_login" && -n "$github_id" ]]; then
@@ -170,26 +187,24 @@ if [[ "${DEVC2_RUNTIME_DOCTOR:-}" == "1" ]]; then
     rm -rf -- "$doctor_jj"
     echo "✓ SSH-agent Span: Git and Jujutsu signing verified without inherited agent state"
   fi
-  if command -v github >/dev/null 2>&1; then
-    github run -- gh api user --jq .login >/dev/null
+  if [[ -n "${GH_TOKEN:-}" ]]; then
+    gh api user --jq .login >/dev/null
     echo "✓ GitHub Span: authenticated"
   fi
-  if command -v openai >/dev/null 2>&1; then
-    openai run -- /bin/sh -ceu '
-      access="$(jq -er .tokens.access_token "$TACT_AUTH_FILE")"
-      account="$(jq -er .tokens.account_id "$TACT_AUTH_FILE")"
-      response="$(mktemp /tmp/devc2-openai-doctor.XXXXXX)"
-      status="$(curl -sS --max-time 30 -w "%{http_code}" \
-        -H "Authorization: Bearer $access" \
-        -H "chatgpt-account-id: $account" \
-        -H "originator: codex_cli_rs" \
-        -H "User-Agent: codex_cli_rs/0.147.0" \
-        "https://chatgpt.com/backend-api/codex/models?client_version=0.147.0" \
-        -o "$response")"
-      test "$status" = 200
-      jq -e "type == \"object\"" "$response" >/dev/null
-      rm -f -- "$response"
-    '
+  if [[ -n "${TACT_AUTH_FILE:-}" ]]; then
+    access="$(jq -er .tokens.access_token "$TACT_AUTH_FILE")"
+    account="$(jq -er .tokens.account_id "$TACT_AUTH_FILE")"
+    response="$(mktemp /tmp/devc2-openai-doctor.XXXXXX)"
+    status="$(curl -sS --max-time 30 -w "%{http_code}" \
+      -H "Authorization: Bearer $access" \
+      -H "chatgpt-account-id: $account" \
+      -H "originator: codex_cli_rs" \
+      -H "User-Agent: codex_cli_rs/0.147.0" \
+      "https://chatgpt.com/backend-api/codex/models?client_version=0.147.0" \
+      -o "$response")"
+    test "$status" = 200
+    jq -e 'type == "object"' "$response" >/dev/null
+    rm -f -- "$response"
     echo "✓ OpenAI Span: authenticated models request"
     pi_probe="$(timeout 90 pi --print --no-session --no-tools \
       --no-extensions --no-skills --no-prompt-templates --no-context-files \

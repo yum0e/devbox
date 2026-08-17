@@ -382,9 +382,9 @@ class ProxyManager:
             if self.proxy is not None and self._running(self.proxy):
                 return self.proxy
             if self.proxy is not None:
-                self.proxy.stop()
-                self.proxy = None
-            # A failed attempt leaves no retained state, so the next request retries lazily.
+                raise ProviderError("OpenAI credential proxy exited after its manifest was attached")
+            # A failed first attempt leaves no retained state, so startup may
+            # be retried without ever changing a published manifest.
             candidate = self._start()
             self.proxy = candidate
             return candidate

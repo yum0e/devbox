@@ -24,12 +24,13 @@ MAX_CLIENT_BYTES = 64 * 1024 * 1024
 MAX_PROVIDER_BYTES = 64 * 1024 * 1024
 MAX_CONNECTIONS = 64
 MAX_SPANS = 16
-SCOPED_EXEC_BUILTINS = {"github", "openai"}
+HTTP_ATTACHMENT_BUILTINS = {"github", "openai"}
 STREAM_BUILTINS = {"ssh-agent"}
 COMMAND_BUILTINS = {"diagnostics"}
 SUPERVISOR = Path(__file__).with_name("span_supervisor.py")
 
-from credential_proxy.stream_relay import duplex_stream
+from credential_proxy.stream_relay import duplex_stream, enable_tcp_keepalive
+from launcher import world_attachment
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,7 @@ class Span:
     name: str
     client: Path | None
     provider: Path
+    http_attachment: bool = False
 
 
 def valid_name(name: str) -> bool:
@@ -78,7 +80,7 @@ def _snapshot_executable(raw: object, label: str, target: Path, maximum: int, fo
         if descriptor is not None: os.close(descriptor)
 
 
-def load_catalog(path: Path, names: tuple[str, ...], forbidden_root: Path, client_destination: Path, provider_destination: Path, builtin_root: Path | None = None, command_projection: Path | None = None, scoped_exec_projection: Path | None = None) -> list[Span]:
+def load_catalog(path: Path, names: tuple[str, ...], forbidden_root: Path, client_destination: Path, provider_destination: Path, builtin_root: Path | None = None, command_projection: Path | None = None) -> list[Span]:
     if len(names)>MAX_SPANS:
         raise RuntimeError(f"an Island may grant at most {MAX_SPANS} Spans")
     client_destination.mkdir(mode=0o700)
@@ -93,16 +95,14 @@ def load_catalog(path: Path, names: tuple[str, ...], forbidden_root: Path, clien
     if builtin_root is not None:
         for name in names:
             world=builtin_root/name/"world"
-            if world.is_file() and name in SCOPED_EXEC_BUILTINS:
-                if scoped_exec_projection is None:
-                    raise RuntimeError(f"Span {name!r} cannot be projected")
-                builtin_entries[name]=(world,scoped_exec_projection)
+            if world.is_file() and name in HTTP_ATTACHMENT_BUILTINS:
+                builtin_entries[name]=(world,None,True)
             elif world.is_file() and name in STREAM_BUILTINS:
-                builtin_entries[name]=(world,None)
+                builtin_entries[name]=(world,None,False)
             elif world.is_file() and name in COMMAND_BUILTINS:
                 if command_projection is None:
                     raise RuntimeError(f"Span {name!r} cannot be projected")
-                builtin_entries[name]=(world,command_projection)
+                builtin_entries[name]=(world,command_projection,False)
     external_names=[name for name in names if name not in builtin_entries]
     forbidden_root=forbidden_root.resolve()
     if not external_names:
@@ -116,17 +116,18 @@ def load_catalog(path: Path, names: tuple[str, ...], forbidden_root: Path, clien
         if entry is None:
             raise RuntimeError(f"Span {name!r} is unavailable")
         if isinstance(entry,tuple):
-            world,link=entry
+            world,link,http_attachment=entry
             provider=_snapshot_executable(str(world),f"{name!r} World",provider_destination/name,MAX_PROVIDER_BYTES,forbidden_root)
-            client=None if link is None else _snapshot_executable(str(link),f"{name!r} scoped-exec Link",client_destination/name,MAX_CLIENT_BYTES,None)
+            client=None if link is None else _snapshot_executable(str(link),f"{name!r} Link",client_destination/name,MAX_CLIENT_BYTES,None)
         elif isinstance(entry,str):
             if command_projection is None:
                 raise RuntimeError(f"Span {name!r} cannot be projected")
             provider=_snapshot_executable(entry,f"{name!r} World",provider_destination/name,MAX_PROVIDER_BYTES,forbidden_root)
             client=_snapshot_executable(str(command_projection),f"{name!r} command projection",client_destination/name,MAX_CLIENT_BYTES,None)
+            http_attachment=False
         else:
             raise RuntimeError(f"Span {name!r} has an invalid World path")
-        result.append(Span(name,client,provider))
+        result.append(Span(name,client,provider,http_attachment))
     client_destination.chmod(0o555)
     return result
 
@@ -418,6 +419,7 @@ class OpaqueRelay:
         with self.connections_lock:
             self.connections.add(raw)
         try:
+            enable_tcp_keepalive(raw)
             raw.settimeout(5)
             with self.context.wrap_socket(raw, server_side=True) as incoming:
                 tracked = incoming
@@ -504,6 +506,14 @@ class SpanRuntime:
         except Exception:
             self.stop()
             raise
+
+    def materialize_http_attachments(self, public: Path) -> dict[str, str]:
+        worlds = [
+            (provider.span.name, provider.address)
+            for provider in self.providers
+            if provider.span.http_attachment
+        ]
+        return world_attachment.materialize(public, worlds)
 
     def _monitor_provider(self, provider: Provider) -> None:
         while not self.stopping.is_set():

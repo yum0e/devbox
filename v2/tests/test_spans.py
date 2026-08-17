@@ -25,7 +25,6 @@ from launcher import span_runtime
 
 V2_ROOT = Path(__file__).parents[1]
 COMMAND_PROJECTION = V2_ROOT / "launcher" / "command_projection.py"
-SCOPED_EXEC_PROJECTION = V2_ROOT / "launcher" / "scoped_exec_projection.py"
 
 
 class BrokenSendSocket:
@@ -159,37 +158,32 @@ class SpanCatalogTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root=Path(raw); builtin=root/"builtins"/"openai"; builtin.mkdir(parents=True)
             world=builtin/"world"; world.write_text("#!/bin/sh\nexit 0\n"); world.chmod(0o555)
-            link=root/"scoped-link"; link.write_bytes(SCOPED_EXEC_PROJECTION.read_bytes()); link.chmod(0o555)
             destination=root/"snapshot"; destination.mkdir()
             spans=span_runtime.load_catalog(
                 root/"missing.json",("openai",),root/"workspace",destination/"clients",destination/"worlds",
-                root/"builtins",scoped_exec_projection=link,
+                root/"builtins",
             )
-            self.assertEqual(
-                [(item.name,item.provider.read_bytes(),item.client.read_bytes()) for item in spans],
-                [('openai',world.read_bytes(),link.read_bytes())],
-            )
+            self.assertEqual([(item.name,item.provider.read_bytes()) for item in spans],[('openai',world.read_bytes())])
+            self.assertIsNone(spans[0].client)
+            self.assertTrue(spans[0].http_attachment)
             self.assertEqual(stat.S_IMODE(spans[0].provider.stat().st_mode),0o555)
-            self.assertEqual(stat.S_IMODE(spans[0].client.stat().st_mode),0o555)
-            self.assertNotIn(b"openai",link.read_bytes().lower())
+            self.assertEqual(list((destination/"clients").iterdir()),[])
 
-    def test_actual_scoped_exec_worlds_share_one_generic_link(self):
+    def test_http_worlds_are_lifetime_attachments_without_commands(self):
         with tempfile.TemporaryDirectory() as raw:
             root=Path(raw); destination=root/"snapshot"; destination.mkdir()
             items=span_runtime.load_catalog(
                 root/"missing.json",("github","openai"),root/"workspace",destination/"links",destination/"worlds",
-                V2_ROOT/"spans",scoped_exec_projection=SCOPED_EXEC_PROJECTION,
+                V2_ROOT/"spans",
             )
             for item in items:
                 self.assertEqual(
                     item.provider.read_bytes(),
                     (V2_ROOT/"spans"/item.name/"world").read_bytes(),
                 )
-                self.assertEqual(item.client.read_bytes(),SCOPED_EXEC_PROJECTION.read_bytes())
-            self.assertEqual(
-                items[0].client.read_bytes(),
-                items[1].client.read_bytes(),
-            )
+                self.assertIsNone(item.client)
+                self.assertTrue(item.http_attachment)
+            self.assertEqual(list((destination/"links").iterdir()),[])
 
     def test_ssh_world_uses_only_the_generic_stream_link(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -451,14 +445,20 @@ class ProviderLifecycleTests(unittest.TestCase):
             try:
                 context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=str(client_tls / "ca.crt"))
                 context.load_cert_chain(client_tls / "client.crt", client_tls / "client.key")
-                with socket.create_connection(("127.0.0.1", relay.port), timeout=2) as raw_socket:
-                    with context.wrap_socket(raw_socket, server_hostname="host.docker.internal") as connection:
-                        payload = bytes(range(256)) * 32
-                        connection.sendall(payload)
-                        received = bytearray()
-                        while len(received) < len(payload):
-                            received.extend(connection.recv(4096))
-                        self.assertEqual(bytes(received), payload)
+                with mock.patch.object(
+                    span_runtime,
+                    "enable_tcp_keepalive",
+                    wraps=span_runtime.enable_tcp_keepalive,
+                ) as keepalive:
+                    with socket.create_connection(("127.0.0.1", relay.port), timeout=2) as raw_socket:
+                        with context.wrap_socket(raw_socket, server_hostname="host.docker.internal") as connection:
+                            payload = bytes(range(256)) * 32
+                            connection.sendall(payload)
+                            received = bytearray()
+                            while len(received) < len(payload):
+                                received.extend(connection.recv(4096))
+                            self.assertEqual(bytes(received), payload)
+                    self.assertTrue(keepalive.called)
             finally:
                 relay.stop()
                 provider.stop()
@@ -584,6 +584,101 @@ class ProviderLifecycleTests(unittest.TestCase):
 
 
 class BridgeConfigTests(unittest.TestCase):
+    def test_bridge_retires_existing_streams_after_a_suspend_gap(self):
+        with tempfile.TemporaryDirectory() as raw:
+            bridge = span_bridge.Bridge("openai", 1, Path(raw), "127.0.0.1", mock.Mock())
+            bridge.last_observed_time = 100
+            bridge_side, island_side = socket.socketpair()
+            with bridge.connections_lock:
+                bridge.connections.add(bridge_side)
+            try:
+                self.assertFalse(
+                    bridge._retire_after_resume(100 + span_bridge.RESUME_GAP_SECONDS)
+                )
+                island_side.sendall(b"still connected")
+                self.assertEqual(bridge_side.recv(15), b"still connected")
+
+                self.assertTrue(
+                    bridge._retire_after_resume(
+                        100 + 2 * span_bridge.RESUME_GAP_SECONDS + 1
+                    )
+                )
+                island_side.settimeout(1)
+                self.assertEqual(island_side.recv(1), b"")
+            finally:
+                bridge_side.close()
+                island_side.close()
+                bridge.server.close()
+                bridge.path.unlink(missing_ok=True)
+
+    def test_bridge_poll_retires_stale_streams_after_resume(self):
+        with tempfile.TemporaryDirectory() as raw:
+            bridge = span_bridge.Bridge("openai", 1, Path(raw), "127.0.0.1", mock.Mock())
+            bridge_side, island_side = socket.socketpair()
+            with bridge.connections_lock:
+                bridge.connections.add(bridge_side)
+            bridge.last_observed_time = (
+                span_bridge.suspend_clock() - span_bridge.RESUME_GAP_SECONDS - 1
+            )
+            bridge.start()
+            try:
+                island_side.settimeout(2)
+                self.assertEqual(island_side.recv(1), b"")
+            finally:
+                bridge.stop()
+                bridge_side.close()
+                island_side.close()
+
+    def test_bridge_tracks_tcp_during_tls_handshake_and_enables_keepalive(self):
+        with tempfile.TemporaryDirectory() as raw:
+            bridge = span_bridge.Bridge("openai", 1, Path(raw), "127.0.0.1", mock.Mock())
+            client = mock.MagicMock(spec=socket.socket)
+            raw_connection = mock.MagicMock(spec=socket.socket)
+            raw_context = mock.MagicMock()
+            raw_context.__enter__.return_value = raw_connection
+            remote = mock.MagicMock(spec=socket.socket)
+            remote_context = mock.MagicMock()
+            remote_context.__enter__.return_value = remote
+
+            def wrap_socket(connection, server_hostname):
+                self.assertIs(connection, raw_connection)
+                self.assertEqual(server_hostname, "127.0.0.1")
+                with bridge.connections_lock:
+                    self.assertIn(raw_connection, bridge.connections)
+                return remote_context
+
+            bridge.context.wrap_socket.side_effect = wrap_socket
+            self.assertTrue(bridge.slots.acquire(blocking=False))
+            try:
+                with mock.patch.object(
+                    span_bridge.socket,
+                    "create_connection",
+                    return_value=raw_context,
+                ), mock.patch.object(
+                    span_bridge, "enable_tcp_keepalive"
+                ) as keepalive, mock.patch.object(span_bridge, "duplex_stream"):
+                    bridge._connection(client)
+                keepalive.assert_called_once_with(raw_connection)
+            finally:
+                bridge.server.close()
+                bridge.path.unlink(missing_ok=True)
+
+    def test_tcp_keepalive_is_enabled_for_relay_connections(self):
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        client = socket.create_connection(listener.getsockname(), timeout=1)
+        server, _address = listener.accept()
+        try:
+            span_bridge.enable_tcp_keepalive(client)
+            self.assertEqual(
+                client.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE), 1
+            )
+        finally:
+            client.close()
+            server.close()
+            listener.close()
+
     def test_repeated_bridge_failure_emits_one_bounded_diagnostic(self):
         with tempfile.TemporaryDirectory() as raw:
             bridge = span_bridge.Bridge("ssh-agent", 1, Path(raw), "127.0.0.1", mock.Mock())

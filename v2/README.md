@@ -26,9 +26,10 @@ raw OAuth credentials, raw SSH-agent socket, and Span transport keys are never
 mounted into the Island.
 
 The first-party OpenAI and GitHub Worlds retain bearer credentials on the host
-and inject them only into narrowly allowed HTTPS requests. Both export bounded
-manifests to the same generic scoped-exec Link, which creates child-scoped fake
-authentication and proxy state, then removes it. The SSH-agent World accepts
+and inject them only into narrowly allowed HTTPS requests. At Island launch,
+both export bounded public manifests to one generic HTTP Link. It attaches fake
+authentication files, environment, public CAs, and exact routes for the lifetime
+of that Island. The SSH-agent World accepts
 only identity queries and signing requests for one host-selected public key;
 the generic opaque-stream Link projects it directly as `SSH_AUTH_SOCK`. Every
 other agent operation and key is rejected before reaching the host agent.
@@ -68,12 +69,13 @@ Island, the projected command and its private endpoint are `/run/devc2/bin/herdr
 removes the checkout or v1 resources.
 
 The first-party `openai`, `github`, `ssh-agent`, and `diagnostics` Spans ship with devc2 but are
-still inert until named. `tact` and Pi automatically run authenticated
-operations through `openai`; local version and help commands need no grant. Pi
+still inert until named. With `openai` granted, stock `tact` and Pi see their
+normal configuration and environment; with `github` granted, stock `gh` sees a
+normal authenticated environment. Pi
 sees a normal `openai-codex` provider backed by a non-secret Span capability;
 the Span owns the connection, account identity, and host ChatGPT credentials.
 Pi retains control of its model choice, settings, extensions, and sessions as
-normal persistent Island state. `github run -- gh …` scopes GitHub authentication to one child command.
+normal persistent Island state. No capability-specific wrapper or command is installed.
 GitHub repository transport is deliberately SSH-only in this iteration and
 composes with `ssh-agent`; the GitHub Span does not grant a second Git HTTPS
 credential path. When `ssh-agent` is present, the Island configures Git and
@@ -98,9 +100,9 @@ writable Tact config, and the pinned Tact binary. It may trigger a 1Password
 approval and makes authenticated probes, including one minimal model response.
 It never mounts a real checkout and removes its project volumes during teardown.
 
-The image installs a trusted `tact` wrapper ahead of the persistent home PATH.
-It delegates authenticated runs to devc2's projected generic scoped-exec Link without modifying
-shell startup files or retaining authentication state.
+The image installs the stock Tact and Pi executables. Attachment environment is
+configured on the container itself, so ordinary shells and later Herdr workers
+receive the same transparent connection without modifying shell startup files.
 
 ## Span contract
 
@@ -131,10 +133,13 @@ hard-linked. `devc2` snapshots its exact bytes without running it and projects
 its own generic shim read-only as `/run/devc2/bin/<name>`. The World supplies no
 client artifact. The host resolves the granted name to this World and supplies
 the generic Link shim. A catalog value has no second shape: every Span is one
-World path. First-party OpenAI uses a second host-owned generic Link shape:
-scoped execution with bounded public
-bootstrap material and declared CONNECT routes. The OpenAI World supplies no
-Island executable.
+World path. First-party OpenAI and GitHub use a second host-owned generic Link
+shape: a launch-lifetime HTTP attachment with bounded public bootstrap material
+and declared CONNECT routes. These Worlds supply no Island executable. The Link
+coalesces compatible environment, rejects route or environment conflicts, and
+projects one standard CONNECT proxy. Undeclared HTTPS remains ordinary outbound
+network traffic. Any process in a granted Island can use an attachment; the
+capability boundary is the World grant, not an individual child process.
 
 The World is executed directly with no devc2-defined arguments.
 `DEVC2_SPAN_SOCKET_FD` names an inherited listening socket.
@@ -155,7 +160,10 @@ to Linux. The transport therefore uses a per-launch mutually authenticated TLS
 hop. Its keys enter only the protocol-blind bridge sidecar, never the Island.
 The bridge owns the socket directory; Island processes may connect to granted
 endpoints but cannot replace them. The World process and transport stop when
-the Island exits. Different Islands receive different World processes,
+the Island exits. The bridge retires existing streams after a suspend-sized
+clock gap so a resumed agent opens a fresh connection instead of reusing a
+half-open tunnel; TCP keepalive provides an additional failure detector.
+Different Islands receive different World processes,
 instance IDs, endpoints, and transport credentials.
 
 `examples/herdr-span/` is the first production-oriented command-Link experiment. When devc2 is

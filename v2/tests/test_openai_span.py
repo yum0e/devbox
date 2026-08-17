@@ -21,7 +21,6 @@ ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = ROOT / "examples" / "openai-span"
 PRODUCTION = ROOT / "spans" / "openai"
 WORLD_PATH = PRODUCTION / "world"
-PROJECTION_PATH = ROOT / "launcher" / "scoped_exec_projection.py"
 
 
 def load(path: Path, name: str):
@@ -34,7 +33,16 @@ def load(path: Path, name: str):
 
 
 P = load(WORLD_PATH, "openai_world")
-C = load(PROJECTION_PATH, "scoped_exec_projection")
+
+
+def receive(connection: socket.socket, size: int) -> bytes:
+    result = bytearray()
+    while len(result) < size:
+        block = connection.recv(size - len(result))
+        if not block:
+            raise RuntimeError("connection ended early")
+        result.extend(block)
+    return bytes(result)
 
 
 class WorldTests(unittest.TestCase):
@@ -256,13 +264,13 @@ class WorldTests(unittest.TestCase):
         thread.start()
         with right:
             right.sendall(b"B")
-            size = P.LENGTH.unpack(C.receive(right, P.LENGTH.size))[0]
-            result = json.loads(C.receive(right, size))
+            size = P.LENGTH.unpack(receive(right, P.LENGTH.size))[0]
+            result = json.loads(receive(right, size))
         thread.join(timeout=2)
         self.assertFalse(thread.is_alive())
         self.assertEqual(set(result), {"v", "ca_b64", "files", "environment", "routes"})
-        self.assertEqual(C.base64.b64decode(result["ca_b64"]), certificate)
-        auth = json.loads(C.base64.b64decode(result["files"][0]["contents_b64"]))
+        self.assertEqual(base64.b64decode(result["ca_b64"]), certificate)
+        auth = json.loads(base64.b64decode(result["files"][0]["contents_b64"]))
         self.assertEqual(auth["tokens"]["access_token"], P.FAKE_ACCESS)
         self.assertEqual(auth["tokens"]["account_id"], P.FAKE_ACCOUNT)
         self.assertEqual(result["environment"]["DEVC2_PI_OPENAI_TOKEN"], P.FAKE_ACCESS)
@@ -275,191 +283,3 @@ class WorldTests(unittest.TestCase):
         )
         self.assertNotIn(b"PRIVATE KEY", json.dumps(result).encode())
         self.assertEqual(result["routes"], ["chatgpt.com:443"])
-
-
-class ScopedExecLinkTests(unittest.TestCase):
-    def test_adapter_has_bounded_headroom_for_parallel_package_restores(self):
-        self.assertGreaterEqual(C.MAX_HANDLERS, 32)
-        self.assertLessEqual(C.MAX_HANDLERS, 128)
-
-    def manifest(self):
-        return (
-            b"public-ca",
-            [("auth.json", P.fake_auth()), ("codex/auth.json", P.fake_auth())],
-            {
-                "HTTPS_PROXY": "${PROXY}",
-                "TACT_AUTH_FILE": "${ROOT}/auth.json",
-                "CODEX_HOME": "${ROOT}/codex",
-                "SSL_CERT_FILE": "${CA}",
-                "DEVC2_PI_OPENAI_TOKEN": P.FAKE_ACCESS,
-            },
-            {"chatgpt.com:443"},
-        )
-
-    def test_help_is_local_and_projection_has_no_capability_semantics(self):
-        with tempfile.TemporaryDirectory() as raw:
-            projected = Path(raw) / "openai"
-            projected.symlink_to(PROJECTION_PATH)
-            result = subprocess.run([str(projected), "--help"], text=True, capture_output=True, check=False)
-        self.assertEqual(result.returncode, 0)
-        self.assertIn("openai run --", result.stdout)
-        source = PROJECTION_PATH.read_bytes().lower()
-        for term in (b"openai", b"chatgpt", b"tact", b"codex"):
-            self.assertNotIn(term, source)
-        self.assertEqual(
-            {path.name for path in PRODUCTION.iterdir() if path.is_file()},
-            {"README.md", "world"},
-        )
-
-    def test_run_materializes_manifest_for_exact_child_and_removes_it(self):
-        seen = {}
-
-        class FakeAdapter:
-            url = "http://127.0.0.1:43210"
-
-            def __init__(self, path, routes, fallback):
-                seen.update(socket=path, routes=routes, fallback=fallback)
-
-            def close(self):
-                seen["closed"] = True
-
-        class FakeProcess:
-            pid = 99999999
-
-            def __init__(self, command, env, start_new_session):
-                seen["command"] = command
-                seen["env"] = env
-                seen["root"] = Path(env["TACT_AUTH_FILE"]).parent
-                seen["auth"] = Path(env["TACT_AUTH_FILE"]).read_bytes()
-                seen["mode"] = stat.S_IMODE(Path(env["TACT_AUTH_FILE"]).stat().st_mode)
-                self.returncode = None
-
-            def wait(self, timeout=None):
-                self.returncode = 0
-                return 0
-
-            def poll(self):
-                return self.returncode
-
-        with mock.patch.dict(C.os.environ, {"HOME": "/island/home"}, clear=True), \
-             mock.patch.object(C, "bootstrap", return_value=self.manifest()), \
-             mock.patch.object(C, "system_ca", return_value=b"system-ca\n"), \
-             mock.patch.object(C, "Adapter", FakeAdapter), \
-             mock.patch.object(C.subprocess, "Popen", FakeProcess):
-            self.assertEqual(C.run(["tact", "run", "hello"], "/span.sock"), 0)
-        self.assertEqual(seen["command"], ["tact", "run", "hello"])
-        self.assertEqual(seen["socket"], "/span.sock")
-        self.assertEqual(seen["routes"], {"chatgpt.com:443"})
-        self.assertEqual(seen["env"]["HOME"], "/island/home")
-        self.assertEqual(seen["env"]["HTTPS_PROXY"], FakeAdapter.url)
-        self.assertEqual(seen["env"]["DEVC2_PI_OPENAI_TOKEN"], P.FAKE_ACCESS)
-        self.assertEqual(json.loads(seen["auth"])["tokens"]["access_token"], P.FAKE_ACCESS)
-        self.assertEqual(seen["mode"], 0o600)
-        self.assertTrue(seen["closed"])
-        self.assertFalse(seen["root"].exists())
-
-    def test_loopback_adapter_selects_declared_world_route(self):
-        with tempfile.TemporaryDirectory() as raw:
-            path = str(Path(raw) / "span.sock")
-            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            server.bind(path); server.listen(1)
-            observed = {}
-            request = b"CONNECT chatgpt.com:443 HTTP/1.1\r\nHost: chatgpt.com:443\r\n\r\nhello"
-
-            def world():
-                connection, _address = server.accept()
-                with connection:
-                    observed["operation"] = C.receive(connection, 1)
-                    observed["request"] = C.receive(connection, len(request))
-                    connection.sendall(b"world")
-
-            thread = threading.Thread(target=world); thread.start()
-            adapter = C.Adapter(path, {"chatgpt.com:443"}, None)
-            try:
-                with socket.create_connection(("127.0.0.1", adapter.server.getsockname()[1]), timeout=2) as client:
-                    client.sendall(request)
-                    self.assertEqual(C.receive(client, 5), b"world")
-            finally:
-                adapter.close(); server.close()
-            thread.join(timeout=2)
-            self.assertEqual(observed, {"operation": b"T", "request": request})
-
-    def test_undeclared_route_preserves_inherited_proxy(self):
-        fallback = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        fallback.bind(("127.0.0.1", 0)); fallback.listen(1)
-        request = b"CONNECT github.com:443 HTTP/1.1\r\nHost: github.com:443\r\n\r\n"
-        response = b"HTTP/1.1 200 Connection Established\r\n\r\n"
-        observed = {}
-
-        def proxy():
-            connection, _address = fallback.accept()
-            with connection:
-                observed["request"] = C.receive(connection, len(request))
-                connection.sendall(response)
-
-        thread = threading.Thread(target=proxy); thread.start()
-        adapter = C.Adapter("/must-not-be-used.sock", {"chatgpt.com:443"}, fallback.getsockname())
-        try:
-            with socket.create_connection(("127.0.0.1", adapter.server.getsockname()[1]), timeout=2) as client:
-                client.sendall(request)
-                self.assertEqual(C.receive(client, len(response)), response)
-        finally:
-            adapter.close(); fallback.close()
-        thread.join(timeout=2)
-        self.assertEqual(observed["request"], request)
-
-    def test_manifest_and_connect_validation_fail_closed(self):
-        certificate = b"-----BEGIN CERTIFICATE-----\npublic\n-----END CERTIFICATE-----\n"
-        valid = {
-            "v": 1,
-            "ca_b64": C.base64.b64encode(certificate).decode(),
-            "files": [{"name": "private/config.json", "contents_b64": "e30="}],
-            "environment": {"CONFIG": "${ROOT}/private/config.json", "CA": "${CA}"},
-            "routes": ["service.example:443"],
-        }
-        with mock.patch.object(C.ssl, "create_default_context"):
-            C.validate_manifest(valid)
-            invalid = dict(valid, extra=True)
-            with self.assertRaises(C.LinkError):
-                C.validate_manifest(invalid)
-            invalid = dict(valid, files=[{"name": "../escape", "contents_b64": "e30="}])
-            with self.assertRaises(C.LinkError):
-                C.validate_manifest(invalid)
-            invalid = dict(valid, routes=["user@service.example:443"])
-            with self.assertRaises(C.LinkError):
-                C.validate_manifest(invalid)
-        with self.assertRaises(C.LinkError):
-            C.child_environment({"X": "${UNKNOWN}"}, Path("/root"), Path("/ca"), "http://proxy")
-        for line in (b"GET / HTTP/1.1", b"CONNECT example.com:80 HTTP/1.1", b"CONNECT user@example.com:443 HTTP/1.1"):
-            with self.subTest(line=line), self.assertRaises(C.LinkError):
-                C.connect_target(line)
-
-    def test_bootstrap_failure_never_launches_the_child(self):
-        with mock.patch.object(C, "bootstrap", side_effect=C.LinkError("denied")), \
-             mock.patch.object(C.subprocess, "Popen") as launch:
-            with self.assertRaisesRegex(C.LinkError, "denied"):
-                C.run(["must-not-run"], "/missing.sock")
-        launch.assert_not_called()
-
-    def test_invalid_inherited_https_proxy_never_falls_back(self):
-        with mock.patch.dict(C.os.environ, {
-            "HTTPS_PROXY": "http://user:secret@proxy.example:3128",
-            "HTTP_PROXY": "http://other.example:8080",
-        }, clear=True), self.assertRaisesRegex(C.LinkError, "HTTPS proxy"):
-            C.inherited_proxy()
-
-    def test_descendant_group_cleanup_and_sigkill_status_are_explicit(self):
-        with mock.patch.object(C, "process_group_exists", side_effect=[True, False]), \
-             mock.patch.object(C.os, "killpg") as kill_group:
-            C.terminate_process_group(1234)
-        kill_group.assert_called_once_with(1234, C.signal.SIGTERM)
-
-        with mock.patch.object(C.signal, "signal") as reset, \
-             mock.patch.object(C.os, "kill") as kill:
-            self.assertEqual(C.preserve_signal_status(-C.signal.SIGKILL), 128 + C.signal.SIGKILL)
-        reset.assert_not_called()
-        kill.assert_called_once_with(C.os.getpid(), C.signal.SIGKILL)
-
-
-if __name__ == "__main__":
-    unittest.main()
