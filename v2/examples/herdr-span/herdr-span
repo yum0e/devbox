@@ -243,8 +243,6 @@ class World:
     def refresh(self, job: Job) -> None:
         with job.lock:
             self.require_open(job)
-            if job.exit_code is not None:
-                return
             self.pane(job)
 
     @staticmethod
@@ -380,6 +378,10 @@ class World:
                     self.refresh(job)
                     state = "running" if job.exit_code is None else f"exited:{job.exit_code}"
                 except SpanError:
+                    if self.target_is_gone(job):
+                        with job.lock:
+                            self.forget(job)
+                        continue
                     state = "gone"
                 result.append({"name": job.name, "state": state})
             return result
@@ -394,9 +396,9 @@ class World:
             job = self.get_job(request["name"])
             with job.lock:
                 self.require_open(job)
-                self.refresh(job)
                 if job.exit_code is not None:
                     raise SpanError(f"worker {job.name!r} has exited")
+                self.refresh(job)
                 self.herdr.call("pane.send_input", {"pane_id": job.pane_id, "text": text, "keys": ["Enter"]})
             return None
         if operation == "close":
@@ -428,9 +430,9 @@ class World:
             while True:
                 with job.lock:
                     self.require_open(job)
-                    self.refresh(job)
                     if job.exit_code is not None:
                         return {"exit_code": job.exit_code}
+                    self.refresh(job)
                     remaining_ms = int((deadline - time.monotonic()) * 1000)
                     if remaining_ms <= 0:
                         break

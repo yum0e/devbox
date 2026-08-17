@@ -265,6 +265,37 @@ class WorldAuthorityTests(unittest.TestCase):
         with self.assertRaisesRegex(H.SpanError, "has exited"):
             item.handle({"op": "send", "name": "done", "text": "touch /tmp/host"})
 
+    def test_list_forgets_an_exited_job_after_its_pane_was_closed_manually(self):
+        item = provider()
+        job = H.Job("done", "w1:p2", "terminal-new", "a" * 32, exit_code=0)
+        item.jobs[job.name] = job
+        item.owned[job.pane_id] = job
+        item.tokens[job.token] = job
+        item.herdr.panes.pop(job.pane_id)
+
+        self.assertEqual(item.handle({"op": "list"}), [])
+        self.assertTrue(job.closed)
+        self.assertFalse(item.jobs)
+        self.assertFalse(item.owned)
+        self.assertFalse(item.tokens)
+
+    def test_list_retains_a_job_when_pane_revalidation_is_only_unavailable(self):
+        item = provider()
+        job = H.Job("done", "w1:p2", "terminal-new", "b" * 32, exit_code=0)
+        item.jobs[job.name] = job
+        item.owned[job.pane_id] = job
+        original = item.herdr.call
+
+        def offline(method, params, timeout=10):
+            if method == "pane.get" and params["pane_id"] == job.pane_id:
+                raise H.SpanError("Herdr temporarily unavailable")
+            return original(method, params, timeout)
+
+        item.herdr.call = offline
+        self.assertEqual(item.handle({"op": "list"}), [{"name": "done", "state": "gone"}])
+        self.assertIs(item.jobs[job.name], job)
+        self.assertIs(item.owned[job.pane_id], job)
+
     def test_close_removes_only_a_revalidated_owned_pane(self):
         item = provider()
         job = H.Job("done", "w1:p2", "terminal-new", "__DEVC2_HERDR_" + "a" * 32 + "_EXIT_", exit_code=0)
