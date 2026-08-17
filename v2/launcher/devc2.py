@@ -1032,7 +1032,7 @@ def _start_unlocked(repo, runtime_doctor=False, span_names=()):
                     if granted_spans: compose(repo,env,'logs','--no-color','--tail','100','span-proxy',capture=False,check=False)
                     raise
                 command=compose_run_command(repo,worktree_override)
-                command.extend(['--pull','never','--no-build'])
+                command.extend(['--pull','never'])
                 if runtime_doctor: command.extend(['--env','DEVC2_RUNTIME_DOCTOR=1'])
                 command.append('devbox')
                 result=subprocess.run(command,env=env).returncode
