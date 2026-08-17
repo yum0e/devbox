@@ -36,10 +36,15 @@ jobs:
           PYTHONPATH=v2 python3 -m unittest discover -s v2/tests -v
           PYTHONPATH=v2 python3 -m unittest discover -s v2/credential_proxy/tests -v
           python3 -m py_compile v2/examples/herdr-span/island_supervisor.py
-          bash -n v2/install.sh v2/install-release.sh v2/devbox/entrypoint.sh v2/devbox/configure-pi.sh v2/devbox/pi-wrapper.sh
+          bash -n v2/install.sh v2/install-release.sh v2/devbox/entrypoint.sh v2/devbox/configure-pi.sh
           bash tests/test_devc_multiplexer.sh
       - name: Build deterministic assets
         run: python3 v2/package-release.py
+      - name: Build and smoke-test packaged images
+        timeout-minutes: 90
+        env:
+          DEVC2_TEST_PACKAGED_IMAGES: "1"
+        run: PYTHONPATH=v2 python3 -m unittest -v v2.tests.test_packaged_images
       - name: Verify reproducibility and clean install
         shell: bash
         run: |

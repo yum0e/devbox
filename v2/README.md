@@ -263,6 +263,15 @@ per-checkout even when `[memory] enabled = true` is set in the shared file.
 
 ## Requirements
 
+The normal test suite builds and validates the real release archive. On a host
+with Docker, also build and smoke-test every image from that packaged archive:
+
+```bash
+DEVC2_TEST_PACKAGED_IMAGES=1 ./v2/test.sh
+```
+
+The opt-in test uses unique temporary image tags and removes only those tags.
+
 - macOS with Docker Desktop, Docker Compose v2, Python 3, and `/usr/bin/openssl`
 - ChatGPT subscription and GitHub account for their respective optional Spans
 - An SSH agent, such as 1Password, for the optional SSH-agent Span
