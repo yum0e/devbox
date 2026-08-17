@@ -31,7 +31,7 @@ class UpdateTests(unittest.TestCase):
             "launcher/dispatcher.py", "launcher/command_projection.py",
             "launcher/world_attachment.py",
             "credential_proxy/span_bridge.py", "credential_proxy/stream_relay.py",
-            "credential_proxy/http_projection.py", "spans/openai/world", "spans/github/world",
+            "credential_proxy/http_projection.py", "spans/http-credential-world",
             "spans/ssh-agent/world", "spans/diagnostics/world",
         )
         for relative in bridge_required:
@@ -42,6 +42,7 @@ class UpdateTests(unittest.TestCase):
             "credential_proxy/ssh_agent_proxy.py",
             "spans/openai/provider", "spans/openai/client",
             "spans/github/provider", "spans/github/client",
+            "spans/openai/world", "spans/github/world",
             "spans/ssh-agent/provider", "spans/ssh-agent/client",
         ):
             self.assertFalse((ROOT/relative).exists(), relative)

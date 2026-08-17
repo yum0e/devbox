@@ -19,8 +19,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = ROOT / "examples" / "openai-span"
-PRODUCTION = ROOT / "spans" / "openai"
-WORLD_PATH = PRODUCTION / "world"
+WORLD_PATH = ROOT / "spans" / "http-credential-world"
 
 
 def load(path: Path, name: str):
@@ -72,7 +71,7 @@ class WorldTests(unittest.TestCase):
             with mock.patch.dict(P.os.environ, {"DEVC2_OPENAI_AUTH_FILE": str(auth)}, clear=True):
                 access, account = P.read_auth()
             self.assertEqual(account, "account-one")
-            config = P.proxy_config("fake-access", "fake-account")
+            config = P.proxy_config(P.POLICIES["openai"], "fake-access", "fake-account")
             self.assertNotIn(access, json.dumps(config))
             self.assertEqual(config["transforms"][0]["config"]["secrets"][0]["source"]["type"], "file")
 
@@ -158,6 +157,7 @@ class WorldTests(unittest.TestCase):
     def test_invalid_tunnel_returns_a_bounded_proxy_error(self):
         client, world = socket.socketpair()
         manager = mock.Mock()
+        manager.policy = P.POLICIES["openai"]
         worker = threading.Thread(target=P.handle, args=(world, manager))
         worker.start()
         with client:

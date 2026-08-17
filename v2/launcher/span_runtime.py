@@ -95,8 +95,8 @@ def load_catalog(path: Path, names: tuple[str, ...], forbidden_root: Path, clien
     if builtin_root is not None:
         for name in names:
             world=builtin_root/name/"world"
-            if world.is_file() and name in HTTP_ATTACHMENT_BUILTINS:
-                builtin_entries[name]=(world,None,True)
+            if name in HTTP_ATTACHMENT_BUILTINS and (builtin_root/"http-credential-world").is_file():
+                builtin_entries[name]=(builtin_root/"http-credential-world",None,True)
             elif world.is_file() and name in STREAM_BUILTINS:
                 builtin_entries[name]=(world,None,False)
             elif world.is_file() and name in COMMAND_BUILTINS:

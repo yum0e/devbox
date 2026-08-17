@@ -156,8 +156,8 @@ class SpanCatalogTests(unittest.TestCase):
 
     def test_builtin_span_needs_no_external_catalog_and_cannot_be_shadowed(self):
         with tempfile.TemporaryDirectory() as raw:
-            root=Path(raw); builtin=root/"builtins"/"openai"; builtin.mkdir(parents=True)
-            world=builtin/"world"; world.write_text("#!/bin/sh\nexit 0\n"); world.chmod(0o555)
+            root=Path(raw); builtin=root/"builtins"; builtin.mkdir(parents=True)
+            world=builtin/"http-credential-world"; world.write_text("#!/bin/sh\nexit 0\n"); world.chmod(0o555)
             destination=root/"snapshot"; destination.mkdir()
             spans=span_runtime.load_catalog(
                 root/"missing.json",("openai",),root/"workspace",destination/"clients",destination/"worlds",
@@ -177,9 +177,10 @@ class SpanCatalogTests(unittest.TestCase):
                 V2_ROOT/"spans",
             )
             for item in items:
+                self.assertEqual(item.provider.name, item.name)
                 self.assertEqual(
                     item.provider.read_bytes(),
-                    (V2_ROOT/"spans"/item.name/"world").read_bytes(),
+                    (V2_ROOT/"spans"/"http-credential-world").read_bytes(),
                 )
                 self.assertIsNone(item.client)
                 self.assertTrue(item.http_attachment)
