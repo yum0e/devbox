@@ -95,6 +95,8 @@ class WorldPolicyTests(unittest.TestCase):
         self.assertEqual(document["routes"], ["api.github.com:443", "uploads.github.com:443"])
         self.assertEqual(document["environment"]["GH_TOKEN"], W.PLACEHOLDER)
         self.assertEqual(document["environment"]["GITHUB_TOKEN"], W.PLACEHOLDER)
+        self.assertNotIn("HTTP_PROXY", document["environment"])
+        self.assertNotIn("http_proxy", document["environment"])
         hosts = base64.b64decode(document["files"][0]["contents_b64"])
         self.assertIn(W.PLACEHOLDER.encode(), hosts)
         self.assertNotIn(b"real-token", json.dumps(document).encode())
@@ -186,6 +188,8 @@ class WorldAuthTests(unittest.TestCase):
         ):
             self.assertIn(value, source)
         self.assertIn('private_write(root / "github-token", token.encode())', source)
+        self.assertIn('"--memory", "128m"', source)
+        self.assertIn('"--pids-limit", "64"', source)
         self.assertNotIn('"--env", "GH_TOKEN=" + token', source)
 
     def test_docker_environment_excludes_host_credentials(self):

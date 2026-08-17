@@ -257,6 +257,24 @@ class HttpProjectionTests(unittest.TestCase):
             upstream.sendall.assert_called_once_with(b"tls")
             self.assertEqual(response, b"HTTP/1.1 200 Connection Established\r\n\r\n")
 
+    def test_fatal_http_listener_failure_stops_the_sidecar(self):
+        stopping = threading.Event()
+        failed = threading.Event()
+        slots = threading.BoundedSemaphore(http_projection.MAX_CONNECTIONS)
+        projection = http_projection.HttpProjection(
+            {}, Path("/unused"), port=0, slots=slots, stopping=stopping, failed=failed,
+        )
+        self.assertIs(projection.slots, slots)
+        projection.start()
+        projection.server.close()
+        try:
+            self.assertTrue(stopping.wait(2))
+            self.assertTrue(failed.is_set())
+            projection.thread.join(2)
+            self.assertFalse(projection.thread.is_alive())
+        finally:
+            projection.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

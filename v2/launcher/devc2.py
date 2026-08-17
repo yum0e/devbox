@@ -967,7 +967,17 @@ def _reset_unlocked(repo,yes):
     with repository_lock(repo):
         dummy=STATE/'reset'; dummy.mkdir(parents=True,exist_ok=True)
         env=compose_env(repo,dummy)
-        compose(repo,env,'down','--volumes','--remove-orphans',check=False)
+        compose(repo,env,'down','--volumes','--remove-orphans')
+        remaining=[]
+        project_label=f"label=com.docker.compose.project={project}"
+        for kind, command in (
+            ('containers', ['docker','ps','--all','--quiet','--filter',project_label]),
+            ('volumes', ['docker','volume','ls','--quiet','--filter',project_label]),
+            ('networks', ['docker','network','ls','--quiet','--filter',project_label]),
+        ):
+            if run(command,timeout=30).stdout.strip(): remaining.append(kind)
+        if remaining:
+            raise RuntimeError(f"reset incomplete for {project}; remaining Docker resources: {', '.join(remaining)}")
         # Permanent lock inodes are intentionally retained to prevent reset/start races.
     print(f"reset {project}"); return 0
 

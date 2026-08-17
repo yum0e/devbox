@@ -8,7 +8,9 @@ import threading
 import time
 
 
-MAX_PENDING = 1024 * 1024
+# This is a per-direction cap. With the sidecar-wide 16-connection budget,
+# relay payload buffers consume at most 8 MiB of the 128 MiB container limit.
+MAX_PENDING = 256 * 1024
 KEEPALIVE_IDLE_SECONDS = 30
 KEEPALIVE_INTERVAL_SECONDS = 10
 KEEPALIVE_PROBES = 3

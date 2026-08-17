@@ -204,6 +204,8 @@ class WorldTests(unittest.TestCase):
             helper = next(call for call in launches if "--detach" in call)
             for option in ("--read-only", "--cap-drop", "--security-opt", "--log-driver"):
                 self.assertIn(option, helper)
+            self.assertEqual(helper[helper.index("--memory") + 1], "128m")
+            self.assertEqual(helper[helper.index("--pids-limit") + 1], "64")
             self.assertIn("127.0.0.1::8080", helper)
             config = (root / "proxy.yaml").read_text()
             self.assertNotIn("real-secret", config)
@@ -274,6 +276,8 @@ class WorldTests(unittest.TestCase):
         self.assertEqual(auth["tokens"]["access_token"], P.FAKE_ACCESS)
         self.assertEqual(auth["tokens"]["account_id"], P.FAKE_ACCOUNT)
         self.assertEqual(result["environment"]["DEVC2_PI_OPENAI_TOKEN"], P.FAKE_ACCESS)
+        self.assertNotIn("HTTP_PROXY", result["environment"])
+        self.assertNotIn("http_proxy", result["environment"])
         access_claims = json.loads(base64.urlsafe_b64decode(
             auth["tokens"]["access_token"].split(".")[1] + "=="
         ))

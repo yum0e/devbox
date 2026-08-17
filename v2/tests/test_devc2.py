@@ -146,6 +146,16 @@ class CliTests(unittest.TestCase):
         self.assertIn("source: state-v2", raw)
         self.assertIn("target: /home/devbox", raw)
 
+    def test_http_ca_umask_is_scoped_to_attachment_creation(self):
+        entrypoint = (PATH.parents[1] / "devbox" / "entrypoint.sh").read_text()
+        scoped = re.search(
+            r'if \[\[ -s /run/devc2-public/http-ca\.pem \]\]; then\n  \(\n'
+            r'    umask 077\n.*?\n  \)\nfi',
+            entrypoint,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(scoped)
+
     def test_compose_hardening_and_v1_namespace(self):
         raw = (PATH.parents[1] / "compose.yaml").read_text()
         services = raw.split("services:\n", 1)[1].split("\nvolumes:\n", 1)[0]
@@ -556,9 +566,27 @@ class CoexistenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             repo=Path(td); calls=[]
             state=repo/"state"
-            with mock.patch.object(D,"compose",side_effect=lambda *a,**k: calls.append(a)), mock.patch.object(D,"STATE",state), mock.patch.object(D,"INSTALL_LOCK",state/"install.lock"), contextlib.redirect_stdout(io.StringIO()):
+            absent=subprocess.CompletedProcess([],0,"","")
+            with mock.patch.object(D,"compose",side_effect=lambda *a,**k: calls.append((a,k))), mock.patch.object(D,"run",return_value=absent) as run, mock.patch.object(D,"STATE",state), mock.patch.object(D,"INSTALL_LOCK",state/"install.lock"), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(D.reset(repo,True),0)
-            self.assertTrue(D.identity(repo)[1].startswith("devc2-")); self.assertIn("down", calls[0])
+            self.assertTrue(D.identity(repo)[1].startswith("devc2-")); self.assertIn("down", calls[0][0])
+            self.assertNotIn("check",calls[0][1])
+            self.assertEqual(run.call_count,3)
+
+    def test_reset_propagates_compose_failure_without_reporting_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo=Path(td); state=repo/"state"; output=io.StringIO()
+            with mock.patch.object(D,"compose",side_effect=RuntimeError("down failed")), mock.patch.object(D,"STATE",state), mock.patch.object(D,"INSTALL_LOCK",state/"install.lock"), contextlib.redirect_stdout(output), self.assertRaisesRegex(RuntimeError,"down failed"):
+                D.reset(repo,True)
+            self.assertNotIn("reset devc2-",output.getvalue())
+
+    def test_reset_verifies_no_project_resources_remain(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo=Path(td); state=repo/"state"; output=io.StringIO()
+            remaining=subprocess.CompletedProcess([],0,"container-id\n","")
+            with mock.patch.object(D,"compose"), mock.patch.object(D,"run",return_value=remaining), mock.patch.object(D,"STATE",state), mock.patch.object(D,"INSTALL_LOCK",state/"install.lock"), contextlib.redirect_stdout(output), self.assertRaisesRegex(RuntimeError,"reset incomplete.*containers, volumes, networks"):
+                D.reset(repo,True)
+            self.assertNotIn("reset devc2-",output.getvalue())
     def test_source_contains_no_devcontainer_mutation(self):
         source=PATH.read_text()
         self.assertNotIn('mkdir(".devcontainer',source)

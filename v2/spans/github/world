@@ -57,8 +57,6 @@ def bootstrap(certificate: bytes) -> bytes:
             "GH_TOKEN": PLACEHOLDER,
             "GITHUB_TOKEN": PLACEHOLDER,
             "GH_CONFIG_DIR": "${ROOT}/gh",
-            "HTTP_PROXY": "${PROXY}",
-            "http_proxy": "${PROXY}",
             "HTTPS_PROXY": "${PROXY}",
             "https_proxy": "${PROXY}",
             "NO_PROXY": "localhost,127.0.0.1,::1,.internal",
@@ -329,7 +327,7 @@ class ProxyManager:
             launched = run_docker(["run", "--pull=never", "--detach", "--rm", "--name", name,
                 "--label", "dev.devbox.github-span.workspace-hash=" + tag,
                 "--user", f"{os.getuid()}:{os.getgid()}", "--read-only", "--tmpfs", "/tmp:size=16m,mode=1777",
-                "--memory", "512m", "--cpus", "1", "--pids-limit", "256", "--cap-drop", "ALL",
+                "--memory", "128m", "--cpus", "1", "--pids-limit", "64", "--cap-drop", "ALL",
                 "--security-opt", "no-new-privileges:true", "--init", "--log-driver", "none",
                 "--publish", "127.0.0.1::8080", "--volume", f"{root}:/run/devc2-private:ro",
                 IRON, "--config", "/run/devc2-private/proxy.yaml"])

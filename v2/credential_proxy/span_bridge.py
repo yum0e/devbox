@@ -16,6 +16,9 @@ from pathlib import Path
 
 NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 READY_TOKEN = re.compile(r"^[a-f0-9]{32}$")
+# Every accepted Span or HTTP connection consumes one worker thread. The
+# sidecar shares this budget across both listeners so its peak thread count
+# stays comfortably below Compose's pids_limit of 64.
 MAX_CONNECTIONS = 16
 MAX_SPANS = 16
 RESUME_GAP_SECONDS = 15
@@ -25,10 +28,11 @@ from .stream_relay import duplex_stream, enable_tcp_keepalive, suspend_clock
 
 
 class Bridge:
-    def __init__(self, name: str, port: int, socket_dir: Path, host: str, context: ssl.SSLContext, slots=None):
+    def __init__(self, name: str, port: int, socket_dir: Path, host: str, context: ssl.SSLContext, slots=None, stopping=None, failed=None):
         self.name, self.port, self.host, self.context = name, port, host, context
         self.path = socket_dir / f"{name}.sock"
-        self.stopping = threading.Event()
+        self.stopping = stopping or threading.Event()
+        self.failed = failed or threading.Event()
         self.slots = slots or threading.BoundedSemaphore(MAX_CONNECTIONS)
         self.connections: set[socket.socket] = set()
         self.connections_lock = threading.Lock()
@@ -68,28 +72,33 @@ class Bridge:
         )
 
     def _serve(self) -> None:
-        while not self.stopping.is_set():
-            client = None
-            try:
-                client, _address = self.server.accept()
-            except socket.timeout:
-                pass
-            except OSError:
-                if self.stopping.is_set():
-                    return
-                raise
-            self._retire_after_resume(suspend_clock())
-            if client is None:
-                continue
-            if not self.slots.acquire(blocking=False):
-                client.close()
-                continue
-            thread = threading.Thread(target=self._connection, args=(client,), daemon=True)
-            try:
-                thread.start()
-            except RuntimeError:
-                client.close()
-                self.slots.release()
+        try:
+            while not self.stopping.is_set():
+                client = None
+                try:
+                    client, _address = self.server.accept()
+                except socket.timeout:
+                    pass
+                self._retire_after_resume(suspend_clock())
+                if client is None:
+                    continue
+                if not self.slots.acquire(blocking=False):
+                    client.close()
+                    continue
+                thread = threading.Thread(target=self._connection, args=(client,), daemon=True)
+                try:
+                    thread.start()
+                except RuntimeError:
+                    client.close()
+                    self.slots.release()
+        except Exception as error:
+            if not self.stopping.is_set():
+                print(
+                    f"span-bridge: Span {self.name!r} listener failed ({type(error).__name__})",
+                    flush=True,
+                )
+                self.failed.set()
+                self.stopping.set()
 
     def _retire_after_resume(self, observed_time: float) -> bool:
         gap = observed_time - self.last_observed_time
@@ -201,11 +210,19 @@ def main(argv: list[str] | None = None) -> int:
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.options |= ssl.OP_NO_COMPRESSION
     context.load_cert_chain(certfile=args.tls_cert, keyfile=args.tls_key)
+    stopping = threading.Event()
+    failed = threading.Event()
     slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
     entries = load_config(args.config)
-    bridges = [Bridge(name, port, args.socket_dir, args.host, context, slots) for name, port in entries]
-    http = HttpProjection(load_routes(args.http_config, {name for name, _port in entries}), args.socket_dir, args.http_port)
-    stopping = threading.Event()
+    bridges = [Bridge(name, port, args.socket_dir, args.host, context, slots, stopping, failed) for name, port in entries]
+    http = HttpProjection(
+        load_routes(args.http_config, {name for name, _port in entries}),
+        args.socket_dir,
+        args.http_port,
+        slots,
+        stopping,
+        failed,
+    )
     def stop(_signum=None, _frame=None):
         stopping.set()
     for signum in (signal.SIGINT, signal.SIGTERM):
@@ -214,15 +231,16 @@ def main(argv: list[str] | None = None) -> int:
         for bridge in bridges:
             bridge.start()
         http.start()
-        ready_path.write_text(token, encoding="ascii")
-        ready_path.chmod(0o444)
-        stopping.wait()
+        if not failed.is_set():
+            ready_path.write_text(token, encoding="ascii")
+            ready_path.chmod(0o444)
+            stopping.wait()
     finally:
         ready_path.unlink(missing_ok=True)
         http.stop()
         for bridge in reversed(bridges):
             bridge.stop()
-    return 0
+    return 1 if failed.is_set() else 0
 
 
 if __name__ == "__main__":

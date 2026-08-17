@@ -12,7 +12,7 @@ from .stream_relay import duplex_stream, enable_tcp_keepalive, suspend_clock
 
 MAX_CONFIG = 64 * 1024
 MAX_HEADERS = 16 * 1024
-MAX_CONNECTIONS = 64
+MAX_CONNECTIONS = 16
 RESUME_GAP_SECONDS = 15
 NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
@@ -64,11 +64,12 @@ def connect_target(first_line: bytes) -> tuple[str, str]:
 
 
 class HttpProjection:
-    def __init__(self, routes: dict[str, str], socket_dir: Path, port: int = 3128):
+    def __init__(self, routes: dict[str, str], socket_dir: Path, port: int = 3128, slots=None, stopping=None, failed=None):
         self.routes = routes
         self.socket_dir = socket_dir
-        self.stopping = threading.Event()
-        self.slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        self.stopping = stopping or threading.Event()
+        self.failed = failed or threading.Event()
+        self.slots = slots or threading.BoundedSemaphore(MAX_CONNECTIONS)
         self.lock = threading.Lock()
         self.connections: set[socket.socket] = set()
         self.threads: set[threading.Thread] = set()
@@ -114,30 +115,37 @@ class HttpProjection:
         return True
 
     def _serve(self) -> None:
-        while not self.stopping.is_set():
-            client = None
-            try:
-                client, _address = self.server.accept()
-            except socket.timeout:
-                pass
-            except OSError:
-                return
-            self._retire_after_resume(suspend_clock())
-            if client is None:
-                continue
-            if not self.slots.acquire(blocking=False):
-                client.close()
-                continue
-            thread = threading.Thread(target=self._handle, args=(client,), daemon=True)
-            with self.lock:
-                self.threads.add(thread)
-            try:
-                thread.start()
-            except RuntimeError:
+        try:
+            while not self.stopping.is_set():
+                client = None
+                try:
+                    client, _address = self.server.accept()
+                except socket.timeout:
+                    pass
+                self._retire_after_resume(suspend_clock())
+                if client is None:
+                    continue
+                if not self.slots.acquire(blocking=False):
+                    client.close()
+                    continue
+                thread = threading.Thread(target=self._handle, args=(client,), daemon=True)
                 with self.lock:
-                    self.threads.discard(thread)
-                client.close()
-                self.slots.release()
+                    self.threads.add(thread)
+                try:
+                    thread.start()
+                except RuntimeError:
+                    with self.lock:
+                        self.threads.discard(thread)
+                    client.close()
+                    self.slots.release()
+        except Exception as error:
+            if not self.stopping.is_set():
+                print(
+                    f"span-bridge: HTTP listener failed ({type(error).__name__})",
+                    flush=True,
+                )
+                self.failed.set()
+                self.stopping.set()
 
     def _handle(self, client: socket.socket) -> None:
         upstream = None

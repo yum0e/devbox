@@ -65,8 +65,10 @@ if [[ -d /run/devc2-public/http-attachments ]]; then
   find "$attachment_root" -type f -exec chmod 0600 {} +
 fi
 if [[ -s /run/devc2-public/http-ca.pem ]]; then
-  umask 077
-  cat /etc/ssl/certs/ca-certificates.crt /run/devc2-public/http-ca.pem >"$attachment_ca"
+  (
+    umask 077
+    cat /etc/ssl/certs/ca-certificates.crt /run/devc2-public/http-ca.pem >"$attachment_ca"
+  )
 fi
 
 # Clear grant-managed state from the persistent home before applying this

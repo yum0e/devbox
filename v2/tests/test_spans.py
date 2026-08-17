@@ -18,7 +18,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from credential_proxy import span_bridge
+from credential_proxy import span_bridge, stream_relay
 from launcher import devc2
 from launcher import span_runtime
 
@@ -725,6 +725,24 @@ class BridgeConfigTests(unittest.TestCase):
                 bridge.slots.release()
                 bridge.stop()
 
+    def test_fatal_bridge_listener_failure_stops_the_sidecar(self):
+        with tempfile.TemporaryDirectory() as raw:
+            stopping = threading.Event()
+            failed = threading.Event()
+            bridge = span_bridge.Bridge(
+                "echo", 1, Path(raw), "127.0.0.1", mock.Mock(),
+                stopping=stopping, failed=failed,
+            )
+            bridge.start()
+            bridge.server.close()
+            try:
+                self.assertTrue(stopping.wait(2))
+                self.assertTrue(failed.is_set())
+                bridge.thread.join(2)
+                self.assertFalse(bridge.thread.is_alive())
+            finally:
+                bridge.stop()
+
     def test_compose_keeps_transport_credentials_outside_the_island(self):
         compose = (Path(__file__).parents[1] / "compose.yaml").read_text()
         island = compose.split("  devbox:\n", 1)[1].split("\n  span-proxy:\n", 1)[0]
@@ -736,6 +754,45 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertIn("profiles: [spans]", bridge)
         self.assertIn('user: "0:0"', bridge)
         self.assertIn("credential_proxy.span_bridge", bridge)
+        self.assertIn("mem_limit: 128m", bridge)
+        self.assertIn("pids_limit: 64", bridge)
+        self.assertEqual(span_bridge.MAX_CONNECTIONS, 16)
+        self.assertLessEqual(
+            2 * span_bridge.MAX_CONNECTIONS * stream_relay.MAX_PENDING,
+            8 * 1024 * 1024,
+        )
+
+    def test_fatal_listener_before_readiness_returns_failure(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            config = root / "spans.json"
+            routes = root / "routes.json"
+            token = root / "token"
+            sockets = root / "sockets"
+            config.write_text('[{"name":"echo","port":1234}]')
+            routes.write_text('{"v":1,"routes":{}}')
+            token.write_text("a" * 32)
+            context = mock.Mock(options=0)
+            bridge = mock.Mock()
+
+            def make_bridge(*args):
+                stopping, failed = args[-2:]
+                bridge.start.side_effect = lambda: (failed.set(), stopping.set())
+                return bridge
+
+            http = mock.Mock()
+            argv = [
+                "--config", str(config), "--socket-dir", str(sockets),
+                "--tls-ca", "ca", "--tls-cert", "cert", "--tls-key", "key",
+                "--ready-token-file", str(token), "--http-config", str(routes),
+            ]
+            with mock.patch.object(span_bridge.ssl, "create_default_context", return_value=context), \
+                 mock.patch.object(span_bridge, "Bridge", side_effect=make_bridge), \
+                 mock.patch.object(span_bridge, "HttpProjection", return_value=http):
+                self.assertEqual(span_bridge.main(argv), 1)
+            self.assertFalse((sockets / ".ready").exists())
+            bridge.stop.assert_called_once_with()
+            http.stop.assert_called_once_with()
 
 
 class LauncherGrantTests(unittest.TestCase):
