@@ -72,8 +72,9 @@ class WorldTests(unittest.TestCase):
             with mock.patch.dict(P.os.environ, {"DEVC2_OPENAI_AUTH_FILE": str(auth)}, clear=True):
                 access, account = P.read_auth()
             self.assertEqual(account, "account-one")
-            self.assertNotIn(access, json.dumps(P.proxy_config()))
-            self.assertEqual(P.proxy_config()["transforms"][0]["config"]["secrets"][0]["source"]["type"], "file")
+            config = P.proxy_config("fake-access", "fake-account")
+            self.assertNotIn(access, json.dumps(config))
+            self.assertEqual(config["transforms"][0]["config"]["secrets"][0]["source"]["type"], "file")
 
             auth.chmod(0o620)
             with mock.patch.dict(P.os.environ, {"DEVC2_OPENAI_AUTH_FILE": str(auth)}, clear=True), \
@@ -257,25 +258,105 @@ class WorldTests(unittest.TestCase):
         with mock.patch.object(P, "run_docker", side_effect=[removal, absent]):
             self.assertTrue(P.remove_container("f" * 64))
 
+    def test_bootstrap_is_stable_and_lifetime_sentinels_are_independent(self):
+        certificate = b"-----BEGIN CERTIFICATE-----\npublic\n-----END CERTIFICATE-----\n"
+        first = P.ProxyManager()
+        second = P.ProxyManager()
+        first.proxy = P.Proxy(Path("/unused"), "a" * 64, 1234, certificate)
+        with mock.patch.object(first, "_state", return_value="running"):
+            one = first.bootstrap()
+            two = first.bootstrap()
+        self.assertIs(one, two)
+        self.assertEqual(one, two)
+        self.assertNotEqual(first.fake_account, second.fake_account)
+        self.assertNotEqual(first.fake_access, second.fake_access)
+
+        document = json.loads(one)
+        auth = json.loads(base64.b64decode(document["files"][0]["contents_b64"]))
+        self.assertEqual(auth["tokens"]["account_id"], first.fake_account)
+        self.assertEqual(auth["tokens"]["access_token"], first.fake_access)
+
+    def test_exited_helper_restarts_with_refreshed_auth_and_same_identity(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / "ca.crt").write_bytes(b"certificate")
+            (root / "ca.key").write_bytes(b"private")
+            (root / "access-token").write_text("old-access")
+            (root / "account-id").write_text("old-account")
+            (root / "proxy.yaml").write_text("old-config")
+            manager = P.ProxyManager()
+            proxy = P.Proxy(root, "a" * 64, 1111, b"certificate")
+            manager.proxy = proxy
+
+            calls = []
+            def docker(arguments, timeout=120):
+                calls.append(arguments)
+                if arguments[:3] == ["run", "--pull", "never"]:
+                    return subprocess.CompletedProcess(arguments, 0, "b" * 64 + "\n", "")
+                if arguments[:2] == ["port", "b" * 64]:
+                    return subprocess.CompletedProcess(arguments, 0, "127.0.0.1:43210\n", "")
+                raise AssertionError(arguments)
+
+            with mock.patch.object(manager, "_state", side_effect=["running", "exited"]), \
+                 mock.patch.object(P, "remove_container", return_value=True), \
+                 mock.patch.object(P, "read_auth", return_value=("new-access", "new-account")), \
+                 mock.patch.object(P, "run_docker", side_effect=docker), \
+                 mock.patch.object(P.socket, "create_connection", return_value=mock.MagicMock()), \
+                 mock.patch.dict(P.os.environ, {"DEVC2_WORKSPACE": "/workspace"}, clear=True):
+                manifest = manager.bootstrap()
+                restarted = manager.get()
+
+            self.assertIs(restarted, proxy)
+            self.assertEqual(restarted.container, "b" * 64)
+            self.assertEqual(restarted.port, 43210)
+            self.assertEqual(restarted.certificate, b"certificate")
+            self.assertEqual((root / "access-token").read_text(), "new-access")
+            self.assertEqual((root / "account-id").read_text(), "new-account")
+            with mock.patch.object(manager, "_state", return_value="running"):
+                self.assertEqual(manager.bootstrap(), manifest)
+            self.assertEqual(
+                json.loads((root / "proxy.yaml").read_text())["transforms"][0]["config"]["secrets"][0]["replace"]["proxy_value"],
+                manager.fake_access,
+            )
+            launch = next(call for call in calls if call[:3] == ["run", "--pull", "never"])
+            self.assertNotIn("new-access", launch)
+            self.assertNotIn("new-account", launch)
+
+    def test_restart_fails_closed_on_unknown_state_or_removal_failure(self):
+        manager = P.ProxyManager()
+        manager.proxy = P.Proxy(Path("/unused"), "a" * 64, 1234, b"certificate")
+        failed = subprocess.CompletedProcess([], 1, "", "daemon unavailable")
+        with mock.patch.object(P, "run_docker", side_effect=[failed, failed]), \
+             self.assertRaisesRegex(P.ProviderError, "verify"):
+            manager.get()
+
+        with mock.patch.object(manager, "_state", return_value="exited"), \
+             mock.patch.object(P, "remove_container", return_value=False), \
+             mock.patch.object(manager, "_launch") as launch, \
+             self.assertRaisesRegex(P.ProviderError, "cleanup"):
+            manager.get()
+        launch.assert_not_called()
+
     def test_bootstrap_returns_only_public_and_fake_material(self):
         certificate = b"-----BEGIN CERTIFICATE-----\npublic\n-----END CERTIFICATE-----\n"
-        manager = mock.Mock()
-        manager.get.return_value = mock.Mock(certificate=certificate)
+        manager = P.ProxyManager()
+        manager.proxy = P.Proxy(Path("/unused"), "a" * 64, 1234, certificate)
         left, right = socket.socketpair()
-        thread = threading.Thread(target=P.handle, args=(left, manager))
-        thread.start()
-        with right:
-            right.sendall(b"B")
-            size = P.LENGTH.unpack(receive(right, P.LENGTH.size))[0]
-            result = json.loads(receive(right, size))
+        with mock.patch.object(manager, "_state", return_value="running"):
+            thread = threading.Thread(target=P.handle, args=(left, manager))
+            thread.start()
+            with right:
+                right.sendall(b"B")
+                size = P.LENGTH.unpack(receive(right, P.LENGTH.size))[0]
+                result = json.loads(receive(right, size))
         thread.join(timeout=2)
         self.assertFalse(thread.is_alive())
         self.assertEqual(set(result), {"v", "ca_b64", "files", "environment", "routes"})
         self.assertEqual(base64.b64decode(result["ca_b64"]), certificate)
         auth = json.loads(base64.b64decode(result["files"][0]["contents_b64"]))
-        self.assertEqual(auth["tokens"]["access_token"], P.FAKE_ACCESS)
-        self.assertEqual(auth["tokens"]["account_id"], P.FAKE_ACCOUNT)
-        self.assertEqual(result["environment"]["DEVC2_PI_OPENAI_TOKEN"], P.FAKE_ACCESS)
+        self.assertEqual(auth["tokens"]["access_token"], manager.fake_access)
+        self.assertEqual(auth["tokens"]["account_id"], manager.fake_account)
+        self.assertEqual(result["environment"]["DEVC2_PI_OPENAI_TOKEN"], manager.fake_access)
         self.assertNotIn("HTTP_PROXY", result["environment"])
         self.assertNotIn("http_proxy", result["environment"])
         access_claims = json.loads(base64.urlsafe_b64decode(
@@ -283,7 +364,7 @@ class WorldTests(unittest.TestCase):
         ))
         self.assertEqual(
             access_claims["https://api.openai.com/auth"]["chatgpt_account_id"],
-            P.FAKE_ACCOUNT,
+            manager.fake_account,
         )
         self.assertNotIn(b"PRIVATE KEY", json.dumps(result).encode())
         self.assertEqual(result["routes"], ["chatgpt.com:443"])

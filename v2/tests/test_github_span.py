@@ -71,11 +71,12 @@ class WorldPolicyTests(unittest.TestCase):
                 self.read_connect(request)
 
     def test_proxy_policy_is_placeholder_only_and_has_no_git_https(self):
-        document = W.proxy_config()
+        sentinel = "random-lifetime-sentinel"
+        document = W.proxy_config(sentinel)
         serialized = json.dumps(document)
         secret = document["transforms"][0]["config"]["secrets"][0]
         self.assertEqual(secret["replace"], {
-            "proxy_value": W.PLACEHOLDER,
+            "proxy_value": sentinel,
             "match_headers": ["Authorization"],
             "require": True,
         })
@@ -89,22 +90,23 @@ class WorldPolicyTests(unittest.TestCase):
 
     def test_bootstrap_is_public_bounded_and_scoped(self):
         certificate = b"-----BEGIN CERTIFICATE-----\npublic\n-----END CERTIFICATE-----\n"
-        document = json.loads(W.bootstrap(certificate))
+        sentinel = "random-lifetime-sentinel"
+        document = json.loads(W.bootstrap(certificate, sentinel))
         self.assertEqual(document["v"], 1)
         self.assertEqual(base64.b64decode(document["ca_b64"]), certificate)
         self.assertEqual(document["routes"], ["api.github.com:443", "uploads.github.com:443"])
-        self.assertEqual(document["environment"]["GH_TOKEN"], W.PLACEHOLDER)
-        self.assertEqual(document["environment"]["GITHUB_TOKEN"], W.PLACEHOLDER)
+        self.assertEqual(document["environment"]["GH_TOKEN"], sentinel)
+        self.assertEqual(document["environment"]["GITHUB_TOKEN"], sentinel)
         self.assertNotIn("HTTP_PROXY", document["environment"])
         self.assertNotIn("http_proxy", document["environment"])
         hosts = base64.b64decode(document["files"][0]["contents_b64"])
-        self.assertIn(W.PLACEHOLDER.encode(), hosts)
+        self.assertIn(sentinel.encode(), hosts)
         self.assertNotIn(b"real-token", json.dumps(document).encode())
 
     def test_bootstrap_control_returns_the_manifest(self):
         certificate = b"-----BEGIN CERTIFICATE-----\npublic\n-----END CERTIFICATE-----\n"
         manager = mock.Mock()
-        manager.get.return_value.certificate = certificate
+        manager.manifest.return_value = W.bootstrap(certificate, "lifetime-sentinel")
         server, client = socket.socketpair()
         thread = threading.Thread(target=W.handle, args=(server, manager))
         thread.start()
@@ -116,6 +118,24 @@ class WorldPolicyTests(unittest.TestCase):
         finally:
             client.close()
             thread.join(1)
+
+    def test_manifest_is_byte_stable_and_lifetimes_have_random_sentinels(self):
+        certificate = b"-----BEGIN CERTIFICATE-----\npublic\n-----END CERTIFICATE-----\n"
+        first = W.ProxyManager()
+        second = W.ProxyManager()
+        self.assertNotEqual(first.sentinel, second.sentinel)
+        self.assertGreaterEqual(len(first.sentinel), 32)
+        first.root = Path("/already/bootstrapped")
+        first.certificate = certificate
+        first.bootstrap_payload = W.bootstrap(certificate, first.sentinel)
+        first.proxy = W.Proxy(first.root, "a" * 64, 1000, certificate)
+        with mock.patch.object(first, "_running", return_value=True):
+            original = first.manifest()
+            self.assertIs(first.manifest(), original)
+            self.assertEqual(first.manifest(), original)
+        document = json.loads(original)
+        self.assertEqual(document["environment"]["GH_TOKEN"], first.sentinel)
+        self.assertNotEqual(document["environment"]["GH_TOKEN"], second.sentinel)
 
 
 class WorldAuthTests(unittest.TestCase):
@@ -187,10 +207,11 @@ class WorldAuthTests(unittest.TestCase):
             '"--log-driver", "none"', '"127.0.0.1::8080"', '"--pids-limit"',
         ):
             self.assertIn(value, source)
-        self.assertIn('private_write(root / "github-token", token.encode())', source)
+        self.assertIn('private_replace(root / "github-token", token.encode())', source)
         self.assertIn('"--memory", "128m"', source)
         self.assertIn('"--pids-limit", "64"', source)
         self.assertNotIn('"--env", "GH_TOKEN=" + token', source)
+        self.assertNotIn('PLACEHOLDER =', source)
 
     def test_docker_environment_excludes_host_credentials(self):
         with mock.patch.dict(W.os.environ, {
@@ -230,6 +251,52 @@ class WorldAuthTests(unittest.TestCase):
                     self.assertRaisesRegex(W.ProviderError, "credential cleanup failed"):
                 W.remove_private_root(root)
             self.assertTrue(root.exists())
+
+    def test_helper_restarts_with_refreshed_auth_and_stable_identity(self):
+        certificate = b"-----BEGIN CERTIFICATE-----\npublic\n-----END CERTIFICATE-----\n"
+        with tempfile.TemporaryDirectory() as raw:
+            manager = W.ProxyManager()
+            manager.root = Path(raw)
+            manager.certificate = certificate
+            manager.bootstrap_payload = W.bootstrap(certificate, manager.sentinel)
+            manager.proxy = W.Proxy(manager.root, "a" * 64, 1000, certificate)
+            with mock.patch.object(manager, "_running", return_value=True):
+                before = manager.manifest()
+            responses = (
+                subprocess.CompletedProcess([], 0, "false\n", ""),
+                subprocess.CompletedProcess([], 0, "b" * 64 + "\n", ""),
+                subprocess.CompletedProcess([], 0, "127.0.0.1:2000\n", ""),
+            )
+            connection = mock.MagicMock()
+            with mock.patch.object(W, "run_docker", side_effect=responses), \
+                    mock.patch.object(W, "remove_container", return_value=True), \
+                    mock.patch.object(W, "read_token", return_value="refreshed-token") as read_token, \
+                    mock.patch.object(W, "private_replace") as replace, \
+                    mock.patch.object(manager, "workspace_tag", return_value="workspace-tag"), \
+                    mock.patch.object(W.socket, "create_connection", return_value=connection):
+                recovered = manager.get()
+            read_token.assert_called_once_with()
+            replace.assert_called_once_with(manager.root / "github-token", b"refreshed-token")
+            self.assertEqual(recovered.container, "b" * 64)
+            self.assertEqual(recovered.certificate, certificate)
+            with mock.patch.object(manager, "_running", return_value=True):
+                self.assertIs(manager.manifest(), before)
+            self.assertEqual(manager.sentinel, json.loads(before)["environment"]["GH_TOKEN"])
+
+    def test_helper_recovery_fails_closed_on_unknown_state_or_cleanup_failure(self):
+        manager = W.ProxyManager()
+        proxy = W.Proxy(Path("/private/lifetime"), "a" * 64, 1000, b"certificate")
+        unknown = subprocess.CompletedProcess([], 1, "", "inspect failed")
+        present = subprocess.CompletedProcess([], 0, proxy.container + "\n", "")
+        with mock.patch.object(W, "run_docker", side_effect=(unknown, present)), \
+                self.assertRaisesRegex(W.ProviderError, "verify GitHub helper exit"):
+            manager._running(proxy)
+
+        exited = subprocess.CompletedProcess([], 0, "false\n", "")
+        with mock.patch.object(W, "run_docker", return_value=exited), \
+                mock.patch.object(W, "remove_container", return_value=False), \
+                self.assertRaisesRegex(W.ProviderError, "cleanup could not be verified"):
+            manager._running(proxy)
 
 
 class FileContractTests(unittest.TestCase):

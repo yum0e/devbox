@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import signal
 import socket
@@ -23,7 +24,6 @@ import uuid
 
 
 IRON = "ironsh/iron-proxy:0.49.0@sha256:c4628019c24f4cc8d77564a26b7c9cedb00accee6f93d06270e85fb8f9c6a7da"
-PLACEHOLDER = "[REDACTED]"
 MAX_AUTH = 1024 * 1024
 MAX_CA = 1024 * 1024
 MAX_CONNECT = 16 * 1024
@@ -39,11 +39,11 @@ class ProviderError(Exception):
     pass
 
 
-def bootstrap(certificate: bytes) -> bytes:
+def bootstrap(certificate: bytes, sentinel: str) -> bytes:
     hosts = (
         "github.com:\n"
         "  git_protocol: ssh\n"
-        "  oauth_token: " + PLACEHOLDER + "\n"
+        "  oauth_token: " + sentinel + "\n"
         "  user: devc2\n"
     ).encode("utf-8")
     document = {
@@ -54,8 +54,8 @@ def bootstrap(certificate: bytes) -> bytes:
             "contents_b64": base64.b64encode(hosts).decode("ascii"),
         }],
         "environment": {
-            "GH_TOKEN": PLACEHOLDER,
-            "GITHUB_TOKEN": PLACEHOLDER,
+            "GH_TOKEN": sentinel,
+            "GITHUB_TOKEN": sentinel,
             "GH_CONFIG_DIR": "${ROOT}/gh",
             "HTTPS_PROXY": "${PROXY}",
             "https_proxy": "${PROXY}",
@@ -174,7 +174,19 @@ def private_write(path: Path, data: bytes) -> None:
         os.close(descriptor)
 
 
-def proxy_config() -> dict:
+def private_replace(path: Path, data: bytes) -> None:
+    temporary = path.with_name(path.name + ".new-" + uuid.uuid4().hex)
+    try:
+        private_write(temporary, data)
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def proxy_config(sentinel: str) -> dict:
     methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
     rules = [{"host": host, "methods": methods, "paths": ["/", "/*"]}
              for host in ("api.github.com", "uploads.github.com")]
@@ -185,7 +197,7 @@ def proxy_config() -> dict:
         "tls": {"mode": "mitm", "ca_cert": "/run/devc2-private/ca.crt", "ca_key": "/run/devc2-private/ca.key"},
         "transforms": [{"name": "secrets", "config": {"secrets": [{
             "source": {"type": "file", "path": "/run/devc2-private/github-token"},
-            "replace": {"proxy_value": PLACEHOLDER, "match_headers": ["Authorization"], "require": True},
+            "replace": {"proxy_value": sentinel, "match_headers": ["Authorization"], "require": True},
             "rules": rules,
         }]}}],
         "log": {"level": "warn"},
@@ -259,6 +271,10 @@ class ProxyManager:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.proxy: Optional[Proxy] = None
+        self.root: Optional[Path] = None
+        self.certificate: Optional[bytes] = None
+        self.sentinel = secrets.token_urlsafe(32)
+        self.bootstrap_payload: Optional[bytes] = None
 
     @staticmethod
     def workspace_tag() -> str:
@@ -279,26 +295,49 @@ class ProxyManager:
 
     def _running(self, proxy: Proxy) -> bool:
         result = run_docker(["inspect", "--format", "{{.State.Running}}", proxy.container], 15)
-        return result.returncode == 0 and result.stdout.strip() == "true"
+        state = result.stdout.strip()
+        if result.returncode == 0 and state == "true":
+            return True
+        if result.returncode == 0 and state == "false":
+            if not remove_container(proxy.container):
+                raise ProviderError("exited GitHub helper cleanup could not be verified")
+            return False
+        if result.returncode == 0:
+            raise ProviderError("Docker returned an unknown GitHub helper state")
+        remaining = run_docker(["ps", "--all", "--quiet", "--no-trunc", "--filter", "id=" + proxy.container], 15)
+        if remaining.returncode != 0:
+            raise ProviderError("Docker could not verify GitHub helper state")
+        identifiers = remaining.stdout.split()
+        if identifiers:
+            raise ProviderError("Docker could not verify GitHub helper exit")
+        return False
+
+    def manifest(self) -> bytes:
+        with self.lock:
+            self._get_locked()
+            assert self.bootstrap_payload is not None
+            return self.bootstrap_payload
 
     def get(self) -> Proxy:
         with self.lock:
-            if self.proxy is not None and self._running(self.proxy):
-                return self.proxy
-            if self.proxy is not None:
-                raise ProviderError("GitHub credential proxy exited after its manifest was attached")
-            self.proxy = self._start()
-            return self.proxy
+            return self._get_locked()
 
-    def _start(self) -> Proxy:
+    def _get_locked(self) -> Proxy:
+        if self.proxy is not None and self._running(self.proxy):
+            return self.proxy
+        self.proxy = None
+        self._ensure_identity()
+        self.proxy = self._start_helper()
+        return self.proxy
+
+    def _ensure_identity(self) -> None:
+        if self.root is not None:
+            return
         tag = self.workspace_tag()
         self._remove_stale(tag)
         root = Path(tempfile.mkdtemp(prefix="devc2-github-" + tag + "-"))
         os.chmod(root, 0o700)
-        container_id = None
-        proxy_name = None
         try:
-            token = read_token()
             ca_name = "devc2-github-ca-" + uuid.uuid4().hex
             try:
                 generated = run_docker(["run", "--pull=never", "--name", ca_name, "--rm", "--network", "none",
@@ -320,8 +359,24 @@ class ProxyManager:
             if (not certificate or b"-----BEGIN CERTIFICATE-----" not in certificate
                     or b"-----END CERTIFICATE-----" not in certificate or b"PRIVATE KEY" in certificate):
                 raise ProviderError("ephemeral CA certificate is invalid")
-            private_write(root / "github-token", token.encode())
-            private_write(root / "proxy.yaml", json.dumps(proxy_config(), separators=(",", ":")).encode())
+            private_write(root / "proxy.yaml", json.dumps(proxy_config(self.sentinel), separators=(",", ":")).encode())
+            payload = bootstrap(certificate, self.sentinel)
+            self.root = root
+            self.certificate = certificate
+            self.bootstrap_payload = payload
+        except Exception:
+            remove_private_root(root)
+            raise
+
+    def _start_helper(self) -> Proxy:
+        assert self.root is not None and self.certificate is not None
+        root = self.root
+        token = read_token()
+        private_replace(root / "github-token", token.encode())
+        container_id = None
+        proxy_name = None
+        try:
+            tag = self.workspace_tag()
             name = "devc2-github-proxy-" + uuid.uuid4().hex
             proxy_name = name
             launched = run_docker(["run", "--pull=never", "--detach", "--rm", "--name", name,
@@ -344,26 +399,33 @@ class ProxyManager:
                     port = int(match.group(1))
                     try:
                         with socket.create_connection(("127.0.0.1", port), timeout=.5):
-                            return Proxy(root, candidate, port, certificate)
+                            return Proxy(root, candidate, port, self.certificate)
                     except OSError:
                         pass
                 time.sleep(.05)
             raise ProviderError("credential proxy did not publish a loopback port")
         except Exception:
-            removed = True
             if container_id is not None:
                 removed = remove_container(container_id)
             elif proxy_name is not None:
                 removed = remove_named_container(proxy_name)
-            if removed:
-                remove_private_root(root)
+            else:
+                removed = True
+            if not removed:
+                raise ProviderError("failed GitHub helper cleanup could not be verified")
             raise
 
     def stop(self) -> None:
         with self.lock:
             if self.proxy is not None:
-                self.proxy.stop()
+                if not remove_container(self.proxy.container):
+                    raise ProviderError("credential proxy cleanup could not be verified")
                 self.proxy = None
+            if self.root is not None:
+                remove_private_root(self.root)
+                self.root = None
+                self.certificate = None
+                self.bootstrap_payload = None
 
 
 def read_connect(connection: socket.socket) -> tuple[bytes, bytes]:
@@ -411,7 +473,7 @@ def handle(connection: socket.socket, manager: ProxyManager) -> None:
         connection.settimeout(10)
         operation = connection.recv(1)
         if operation == b"B":
-            payload = bootstrap(manager.get().certificate)
+            payload = manager.manifest()
             connection.sendall(LENGTH.pack(len(payload)) + payload)
             return
         if operation != b"T":

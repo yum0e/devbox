@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import signal
 import socket
@@ -24,7 +25,6 @@ import uuid
 
 
 IRON = "ironsh/iron-proxy:0.49.0@sha256:c4628019c24f4cc8d77564a26b7c9cedb00accee6f93d06270e85fb8f9c6a7da"
-FAKE_ACCOUNT = "00000000-0000-0000-0000-000000000000"
 MAX_AUTH = 1024 * 1024
 MAX_CA = 1024 * 1024
 MAX_CONNECT = 16 * 1024
@@ -36,6 +36,10 @@ HEADER_NAME = re.compile(rb"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 
 
 class ProviderError(Exception):
+    pass
+
+
+class CleanupError(ProviderError):
     pass
 
 
@@ -51,42 +55,42 @@ def jwt(claims: dict) -> str:
     )
 
 
-FAKE_ACCESS = jwt({
-    "aud": ["https://api.openai.com/v1", "https://chatgpt.com/backend-api"],
-    "exp": 4102444800,
-    "https://api.openai.com/auth": {
-        "chatgpt_account_id": FAKE_ACCOUNT,
-        "chatgpt_plan_type": "plus",
-    },
-    "sub": "devc2",
-})
-
-
-def fake_auth() -> bytes:
+def fake_identity() -> tuple[str, str, bytes]:
+    account = str(uuid.uuid4())
+    subject = secrets.token_urlsafe(32)
+    access = jwt({
+        "aud": ["https://api.openai.com/v1", "https://chatgpt.com/backend-api"],
+        "exp": 4102444800,
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": account,
+            "chatgpt_plan_type": "plus",
+        },
+        "sub": subject,
+    })
     identity = jwt({
         "exp": 4102444800,
         "https://api.openai.com/auth": {
-            "chatgpt_account_id": FAKE_ACCOUNT,
+            "chatgpt_account_id": account,
             "chatgpt_plan_type": "plus",
         },
-        "sub": "devc2",
+        "sub": subject,
     })
     document = {
         "OPENAI_API_KEY": None,
         "auth_mode": "chatgpt",
         "tokens": {
             "id_token": identity,
-            "access_token": FAKE_ACCESS,
-            "refresh_token": "not-a-real-refresh-token",
-            "account_id": FAKE_ACCOUNT,
+            "access_token": access,
+            "refresh_token": secrets.token_urlsafe(32),
+            "account_id": account,
         },
         "last_refresh": "2025-01-01T00:00:00.000Z",
     }
-    return json.dumps(document, separators=(",", ":")).encode()
+    return account, access, json.dumps(document, separators=(",", ":")).encode()
 
 
-def bootstrap(certificate: bytes) -> bytes:
-    auth = base64.b64encode(fake_auth()).decode("ascii")
+def bootstrap(certificate: bytes, auth_document: bytes, access: str) -> bytes:
+    auth = base64.b64encode(auth_document).decode("ascii")
     document = {
         "v": 1,
         "ca_b64": base64.b64encode(certificate).decode("ascii"),
@@ -108,7 +112,7 @@ def bootstrap(certificate: bytes) -> bytes:
             "TACT_AUTH": "chatgpt",
             "TACT_AUTH_FILE": "${ROOT}/auth.json",
             "CODEX_HOME": "${ROOT}/codex",
-            "DEVC2_PI_OPENAI_TOKEN": FAKE_ACCESS,
+            "DEVC2_PI_OPENAI_TOKEN": access,
         },
         "routes": ["chatgpt.com:443"],
     }
@@ -192,6 +196,18 @@ def private_write(path: Path, data: bytes) -> None:
             view = view[written:]
     finally:
         os.close(descriptor)
+
+
+def private_replace(path: Path, data: bytes) -> None:
+    temporary = path.with_name(path.name + ".new-" + uuid.uuid4().hex)
+    try:
+        private_write(temporary, data)
+        os.replace(str(temporary), str(path))
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def docker_environment() -> dict[str, str]:
@@ -280,7 +296,7 @@ def cleanup_stale_roots(prefix: str) -> None:
         shutil.rmtree(candidate)
 
 
-def proxy_config() -> dict:
+def proxy_config(fake_access: str, fake_account: str) -> dict:
     def secret(filename: str, placeholder: str, header: str) -> dict:
         return {
             "source": {"type": "file", "path": "/run/devc2-private/" + filename},
@@ -314,8 +330,8 @@ def proxy_config() -> dict:
         "transforms": [{
             "name": "secrets",
             "config": {"secrets": [
-                secret("access-token", FAKE_ACCESS, "Authorization"),
-                secret("account-id", FAKE_ACCOUNT, "chatgpt-account-id"),
+                secret("access-token", fake_access, "Authorization"),
+                secret("account-id", fake_account, "chatgpt-account-id"),
             ]},
         }],
         "log": {"level": "warn"},
@@ -348,6 +364,8 @@ class ProxyManager:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.proxy: Optional[Proxy] = None
+        self.fake_account, self.fake_access, self.fake_auth = fake_identity()
+        self._manifest: Optional[bytes] = None
 
     @staticmethod
     def workspace_tag() -> str:
@@ -371,70 +389,60 @@ class ProxyManager:
                 raise ProviderError("stale credential proxy cleanup failed")
         cleanup_stale_roots("devc2-openai-" + tag + "-")
 
-    def _running(self, proxy: Proxy) -> bool:
+    def _state(self, proxy: Proxy) -> str:
         result = run_docker(["inspect", "--format", "{{.State.Running}}", proxy.container], 15)
-        return result.returncode == 0 and result.stdout.strip() == "true"
+        if result.returncode == 0 and result.stdout.strip() in ("true", "false"):
+            return "running" if result.stdout.strip() == "true" else "exited"
+        absent = run_docker([
+            "ps", "--all", "--quiet", "--no-trunc", "--filter", "id=" + proxy.container,
+        ], 15)
+        if absent.returncode == 0 and not absent.stdout.split():
+            return "exited"
+        raise ProviderError("Docker could not verify credential proxy state")
 
     def get(self) -> Proxy:
         with self.lock:
-            if self.proxy is not None and self._running(self.proxy):
-                return self.proxy
-            if self.proxy is not None:
-                raise ProviderError("OpenAI credential proxy exited after its manifest was attached")
-            # A failed first attempt leaves no retained state, so startup may
-            # be retried without ever changing a published manifest.
-            candidate = self._start()
-            self.proxy = candidate
-            return candidate
+            return self._get_locked()
 
-    def _start(self) -> Proxy:
-        tag = self.workspace_tag()
-        self._remove_stale(tag)
-        root = Path(tempfile.mkdtemp(prefix="devc2-openai-" + tag + "-"))
-        os.chmod(str(root), 0o700)
-        container_id = None
-        proxy_name = None
-        try:
-            access, account = read_auth()
-            ca_name = "devc2-openai-ca-" + uuid.uuid4().hex
-            try:
-                generated = run_docker([
-                    "run", "--pull", "never", "--name", ca_name, "--rm", "--network", "none",
-                    "--label", "dev.devbox.openai-span.workspace-hash=" + tag,
-                    "--user", "%d:%d" % (os.getuid(), os.getgid()),
-                    "--volume", "%s:/out" % root,
-                    IRON, "generate-ca", "-outdir", "/out", "-alg", "ed25519",
-                    "-name", "devc2 OpenAI Span",
-                ])
-                if generated.returncode != 0:
-                    raise ProviderError("ephemeral CA generation failed")
-            finally:
-                if not remove_named_container(ca_name):
-                    raise ProviderError("CA helper cleanup could not be verified")
-
-            for filename in ("ca.crt", "ca.key"):
-                path = root / filename
-                metadata = path.lstat()
-                if (not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
-                        or metadata.st_size > MAX_CA):
-                    raise ProviderError("ephemeral CA output is invalid")
-                os.chmod(str(path), 0o600)
-            certificate = (root / "ca.crt").read_bytes()
-            if (not certificate or len(certificate) > MAX_CA
-                    or b"-----BEGIN CERTIFICATE-----" not in certificate
-                    or b"-----END CERTIFICATE-----" not in certificate
-                    or b"PRIVATE KEY" in certificate):
-                raise ProviderError("ephemeral CA certificate is invalid")
-
-            private_write(root / "access-token", access.encode("utf-8"))
-            private_write(root / "account-id", account.encode("utf-8"))
-            private_write(
-                root / "proxy.yaml",
-                json.dumps(proxy_config(), separators=(",", ":")).encode("utf-8"),
+    def bootstrap(self) -> bytes:
+        with self.lock:
+            proxy = self._get_locked()
+            if self._manifest is not None:
+                return self._manifest
+            self._manifest = bootstrap(
+                proxy.certificate, self.fake_auth, self.fake_access,
             )
+            return self._manifest
 
-            name = "devc2-openai-proxy-" + uuid.uuid4().hex
-            proxy_name = name
+    def _get_locked(self) -> Proxy:
+        if self.proxy is not None:
+            if self._state(self.proxy) == "running":
+                return self.proxy
+            if not remove_container(self.proxy.container):
+                raise ProviderError("credential proxy cleanup could not be verified")
+            container, port = self._launch(self.proxy.root, self.workspace_tag())
+            self.proxy.container = container
+            self.proxy.port = port
+            return self.proxy
+        candidate = self._start()
+        self.proxy = candidate
+        return candidate
+
+    def _launch(self, root: Path, tag: str) -> tuple[str, int]:
+        access, account = read_auth()
+        private_replace(root / "access-token", access.encode("utf-8"))
+        private_replace(root / "account-id", account.encode("utf-8"))
+        private_replace(
+            root / "proxy.yaml",
+            json.dumps(
+                proxy_config(self.fake_access, self.fake_account),
+                separators=(",", ":"),
+            ).encode("utf-8"),
+        )
+
+        name = "devc2-openai-proxy-" + uuid.uuid4().hex
+        container_id = None
+        try:
             launched = run_docker([
                 "run", "--pull", "never", "--detach", "--rm", "--name", name,
                 "--label", "dev.devbox.openai-span.workspace-hash=" + tag,
@@ -449,7 +457,8 @@ class ProxyManager:
             ])
             candidate_id = launched.stdout.strip()
             if launched.returncode != 0 or not re.fullmatch(r"[0-9a-f]{64}", candidate_id):
-                remove_named_container(name)
+                if not remove_named_container(name):
+                    raise CleanupError("credential proxy cleanup could not be verified")
                 raise ProviderError("credential proxy failed to start")
             container_id = candidate_id
 
@@ -469,15 +478,55 @@ class ProxyManager:
                 time.sleep(0.05)
             if not port:
                 raise ProviderError("credential proxy did not publish a loopback port")
-            return Proxy(root, container_id, port, certificate)
+            return container_id, port
         except Exception:
-            removed = True
             if container_id is not None:
-                removed = remove_container(container_id)
-            elif proxy_name is not None:
-                removed = remove_named_container(proxy_name)
-            if removed:
-                remove_private_root(root)
+                if not remove_container(container_id):
+                    raise CleanupError("credential proxy cleanup could not be verified")
+            raise
+
+    def _start(self) -> Proxy:
+        tag = self.workspace_tag()
+        self._remove_stale(tag)
+        root = Path(tempfile.mkdtemp(prefix="devc2-openai-" + tag + "-"))
+        os.chmod(str(root), 0o700)
+        try:
+            ca_name = "devc2-openai-ca-" + uuid.uuid4().hex
+            try:
+                generated = run_docker([
+                    "run", "--pull", "never", "--name", ca_name, "--rm", "--network", "none",
+                    "--label", "dev.devbox.openai-span.workspace-hash=" + tag,
+                    "--user", "%d:%d" % (os.getuid(), os.getgid()),
+                    "--volume", "%s:/out" % root,
+                    IRON, "generate-ca", "-outdir", "/out", "-alg", "ed25519",
+                    "-name", "devc2 OpenAI Span",
+                ])
+                if generated.returncode != 0:
+                    raise ProviderError("ephemeral CA generation failed")
+            finally:
+                if not remove_named_container(ca_name):
+                    raise CleanupError("CA helper cleanup could not be verified")
+
+            for filename in ("ca.crt", "ca.key"):
+                path = root / filename
+                metadata = path.lstat()
+                if (not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
+                        or metadata.st_size > MAX_CA):
+                    raise ProviderError("ephemeral CA output is invalid")
+                os.chmod(str(path), 0o600)
+            certificate = (root / "ca.crt").read_bytes()
+            if (not certificate or len(certificate) > MAX_CA
+                    or b"-----BEGIN CERTIFICATE-----" not in certificate
+                    or b"-----END CERTIFICATE-----" not in certificate
+                    or b"PRIVATE KEY" in certificate):
+                raise ProviderError("ephemeral CA certificate is invalid")
+
+            container_id, port = self._launch(root, tag)
+            return Proxy(root, container_id, port, certificate)
+        except CleanupError:
+            raise
+        except Exception:
+            remove_private_root(root)
             raise
 
     def stop(self) -> None:
@@ -550,7 +599,7 @@ def handle(connection: socket.socket, manager: ProxyManager) -> None:
         connection.settimeout(10)
         operation = connection.recv(1)
         if operation == b"B":
-            payload = bootstrap(manager.get().certificate)
+            payload = manager.bootstrap()
             connection.sendall(LENGTH.pack(len(payload)) + payload)
             return
         if operation != b"T":
