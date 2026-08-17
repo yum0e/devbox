@@ -17,7 +17,8 @@ import stat
 import struct
 import sys
 import threading
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -36,6 +37,12 @@ NAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
 class SpanError(RuntimeError):
     pass
+
+
+class HerdrRejected(SpanError):
+    def __init__(self, code: object, message: str):
+        super().__init__(message)
+        self.code = code
 
 
 def receive(connection: socket.socket, size: int) -> bytes:
@@ -122,7 +129,10 @@ class Herdr:
         if "error" in response:
             error = response["error"]
             message = error.get("message") if isinstance(error, dict) else None
-            raise SpanError(message if isinstance(message, str) else "Herdr rejected the request")
+            code = error.get("code") if isinstance(error, dict) else None
+            raise HerdrRejected(
+                code, message if isinstance(message, str) else "Herdr rejected the request"
+            )
         result = response.get("result")
         if not isinstance(result, dict):
             raise SpanError("invalid result from Herdr")
@@ -137,6 +147,8 @@ class Job:
     marker: str
     exit_code: int | None = None
     started: bool = False
+    closed: bool = False
+    lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
 
 
 def start_marker(marker: str) -> str:
@@ -190,31 +202,58 @@ class World:
         return read["text"]
 
     def read_job(self, job: Job, lines: int = 1000) -> str:
-        output = self.pane_output(job)
-        boundary = start_marker(job.marker)
-        start = output.find(boundary)
-        if start >= 0:
-            job.started = True
-            output = output[start + len(boundary):].lstrip("\r\n")
-        elif not job.started:
-            # Until the worker boundary appears, the pane contains only its
-            # host shell prompt and the private bootstrap invocation.
-            return ""
-        end = output.find(job.marker)
-        if end >= 0:
-            output = output[:end]
-        return "".join(output.splitlines(keepends=True)[-lines:])
+        with job.lock:
+            self.require_open(job)
+            output = self.pane_output(job)
+            boundary = start_marker(job.marker)
+            start = output.find(boundary)
+            if start >= 0:
+                job.started = True
+                output = output[start + len(boundary):].lstrip("\r\n")
+            elif not job.started:
+                # Until the worker boundary appears, the pane contains only its
+                # host shell prompt and the private bootstrap invocation.
+                return ""
+            end = output.find(job.marker)
+            if end >= 0:
+                output = output[:end]
+            return "".join(output.splitlines(keepends=True)[-lines:])
 
     def refresh(self, job: Job) -> None:
-        if job.exit_code is not None:
-            return
-        output = self.pane_output(job)
-        if start_marker(job.marker) in output:
-            job.started = True
-        match = re.search(re.escape(job.marker) + r"([0-9]{1,3})", output)
-        if match:
-            job.started = True
-            job.exit_code = int(match.group(1))
+        with job.lock:
+            self.require_open(job)
+            if job.exit_code is not None:
+                return
+            output = self.pane_output(job)
+            if start_marker(job.marker) in output:
+                job.started = True
+            match = re.search(re.escape(job.marker) + r"([0-9]{1,3})", output)
+            if match:
+                job.started = True
+                job.exit_code = int(match.group(1))
+
+    @staticmethod
+    def require_open(job: Job) -> None:
+        if job.closed:
+            raise SpanError(f"worker {job.name!r} is closed")
+
+    def forget(self, job: Job) -> None:
+        job.closed = True
+        with self.lock:
+            if self.jobs.get(job.name) is job:
+                self.jobs.pop(job.name)
+            if self.owned.get(job.pane_id) is job:
+                self.owned.pop(job.pane_id)
+
+    def target_is_gone(self, job: Job) -> bool:
+        try:
+            result = self.herdr.call("pane.get", {"pane_id": job.pane_id})
+        except HerdrRejected as error:
+            return error.code == "not_found"
+        except Exception:
+            return False
+        pane = result.get("pane")
+        return isinstance(pane, dict) and pane.get("terminal_id") != job.terminal_id
 
     def get_job(self, name: object) -> Job:
         if not isinstance(name, str) or not NAME.fullmatch(name):
@@ -223,7 +262,6 @@ class World:
             job = self.jobs.get(name)
         if job is None:
             raise SpanError(f"unknown worker: {name}")
-        self.pane(job)
         return job
 
     def spawn(self, request: dict) -> str:
@@ -332,10 +370,28 @@ class World:
                 raise SpanError("send accepts only name and text")
             text = bounded_input(request["text"])
             job = self.get_job(request["name"])
-            self.refresh(job)
-            if job.exit_code is not None:
-                raise SpanError(f"worker {job.name!r} has exited")
-            self.herdr.call("pane.send_input", {"pane_id": job.pane_id, "text": text, "keys": ["Enter"]})
+            with job.lock:
+                self.require_open(job)
+                self.refresh(job)
+                if job.exit_code is not None:
+                    raise SpanError(f"worker {job.name!r} has exited")
+                self.herdr.call("pane.send_input", {"pane_id": job.pane_id, "text": text, "keys": ["Enter"]})
+            return None
+        if operation == "close":
+            if set(request) != {"op", "name"}:
+                raise SpanError("close accepts only name")
+            job = self.get_job(request["name"])
+            with job.lock:
+                self.require_open(job)
+                try:
+                    self.pane(job)
+                    self.herdr.call("pane.close", {"pane_id": job.pane_id})
+                except Exception as error:
+                    if self.target_is_gone(job):
+                        self.forget(job)
+                        return None
+                    raise error
+                self.forget(job)
             return None
         if operation == "wait":
             if set(request) != {"op", "name", "timeout_ms"}:
@@ -344,23 +400,31 @@ class World:
             if not isinstance(timeout_ms, int) or not 1 <= timeout_ms <= 3_600_000:
                 raise SpanError("wait timeout must be between 1 ms and 1 hour")
             job = self.get_job(request["name"])
-            self.refresh(job)
-            if job.exit_code is None:
-                self.herdr.call(
-                    "pane.wait_for_output",
-                    {
-                        "pane_id": job.pane_id,
-                        "source": "recent_unwrapped",
-                        "lines": 1000,
-                        "match": {"type": "substring", "value": job.marker},
-                        "timeout_ms": timeout_ms,
-                    },
-                    timeout=timeout_ms / 1000 + 5,
-                )
-                self.refresh(job)
-            if job.exit_code is None:
-                raise SpanError("worker completion marker was not found")
-            return {"exit_code": job.exit_code}
+            deadline = time.monotonic() + timeout_ms / 1000
+            while True:
+                with job.lock:
+                    self.require_open(job)
+                    self.refresh(job)
+                    if job.exit_code is not None:
+                        return {"exit_code": job.exit_code}
+                    remaining_ms = int((deadline - time.monotonic()) * 1000)
+                    if remaining_ms <= 0:
+                        break
+                    interval_ms = min(remaining_ms, 500)
+                    self.herdr.call(
+                        "pane.wait_for_output",
+                        {
+                            "pane_id": job.pane_id,
+                            "source": "recent_unwrapped",
+                            "lines": 1000,
+                            "match": {"type": "substring", "value": job.marker},
+                            "timeout_ms": interval_ms,
+                        },
+                        timeout=interval_ms / 1000 + 5,
+                    )
+                # Give close a deterministic opportunity between bounded waits.
+                time.sleep(0)
+            raise SpanError("worker completion marker was not found")
         raise SpanError("unknown operation")
 
     def cleanup(self) -> None:
@@ -369,16 +433,30 @@ class World:
             jobs = list(self.owned.values())
 
         def close(job: Job) -> None:
-            for _attempt in range(2):
-                try:
-                    result = self.herdr.call("pane.get", {"pane_id": job.pane_id}, timeout=0.5)
-                    pane = result.get("pane")
-                    if not isinstance(pane, dict) or pane.get("terminal_id") != job.terminal_id:
-                        return
-                    self.herdr.call("pane.close", {"pane_id": job.pane_id}, timeout=0.5)
+            with job.lock:
+                if job.closed:
                     return
-                except Exception:
+                for _attempt in range(2):
+                    try:
+                        result = self.herdr.call("pane.get", {"pane_id": job.pane_id}, timeout=0.5)
+                        pane = result.get("pane")
+                        if not isinstance(pane, dict):
+                            continue
+                        if pane.get("terminal_id") != job.terminal_id:
+                            self.forget(job)
+                            return
+                        self.herdr.call("pane.close", {"pane_id": job.pane_id}, timeout=0.5)
+                    except HerdrRejected as error:
+                        if error.code == "not_found":
+                            self.forget(job)
+                            return
+                    except Exception:
+                        if self.target_is_gone(job):
+                            self.forget(job)
+                            return
                     continue
+                    self.forget(job)
+                    return
 
         threads = [threading.Thread(target=close, args=(job,)) for job in jobs]
         for thread in threads:
@@ -402,6 +480,8 @@ def command_parser() -> argparse.ArgumentParser:
     read.add_argument("--lines", type=int, default=200)
     send = commands.add_parser("send", help="submit stdin and Enter to a running worker")
     send.add_argument("name")
+    close = commands.add_parser("close", help="close a worker pane owned by this Island")
+    close.add_argument("name")
     wait = commands.add_parser("wait", help="wait for a worker to exit")
     wait.add_argument("name")
     wait.add_argument("--timeout", type=float, default=300, metavar="SECONDS")
@@ -465,6 +545,8 @@ def invoke_command(world: World, request: object) -> dict:
             elif args.command == "send":
                 text = raw_input.decode()
                 world.handle({"op": "send", "name": args.name, "text": text})
+            elif args.command == "close":
+                world.handle({"op": "close", "name": args.name})
             elif args.command == "wait":
                 if not 0 < args.timeout <= 3600:
                     raise SpanError("timeout must be between 0 and 3600 seconds")

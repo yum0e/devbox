@@ -17,7 +17,7 @@ runs inside the same Island.
                                       ▼
                          docker exec ──▶ same Island
 
- Herdr World: pane ownership · names · read/send/wait · no Docker knowledge
+ Herdr World: pane ownership · names · read/send/wait/close · no Docker knowledge
  Docker Agent: exact Island selection · fixed user/cwd/TTY · no Herdr authority
  Island:       no Docker socket · no host Herdr socket · no worker Link
 ```
@@ -65,6 +65,7 @@ herdr read reviewer --lines 500
 
 ```sh
 printf 'continue with the tests' | herdr send reviewer
+herdr close reviewer
 ```
 
 The projected command never accepts a Herdr pane ID, container ID, cwd, environment, Docker
@@ -72,6 +73,7 @@ option, or host command. The Herdr World targets only the pane inherited from th
 host launch, remembers only panes it created, and rechecks each pane's terminal
 identity before using it. The host shell `exec`s the trusted worker, so there is
 no host prompt underneath it; a completed worker stays parked for inspection.
+`close` removes only a named pane owned by this World.
 World teardown makes bounded best-effort attempts to close its panes.
 `herdr read` returns only content between private worker boundaries; it does not
 expose the host bootstrap command, executable path, container identity, payload,

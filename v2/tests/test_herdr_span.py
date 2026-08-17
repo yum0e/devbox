@@ -219,6 +219,149 @@ class WorldAuthorityTests(unittest.TestCase):
         with self.assertRaisesRegex(H.SpanError, "has exited"):
             item.handle({"op": "send", "name": "done", "text": "touch /tmp/host"})
 
+    def test_close_removes_only_a_revalidated_owned_pane(self):
+        item = provider()
+        job = H.Job("done", "w1:p2", "terminal-new", "__DEVC2_HERDR_" + "a" * 32 + "_EXIT_", exit_code=0)
+        item.jobs[job.name] = job
+        item.owned[job.pane_id] = job
+        self.assertIsNone(item.handle({"op": "close", "name": "done"}))
+        self.assertFalse(item.jobs)
+        self.assertFalse(item.owned)
+        self.assertEqual(item.herdr.calls[-1][:2], ("pane.close", {"pane_id": "w1:p2"}))
+
+    def test_close_failure_retains_public_and_cleanup_ownership(self):
+        item = provider()
+        job = H.Job("live", "w1:p2", "terminal-new", "__DEVC2_HERDR_" + "b" * 32 + "_EXIT_")
+        item.jobs[job.name] = job
+        item.owned[job.pane_id] = job
+        original = item.herdr.call
+
+        def fail(method, params, timeout=10):
+            if method == "pane.close":
+                raise H.SpanError("close failed")
+            return original(method, params, timeout)
+
+        item.herdr.call = fail
+        with self.assertRaisesRegex(H.SpanError, "close failed"):
+            item.handle({"op": "close", "name": "live"})
+        self.assertIs(item.jobs["live"], job)
+        self.assertIs(item.owned["w1:p2"], job)
+
+    def test_close_lost_response_forgets_a_provably_gone_pane(self):
+        item = provider()
+        job = H.Job("gone", "w1:p2", "terminal-new", "__DEVC2_HERDR_" + "d" * 32 + "_EXIT_")
+        item.jobs[job.name] = job
+        item.owned[job.pane_id] = job
+        original = item.herdr.call
+        closed = False
+
+        def lose_response(method, params, timeout=10):
+            nonlocal closed
+            if method == "pane.close":
+                closed = True
+                raise OSError("response lost")
+            if method == "pane.get" and closed:
+                raise H.HerdrRejected("not_found", "pane not found")
+            return original(method, params, timeout)
+
+        item.herdr.call = lose_response
+        self.assertIsNone(item.handle({"op": "close", "name": "gone"}))
+        self.assertTrue(job.closed)
+        self.assertFalse(item.jobs)
+        self.assertFalse(item.owned)
+
+    def test_send_and_close_are_serialized_per_worker(self):
+        item = provider()
+        job = H.Job("live", "w1:p2", "terminal-new", "__DEVC2_HERDR_" + "e" * 32 + "_EXIT_")
+        item.jobs[job.name] = job
+        item.owned[job.pane_id] = job
+        original = item.herdr.call
+        sending = threading.Event()
+        release = threading.Event()
+        errors = []
+
+        def block_send(method, params, timeout=10):
+            if method == "pane.send_input" and params.get("text") == "hello":
+                sending.set()
+                release.wait(2)
+            return original(method, params, timeout)
+
+        def run(request):
+            try:
+                item.handle(request)
+            except Exception as error:
+                errors.append(error)
+
+        item.herdr.call = block_send
+        sender = threading.Thread(target=run, args=({"op": "send", "name": "live", "text": "hello"},))
+        closer = threading.Thread(target=run, args=({"op": "close", "name": "live"},))
+        sender.start()
+        self.assertTrue(sending.wait(1))
+        closer.start()
+        self.assertFalse(any(call[0] == "pane.close" for call in item.herdr.calls))
+        release.set()
+        sender.join(2)
+        closer.join(2)
+        self.assertFalse(sender.is_alive())
+        self.assertFalse(closer.is_alive())
+        self.assertFalse(errors)
+        self.assertEqual(sum(call[0] == "pane.close" for call in item.herdr.calls), 1)
+
+    def test_cleanup_cannot_double_close_a_public_close(self):
+        item = provider()
+        job = H.Job("live", "w1:p2", "terminal-new", "__DEVC2_HERDR_" + "f" * 32 + "_EXIT_")
+        item.jobs[job.name] = job
+        item.owned[job.pane_id] = job
+        original = item.herdr.call
+        closing = threading.Event()
+        release = threading.Event()
+        errors = []
+
+        def block_close(method, params, timeout=10):
+            if method == "pane.close":
+                closing.set()
+                release.wait(2)
+            return original(method, params, timeout)
+
+        def public_close():
+            try:
+                item.handle({"op": "close", "name": "live"})
+            except Exception as error:
+                errors.append(error)
+
+        item.herdr.call = block_close
+        closer = threading.Thread(target=public_close)
+        closer.start()
+        self.assertTrue(closing.wait(1))
+        teardown = threading.Thread(target=item.cleanup)
+        teardown.start()
+        release.set()
+        closer.join(2)
+        teardown.join(3)
+        self.assertFalse(errors)
+        self.assertFalse(closer.is_alive())
+        self.assertFalse(teardown.is_alive())
+        self.assertEqual(sum(call[0] == "pane.close" for call in item.herdr.calls), 1)
+        self.assertFalse(item.owned)
+
+    def test_cleanup_retains_ownership_after_a_non_not_found_rejection(self):
+        item = provider()
+        job = H.Job("live", "w1:p2", "terminal-new", "__DEVC2_HERDR_" + "7" * 32 + "_EXIT_")
+        item.jobs[job.name] = job
+        item.owned[job.pane_id] = job
+        original = item.herdr.call
+
+        def reject_close(method, params, timeout=10):
+            if method == "pane.close":
+                raise H.HerdrRejected("permission_denied", "close denied")
+            return original(method, params, timeout)
+
+        item.herdr.call = reject_close
+        item.cleanup()
+        self.assertIs(item.jobs[job.name], job)
+        self.assertIs(item.owned[job.pane_id], job)
+        self.assertFalse(job.closed)
+
     def test_spawn_boundary_makes_immediate_send_safe(self):
         item = provider()
         item.spawn({"op": "spawn", "name": "starting", "argv": ["sh"]})
@@ -256,6 +399,7 @@ class WorldAuthorityTests(unittest.TestCase):
             {"op": "spawn", "name": "x", "argv": ["true"], "container": "host"},
             {"op": "spawn", "name": "x", "argv": ["true"], "cwd": "/"},
             {"op": "read", "name": "x", "lines": 1, "pane_id": "w1:p1"},
+            {"op": "close", "name": "x", "pane_id": "w1:p1"},
         )
         for request in attempts:
             with self.subTest(request=request), self.assertRaises(H.SpanError):
@@ -500,8 +644,19 @@ class CommandAffordanceTests(unittest.TestCase):
         self.assertEqual(response["exit_code"], 0)
         self.assertFalse(item.herdr.calls)
         output = self.output(response, "stdout_b64")
-        for command in ("spawn", "list", "read", "send", "wait"):
+        for command in ("spawn", "list", "read", "send", "close", "wait"):
             self.assertIn(command, output)
+
+    def test_close_cli_removes_an_owned_worker(self):
+        item = provider()
+        job = H.Job("agent", "w1:p2", "terminal-new", "__DEVC2_HERDR_" + "c" * 32 + "_EXIT_")
+        item.jobs[job.name] = job
+        item.owned[job.pane_id] = job
+        response = self.invoke(item, ["close", "agent"])
+        self.assertEqual(response["exit_code"], 0)
+        self.assertEqual(self.output(response, "stdout_b64"), "")
+        self.assertFalse(item.jobs)
+        self.assertFalse(item.owned)
 
     def test_world_owns_cli_semantics_and_exit_status(self):
         item = provider()
