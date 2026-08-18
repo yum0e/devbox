@@ -45,6 +45,7 @@ needs.
 devc2 auth               # one-time OpenAI + GitHub login and SSH key selection
 devc2 doctor             # fast host prerequisites
 devc2 doctor --runtime   # disposable live Docker/credential/signing checks
+devc2 repair /path/to/repository # reconnect one running Island's Spans
 devc2 update             # atomically update from the install source
 devc2 rollback           # atomically return to the retained previous runtime
 devc2 run /path/to/repository
@@ -94,6 +95,16 @@ transport, GitHub API authentication, the exact filtered SSH identity, signing,
 writable Tact config, and the pinned Tact binary. It may trigger a 1Password
 approval and makes authenticated probes, including one minimal model response.
 It never mounts a real checkout and removes its project volumes during teardown.
+
+`devc2 repair /path/to/repository` keeps the running Island and its Herdr panes
+alive. It restarts only that checkout's Span bridge (including a stopped one),
+waits for fresh projected sockets, verifies GitHub and the selected SSH identity
+when granted, checks every host World's process status when diagnostics is
+granted, and refreshes Git signing configuration. Without diagnostics, a custom
+World's application protocol cannot be checked generically. Existing shells
+cannot have their process environment rewritten; after repairing a mixed-version session they may need
+`export SSH_AUTH_SOCK=/run/devc2/spans/ssh-agent.sock`. New launches use that
+path directly.
 
 The image installs the stock Tact, Pi, and Herdr executables. Attachment
 environment is configured on the container itself, so ordinary shells and

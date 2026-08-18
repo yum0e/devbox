@@ -29,6 +29,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(D.parse_cli(["auth"]),("auth",None,False,()))
         self.assertEqual(D.parse_cli(["update"]),("update",None,False,()))
         self.assertEqual(D.parse_cli(["rollback"]),("rollback",None,False,()))
+        self.assertEqual(D.parse_cli(["repair","repo"]),("repair","repo",False,()))
         self.assertEqual(D.parse_cli(["reset","repo","--yes"]),("reset","repo",True,()))
         with self.assertRaises(RuntimeError): D.parse_cli(["run","repo","--span","example","--span","example"])
         with self.assertRaises(RuntimeError): D.parse_cli(["run","repo",*sum((["--span",f"s{i}"] for i in range(17)),[])])
@@ -265,6 +266,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("--ignore-scripts --no-optional", dockerfile)
         self.assertNotIn("pi-upstream", dockerfile)
         self.assertIn("COPY devbox/configure-pi.sh /usr/local/libexec/devc2/configure-pi", dockerfile)
+        self.assertIn("COPY devbox/configure-signing.sh /usr/local/libexec/devc2/configure-signing", dockerfile)
         self.assertIn("/usr/local/libexec/devc2/configure-pi", entrypoint)
         island,auth=dockerfile.split("FROM island AS auth",1)
         self.assertNotIn("@openai/codex", island)
@@ -354,17 +356,23 @@ class CliTests(unittest.TestCase):
 
     def test_entrypoint_uses_optional_github_and_ssh_agent_spans_with_signing_readiness(self):
         entrypoint = (PATH.parents[1] / "devbox" / "entrypoint.sh").read_text()
+        signing = (PATH.parents[1] / "devbox" / "configure-signing.sh").read_text()
         self.assertIn("gh api user", entrypoint)
         self.assertNotIn("github run --", entrypoint)
-        self.assertIn("ssh-keygen -Y sign", entrypoint)
-        self.assertIn("ssh-keygen-with-agent", entrypoint)
-        self.assertIn("gpg.ssh.program", entrypoint)
-        self.assertIn("signing.backends.ssh.program", entrypoint)
+        self.assertIn("/usr/local/libexec/devc2/configure-signing", entrypoint)
+        self.assertIn("ssh-keygen -Y sign", signing)
+        self.assertIn("ssh-keygen-with-agent", signing)
+        self.assertIn("gpg.ssh.program", signing)
+        self.assertIn("signing.backends.ssh.program", signing)
         self.assertIn("env -u SSH_AUTH_SOCK git", entrypoint)
         self.assertIn("env -u SSH_AUTH_SOCK jj", entrypoint)
-        self.assertIn('gpg.ssh.allowedSignersFile "$allowed_signers"', entrypoint)
-        self.assertIn("namespaces=\"git\"", entrypoint)
-        self.assertIn("SSH-agent Span selected identity could not sign", entrypoint)
+        self.assertIn('gpg.ssh.allowedSignersFile "$allowed_signers"', signing)
+        self.assertIn("namespaces=\"git\"", signing)
+        self.assertIn('exec 9<"$signing_dir"', signing)
+        self.assertIn("flock -x 9", signing)
+        self.assertIn("mktemp -d", signing)
+        self.assertIn("mv -f", signing)
+        self.assertIn("did not expose exactly one identity", signing)
         self.assertIn("if [[ -S /run/devc2/spans/ssh-agent.sock ]]", entrypoint)
         self.assertIn("report_span_diagnostics", entrypoint)
         self.assertIn("git config --global --unset-all core.sshCommand", entrypoint)
@@ -643,5 +651,81 @@ class CoexistenceTests(unittest.TestCase):
         source=PATH.read_text()
         self.assertNotIn('mkdir(".devcontainer',source)
         self.assertNotIn('rmtree(".devcontainer',source)
+
+class RepairTests(unittest.TestCase):
+    def test_repair_restarts_only_the_project_bridge_and_refreshes_live_credentials(self):
+        repo=Path("/tmp/repo")
+        project=D.identity(repo)[1]
+        completed=lambda stdout="",returncode=0: subprocess.CompletedProcess([],returncode,stdout,"")
+        results=[
+            completed("a"*12+"\n"), completed("b"*12+"\n"), completed("devbox\n"),
+            completed(), completed(),
+            completed(), completed('[{"name":"ssh-agent","port":49152},{"name":"github","port":49153}]'),
+            completed(), completed(), completed("ssh-ed25519 key comment\n"),
+            completed(), completed(), completed(), completed("yum0e\n"),
+        ]
+        output=io.StringIO()
+        with mock.patch.object(D,"require_docker"), \
+             mock.patch.object(D,"lifecycle_lock",return_value=contextlib.nullcontext()), \
+             mock.patch.object(D,"repair_lock",return_value=contextlib.nullcontext()), \
+             mock.patch.object(D,"run",side_effect=results) as run, \
+             contextlib.redirect_stdout(output):
+            self.assertEqual(D.repair(repo),0)
+        commands=[call.args[0] for call in run.call_args_list]
+        self.assertEqual(commands[0],[
+            "docker","ps","--quiet","--filter",f"label=com.docker.compose.project={project}",
+            "--filter","label=com.docker.compose.service=devbox",
+            "--filter","label=dev.devbox.generation=2",
+            "--filter",f"label=dev.devbox.workspace-hash={D.identity(repo)[0]}",
+        ])
+        self.assertIn("label=dev.devbox.generation=2",commands[1])
+        self.assertIn("--all",commands[1])
+        self.assertEqual(commands[2],["docker","inspect","--format","{{.Config.User}}","a"*12])
+        self.assertEqual(commands[3], ["docker","exec","--user","0","a"*12,"rm","-f","/run/devc2/spans/.ready"])
+        self.assertEqual(commands[4],["docker","restart","b"*12])
+        self.assertEqual(commands[5][-3:], ["cmp","-s","/run/devc2-public/span-ready","/run/devc2/spans/.ready"][-3:])
+        self.assertIn("/run/devc2-public/spans.json",commands[6])
+        self.assertIn("SSH_AUTH_SOCK=/run/devc2/spans/ssh-agent.sock",commands[9])
+        self.assertEqual(commands[10][:2],["docker","cp"])
+        self.assertIn("/bin/bash",commands[11])
+        self.assertIn("--user",commands[12])
+        self.assertEqual(commands[13][-5:], ["gh","api","user","--jq",".login"])
+        self.assertIn("authenticated as yum0e",output.getvalue())
+
+    def test_service_container_requires_one_exact_container(self):
+        completed=lambda stdout: subprocess.CompletedProcess([],0,stdout,"")
+        for stdout in ("", "a"*12+"\n"+"b"*12+"\n", "not-an-id\n"):
+            with self.subTest(stdout=stdout), mock.patch.object(D,"run",return_value=completed(stdout)), self.assertRaisesRegex(RuntimeError,"expected one running"):
+                D._service_container("devc2-project","span-proxy")
+
+    def test_service_container_can_find_a_stopped_bridge(self):
+        completed=subprocess.CompletedProcess([],0,"a"*12+"\n","")
+        with mock.patch.object(D,"run",return_value=completed) as run:
+            self.assertEqual(D._service_container("devc2-project","span-proxy",include_stopped=True),"a"*12)
+        self.assertIn("--all",run.call_args.args[0])
+
+    def test_world_diagnostics_rejects_an_exited_or_missing_world(self):
+        raw='{"links":[{"name":"openai","world_status":"exited"},{"name":"diagnostics","world_status":"running"}]}'
+        with self.assertRaisesRegex(RuntimeError,"openai, ssh-agent"):
+            D._verify_world_diagnostics(raw,{"openai","ssh-agent","diagnostics"})
+        with self.assertRaisesRegex(RuntimeError,"invalid World status"):
+            D._verify_world_diagnostics("{}",{"diagnostics"})
+
+    def test_repair_waits_for_fresh_token_and_requires_every_granted_socket(self):
+        completed=lambda stdout="",returncode=0: subprocess.CompletedProcess([],returncode,stdout,"")
+        results=[
+            completed("a"*12+"\n"), completed("b"*12+"\n"), completed("devbox\n"),
+            completed(), completed(),
+            completed(returncode=1), completed(),
+            completed('[{"name":"ssh-agent","port":49152}]'), completed(returncode=1),
+        ]
+        with mock.patch.object(D,"require_docker"), \
+             mock.patch.object(D,"lifecycle_lock",return_value=contextlib.nullcontext()), \
+             mock.patch.object(D,"repair_lock",return_value=contextlib.nullcontext()), \
+             mock.patch.object(D,"run",side_effect=results) as run, \
+             self.assertRaisesRegex(RuntimeError,"did not project 'ssh-agent'"):
+            D.repair(Path("/tmp/repo"))
+        comparisons=[call.args[0] for call in run.call_args_list if "cmp" in call.args[0]]
+        self.assertEqual(len(comparisons),2)
 
 if __name__=="__main__": unittest.main()

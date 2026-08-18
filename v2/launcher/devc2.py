@@ -100,6 +100,15 @@ def repository_lock(repo):
         finally:
             for candidate in reversed(acquired): fcntl.flock(candidate,fcntl.LOCK_UN)
 
+@contextlib.contextmanager
+def repair_lock(repo):
+    locks=STATE/"repairs"; locks.mkdir(parents=True,exist_ok=True,mode=0o700)
+    with (locks/f"{identity(repo)[0]}.lock").open("a+") as lock:
+        try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError as error: raise RuntimeError("another repair is already active for this checkout") from error
+        try: yield
+        finally: fcntl.flock(lock,fcntl.LOCK_UN)
+
 def active_legacy_sessions():
     active=[]
     if not STATE.exists(): return active
@@ -144,7 +153,7 @@ def source_version(source):
     return match.group(1)
 
 def validate_asset_tree(source,strict=False):
-    required=("Dockerfile","compose.yaml","devbox/entrypoint.sh","devbox/configure-pi.sh","launcher/devc2.py","launcher/span_runtime.py","launcher/span_supervisor.py","launcher/dispatcher.py","launcher/command_projection.py","launcher/world_attachment.py","credential_proxy/span_bridge.py","credential_proxy/stream_relay.py","credential_proxy/http_projection.py","spans/http-credential-world","spans/ssh-agent/world","spans/diagnostics/world")
+    required=("Dockerfile","compose.yaml","devbox/entrypoint.sh","devbox/configure-pi.sh","devbox/configure-signing.sh","launcher/devc2.py","launcher/span_runtime.py","launcher/span_supervisor.py","launcher/dispatcher.py","launcher/command_projection.py","launcher/world_attachment.py","credential_proxy/span_bridge.py","credential_proxy/stream_relay.py","credential_proxy/http_projection.py","spans/http-credential-world","spans/ssh-agent/world","spans/diagnostics/world")
     if not source.is_dir() or source.is_symlink(): raise RuntimeError("release asset root must be a directory")
     total=0; count=0; allowed={"Dockerfile","compose.yaml","README.md","install.sh","devbox","credential_proxy","launcher","spans"}
     for path in source.rglob("*"):
@@ -259,14 +268,14 @@ def copy_release_assets(source,destination):
     for path in destination.rglob("*"):
         if path.is_dir(): path.chmod(0o755)
         elif path.is_file(): path.chmod(0o644)
-    for relative in ("launcher/devc2.py","launcher/dispatcher.py","launcher/command_projection.py","devbox/entrypoint.sh","devbox/configure-pi.sh","spans/http-credential-world","spans/ssh-agent/world","spans/diagnostics/world"):
+    for relative in ("launcher/devc2.py","launcher/dispatcher.py","launcher/command_projection.py","devbox/entrypoint.sh","devbox/configure-pi.sh","devbox/configure-signing.sh","spans/http-credential-world","spans/ssh-agent/world","spans/diagnostics/world"):
         (destination/relative).chmod(0o755)
 
 def freeze_asset_tree(destination):
     for path in destination.rglob("*"):
         if path.is_dir(): path.chmod(0o555)
         elif path.is_file(): path.chmod(0o444)
-    for relative in ("launcher/devc2.py","launcher/dispatcher.py","launcher/command_projection.py","devbox/entrypoint.sh","devbox/configure-pi.sh","spans/http-credential-world","spans/ssh-agent/world","spans/diagnostics/world"):
+    for relative in ("launcher/devc2.py","launcher/dispatcher.py","launcher/command_projection.py","devbox/entrypoint.sh","devbox/configure-pi.sh","devbox/configure-signing.sh","spans/http-credential-world","spans/ssh-agent/world","spans/diagnostics/world"):
         (destination/relative).chmod(0o555)
     destination.chmod(0o555)
 
@@ -1084,6 +1093,126 @@ def _reset_unlocked(repo,yes):
 def reset(repo,yes):
     with lifecycle_lock(False): return _reset_unlocked(repo,yes)
 
+def _service_container(project,service,workspace_hash=None,include_stopped=False):
+    filters=[
+        f"label=com.docker.compose.project={project}",
+        f"label=com.docker.compose.service={service}",
+        "label=dev.devbox.generation=2",
+    ]
+    if workspace_hash is not None:
+        filters.append(f"label=dev.devbox.workspace-hash={workspace_hash}")
+    command=["docker","ps"]
+    if include_stopped: command.append("--all")
+    command.append("--quiet")
+    for item in filters: command.extend(("--filter",item))
+    result=run(command,timeout=15)
+    containers=result.stdout.split()
+    if len(containers)!=1 or not re.fullmatch(r"[a-f0-9]{12,64}",containers[0]):
+        detail="none" if not containers else str(len(containers))
+        state="existing" if include_stopped else "running"
+        raise RuntimeError(f"expected one {state} {service} container for {project}, found {detail}")
+    return containers[0]
+
+def _verify_world_diagnostics(raw,granted):
+    try:
+        links=json.loads(raw)["links"]
+        states={item["name"]:item["world_status"] for item in links}
+    except (ValueError,TypeError,KeyError) as error:
+        raise RuntimeError("diagnostics Span returned invalid World status") from error
+    failed=sorted(name for name in granted if states.get(name)!="running")
+    if failed:
+        raise RuntimeError(f"host Worlds are not running: {', '.join(failed)}")
+
+def repair(repo):
+    with lifecycle_lock(False), repair_lock(repo):
+        require_docker()
+        digest,project=identity(repo)
+        devbox=_service_container(project,"devbox",digest)
+        # A crashed bridge is a primary repair case, so include stopped containers.
+        proxy=_service_container(project,"span-proxy",include_stopped=True)
+        user=run(["docker","inspect","--format","{{.Config.User}}",devbox],timeout=15).stdout.strip()
+        if user!="devbox":
+            raise RuntimeError(f"running devbox for {project} has unexpected runtime user")
+        run([
+            "docker","exec","--user","0",devbox,"rm","-f","/run/devc2/spans/.ready",
+        ],timeout=10)
+        run(["docker","restart",proxy],timeout=30)
+        deadline=time.monotonic()+15
+        ready=False
+        while time.monotonic()<deadline:
+            probe=run([
+                "docker","exec",devbox,"cmp","-s",
+                "/run/devc2-public/span-ready","/run/devc2/spans/.ready",
+            ],check=False,timeout=10)
+            if probe.returncode==0:
+                ready=True
+                break
+            time.sleep(0.1)
+        if not ready:
+            raise RuntimeError(f"Span bridge for {project} did not become ready after restart")
+
+        try:
+            entries=json.loads(run([
+                "docker","exec",devbox,"cat","/run/devc2-public/spans.json",
+            ],timeout=10).stdout)
+        except (ValueError,TypeError) as error:
+            raise RuntimeError("running Island has an invalid Span manifest") from error
+        if (not isinstance(entries,list) or any(
+                not isinstance(item,dict) or set(item)!={"name","port"}
+                or not isinstance(item["name"],str) or not span_runtime.valid_name(item["name"])
+                or not isinstance(item["port"],int) or not 1<=item["port"]<=65535
+                for item in entries)):
+            raise RuntimeError("running Island has an invalid Span manifest")
+        names=[item["name"] for item in entries]
+        if len(names)!=len(set(names)):
+            raise RuntimeError("running Island has an invalid Span manifest")
+        granted=set(names)
+        socket_root="/run/devc2/spans"
+        for name in names:
+            projected=run([
+                "docker","exec",devbox,"/bin/sh","-c",f"test -S {socket_root}/{name}.sock",
+            ],check=False,timeout=10)
+            if projected.returncode!=0:
+                raise RuntimeError(f"repaired Span bridge did not project {name!r}")
+        if "diagnostics" in granted:
+            status=run([
+                "docker","exec",devbox,"/run/devc2/bin/diagnostics",
+            ],timeout=15).stdout
+            _verify_world_diagnostics(status,granted)
+        ssh_socket=f"{socket_root}/ssh-agent.sock"
+        has_ssh="ssh-agent" in granted
+        if has_ssh:
+            identities=run([
+                "docker","exec","--env",f"SSH_AUTH_SOCK={ssh_socket}",devbox,
+                "ssh-add","-L",
+            ],timeout=15).stdout.splitlines()
+            if len(identities)!=1 or not identities[0].startswith("ssh-"):
+                raise RuntimeError("repaired SSH-agent Span did not expose exactly one identity")
+            remote_script=f"/tmp/devc2-repair-signing-{secrets.token_hex(16)}"
+            try:
+                run(["docker","cp",str(ROOT/"devbox"/"configure-signing.sh"),f"{devbox}:{remote_script}"],timeout=30)
+                run([
+                    "docker","exec","--env",f"SSH_AUTH_SOCK={ssh_socket}",devbox,
+                    "/bin/bash",remote_script,
+                ],capture=False,timeout=60)
+            finally:
+                run(["docker","exec","--user","0",devbox,"rm","-f",remote_script],check=False,timeout=10)
+
+        has_github="github" in granted
+        if has_github:
+            login=run([
+                "docker","exec",devbox,"gh","api","user","--jq",".login",
+            ],timeout=30).stdout.strip()
+            if not login:
+                raise RuntimeError("repaired GitHub Span returned no identity")
+
+        print(f"restarted Span bridge and verified its projections for {project}")
+        if has_ssh:
+            print(f"✓ SSH-agent Span: one identity; signing configuration refreshed")
+            print(f"note: existing shells may need: export SSH_AUTH_SOCK={ssh_socket}")
+        if has_github: print(f"✓ GitHub Span: authenticated as {login}")
+        return 0
+
 def authenticate():
     require_docker()
     AUTH.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1209,7 +1338,7 @@ def usage_parser():
     parser = argparse.ArgumentParser(
         prog="devc2",
         description="Open a hardened, credential-isolated development environment.",
-        epilog="commands: devc2 run <repo> [--span NAME] | devc2 <repo> | devc2 auth | devc2 doctor [--runtime] | devc2 update | devc2 rollback | devc2 reset <repo> [--yes]",
+        epilog="commands: devc2 run <repo> [--span NAME] | devc2 <repo> | devc2 auth | devc2 doctor [--runtime] | devc2 repair <repo> | devc2 update | devc2 rollback | devc2 reset <repo> [--yes]",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {installed_version(ROOT)}")
     return parser
@@ -1240,6 +1369,11 @@ def parse_cli(argv):
         parser.add_argument("--yes", action="store_true")
         args = parser.parse_args(argv[1:])
         return "reset", args.repo, args.yes, ()
+    if argv[0] == "repair":
+        parser = argparse.ArgumentParser(prog="devc2 repair")
+        parser.add_argument("repo")
+        args = parser.parse_args(argv[1:])
+        return "repair", args.repo, False, ()
     explicit_run=argv[0]=="run" and len(argv)>1
     parser=argparse.ArgumentParser(prog="devc2 run" if explicit_run else "devc2")
     parser.add_argument("repo")
@@ -1267,6 +1401,7 @@ def main(argv=None):
         if command == "rollback": return rollback_installation()
         repo = canonical_repo(raw_repo)
         if command == "reset": return reset(repo, yes)
+        if command == "repair": return repair(repo)
         return start(repo,span_names=spans)
     except RuntimeError as error:
         print(f"devc2: error: {error}", file=sys.stderr)

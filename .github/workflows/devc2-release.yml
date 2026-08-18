@@ -35,7 +35,7 @@ jobs:
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main
           PYTHONPATH=v2 python3 -m unittest discover -s v2/tests -v
           PYTHONPATH=v2 python3 -m unittest discover -s v2/credential_proxy/tests -v
-          bash -n v2/install.sh v2/install-release.sh v2/devbox/entrypoint.sh v2/devbox/configure-pi.sh
+          bash -n v2/install.sh v2/install-release.sh v2/devbox/entrypoint.sh v2/devbox/configure-pi.sh v2/devbox/configure-signing.sh
           bash tests/test_devc_multiplexer.sh
       - name: Build deterministic assets
         run: python3 v2/package-release.py

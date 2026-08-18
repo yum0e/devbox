@@ -19,6 +19,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_EXECUTABLES = {
     "install.sh", "devbox/entrypoint.sh", "devbox/configure-pi.sh",
+    "devbox/configure-signing.sh",
     "launcher/devc2.py", "launcher/dispatcher.py",
     "launcher/command_projection.py", "spans/http-credential-world",
     "spans/ssh-agent/world", "spans/diagnostics/world",

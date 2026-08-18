@@ -27,6 +27,7 @@ class UpdateTests(unittest.TestCase):
     def test_current_tree_satisfies_bridge_updater_asset_contract(self):
         bridge_required=(
             "Dockerfile", "compose.yaml", "devbox/entrypoint.sh", "devbox/configure-pi.sh",
+            "devbox/configure-signing.sh",
             "launcher/devc2.py", "launcher/span_runtime.py", "launcher/span_supervisor.py",
             "launcher/dispatcher.py", "launcher/command_projection.py",
             "launcher/world_attachment.py",

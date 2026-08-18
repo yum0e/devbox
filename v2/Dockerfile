@@ -106,9 +106,11 @@ RUN set -eux; \
 
 COPY devbox/entrypoint.sh /usr/local/bin/devc2-entrypoint
 COPY devbox/configure-pi.sh /usr/local/libexec/devc2/configure-pi
+COPY devbox/configure-signing.sh /usr/local/libexec/devc2/configure-signing
 COPY devbox/github-known-hosts /etc/ssh/ssh_known_hosts
 RUN chmod 0755 /usr/local/bin/devc2-entrypoint /usr/local/bin/tact \
       /usr/local/libexec/devc2/configure-pi \
+      /usr/local/libexec/devc2/configure-signing \
       /usr/local/share/pnpm/bin/pi \
  && groupadd --gid 1000 devbox \
  && useradd --uid 1000 --gid devbox --create-home --shell /bin/zsh devbox \
