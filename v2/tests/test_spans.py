@@ -202,18 +202,18 @@ class SpanCatalogTests(unittest.TestCase):
 
     def test_command_link_snapshots_one_world_and_the_generic_projection(self):
         with tempfile.TemporaryDirectory() as raw:
-            root=Path(raw); world=root/"herdr-world"
+            root=Path(raw); world=root/"tool-world"
             world.write_text("#!/bin/sh\nexit 0\n"); world.chmod(0o755)
-            catalog=self.catalog(root,{"herdr":str(world)})
+            catalog=self.catalog(root,{"tool":str(world)})
             destination=root/"snapshot"; destination.mkdir()
             item=span_runtime.load_catalog(
-                catalog,("herdr",),root/"workspace",destination/"clients",destination/"worlds",
+                catalog,("tool",),root/"workspace",destination/"clients",destination/"worlds",
                 command_projection=COMMAND_PROJECTION,
             )[0]
             self.assertEqual(item.provider.read_bytes(),world.read_bytes())
             self.assertEqual(item.client.read_bytes(),COMMAND_PROJECTION.read_bytes())
-            self.assertEqual(item.client.name,"herdr")
-            self.assertNotIn(b"herdr",COMMAND_PROJECTION.read_bytes().lower())
+            self.assertEqual(item.client.name,"tool")
+            self.assertNotIn(b"tool",COMMAND_PROJECTION.read_bytes().lower())
 
     def test_structured_world_entry_fails_closed(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -239,9 +239,9 @@ class CommandProjectionTests(unittest.TestCase):
     def test_generic_projection_preserves_argv_stdin_outputs_and_status(self):
         with tempfile.TemporaryDirectory() as raw:
             root=Path(raw); socket_dir=root/"sockets"; socket_dir.mkdir()
-            projected=root/"herdr"; projected.symlink_to(COMMAND_PROJECTION)
+            projected=root/"tool"; projected.symlink_to(COMMAND_PROJECTION)
             server=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
-            server.bind(str(socket_dir/"herdr.sock")); server.listen()
+            server.bind(str(socket_dir/"tool.sock")); server.listen()
             observed={}
 
             def serve():
@@ -270,7 +270,7 @@ class CommandProjectionTests(unittest.TestCase):
             self.assertEqual(completed.returncode,23,completed.stderr)
             self.assertEqual(completed.stdout,b"output\n")
             self.assertEqual(completed.stderr,b"warning\n")
-            self.assertEqual(observed,{"v":1,"command":"herdr","argv":["wait","worker"],"stdin_b64":"aW5wdXQ="})
+            self.assertEqual(observed,{"v":1,"command":"tool","argv":["wait","worker"],"stdin_b64":"aW5wdXQ="})
 
 
 class ProviderLifecycleTests(unittest.TestCase):
@@ -698,9 +698,9 @@ class BridgeConfigTests(unittest.TestCase):
     def test_bridge_config_knows_only_names_and_ports(self):
         with tempfile.TemporaryDirectory() as raw:
             path = Path(raw) / "spans.json"
-            path.write_text('[{"name":"herdr","port":49152}]')
-            self.assertEqual(span_bridge.load_config(path), [("herdr", 49152)])
-            path.write_text('[{"name":"herdr","port":49152,"methods":["spawn"]}]')
+            path.write_text('[{"name":"tool","port":49152}]')
+            self.assertEqual(span_bridge.load_config(path), [("tool", 49152)])
+            path.write_text('[{"name":"tool","port":49152,"methods":["spawn"]}]')
             with self.assertRaisesRegex(RuntimeError, "invalid Span bridge entry"):
                 span_bridge.load_config(path)
 
@@ -804,11 +804,11 @@ class LauncherGrantTests(unittest.TestCase):
         relay_server.mkdir()
         relay_client.mkdir()
         calls = []
-        runtime = mock.Mock(ports={"herdr": 49153})
-        client = root / "herdr-client"
+        runtime = mock.Mock(ports={"tool": 49153})
+        client = root / "tool-client"
         client.write_text("#!/bin/sh\nexit 0\n")
         client.chmod(0o755)
-        span = span_runtime.Span("herdr", client, root / "herdr-span")
+        span = span_runtime.Span("tool", client, root / "tool-span")
         completed = mock.Mock(returncode=0)
         with mock.patch.object(devc2, "require_docker"), \
              mock.patch.object(devc2, "ensure_v1_not_running"), \
@@ -841,15 +841,15 @@ class LauncherGrantTests(unittest.TestCase):
 
     def test_explicit_grant_starts_and_stops_only_that_span(self):
         with tempfile.TemporaryDirectory() as raw:
-            calls, load_catalog, start_runtime, runtime, public = self.run_launcher(Path(raw), ("herdr",))
+            calls, load_catalog, start_runtime, runtime, public = self.run_launcher(Path(raw), ("tool",))
             load_catalog.assert_called_once()
             args=load_catalog.call_args.args
-            self.assertEqual(args[:3],(devc2.SPAN_CATALOG,("herdr",),Path(raw)))
+            self.assertEqual(args[:3],(devc2.SPAN_CATALOG,("tool",),Path(raw)))
             self.assertEqual((args[3].name,args[4].name),("span-clients","span-providers"))
             self.assertEqual(args[5],devc2.ROOT/"spans")
             start_runtime.assert_called_once()
             runtime.stop.assert_called_once()
-            self.assertEqual(json.loads((public / "spans.json").read_text()), [{"name": "herdr", "port": 49153}])
+            self.assertEqual(json.loads((public / "spans.json").read_text()), [{"name": "tool", "port": 49153}])
             self.assertIn("span-proxy", " ".join(str(part) for call in calls for part in call))
             up=next(call for call in calls if "up" in call)
             self.assertIn("never",up)

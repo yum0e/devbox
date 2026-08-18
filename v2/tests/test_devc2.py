@@ -22,15 +22,15 @@ class CliTests(unittest.TestCase):
     def test_cli(self):
         self.assertEqual(D.parse_cli(["repo"]),("start","repo",False,()))
         self.assertEqual(D.parse_cli(["run"]),("start","run",False,()))
-        self.assertEqual(D.parse_cli(["run","repo","--span","herdr"]),("start","repo",False,("herdr",)))
-        self.assertEqual(D.parse_cli(["repo","--span","herdr"]),("start","repo",False,("herdr",)))
+        self.assertEqual(D.parse_cli(["run","repo","--span","example"]),("start","repo",False,("example",)))
+        self.assertEqual(D.parse_cli(["repo","--span","example"]),("start","repo",False,("example",)))
         self.assertEqual(D.parse_cli(["doctor"]),("doctor",None,False,()))
         self.assertEqual(D.parse_cli(["doctor","--runtime"]),("doctor-runtime",None,False,()))
         self.assertEqual(D.parse_cli(["auth"]),("auth",None,False,()))
         self.assertEqual(D.parse_cli(["update"]),("update",None,False,()))
         self.assertEqual(D.parse_cli(["rollback"]),("rollback",None,False,()))
         self.assertEqual(D.parse_cli(["reset","repo","--yes"]),("reset","repo",True,()))
-        with self.assertRaises(RuntimeError): D.parse_cli(["run","repo","--span","herdr","--span","herdr"])
+        with self.assertRaises(RuntimeError): D.parse_cli(["run","repo","--span","example","--span","example"])
         with self.assertRaises(RuntimeError): D.parse_cli(["run","repo",*sum((["--span",f"s{i}"] for i in range(17)),[])])
     def test_help_has_no_subprocess(self):
         with mock.patch.object(D.subprocess,"run") as run, contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as exit:
@@ -289,11 +289,16 @@ class CliTests(unittest.TestCase):
         ):
             self.assertIn(probe, entrypoint)
 
-    def test_herdr_is_not_bundled_and_shell_is_the_default_environment(self):
+    def test_herdr_is_bundled_but_never_started_by_the_entrypoint(self):
         dockerfile = (PATH.parents[1] / "Dockerfile").read_text()
         entrypoint = (PATH.parents[1] / "devbox" / "entrypoint.sh").read_text()
-        self.assertNotIn("HERDR_VERSION", dockerfile)
-        self.assertNotIn("herdr-linux-", dockerfile)
+        self.assertIn("ARG HERDR_VERSION=0.8.0", dockerfile)
+        self.assertIn('herdr_asset="herdr-linux-x86_64"', dockerfile)
+        self.assertIn('herdr_asset="herdr-linux-aarch64"', dockerfile)
+        self.assertIn("b872ea7e40fa2cb17e857ac9b62b1bf26db7b403c622f5d2f3f5b35f6e9acd28", dockerfile)
+        self.assertIn("f647ac66468d9efbc642fe534fb284468f0aea60641606fc008dfc0d82a3ca87", dockerfile)
+        self.assertIn("install -m 0755 /tmp/herdr /usr/local/bin/herdr", dockerfile)
+        self.assertNotIn("herdr", entrypoint.lower())
         self.assertNotIn("herdr-wrapper", dockerfile)
         self.assertFalse((PATH.parents[1] / "devbox" / "herdr-wrapper.py").exists())
         self.assertTrue(entrypoint.rstrip().endswith('exec /bin/zsh'))

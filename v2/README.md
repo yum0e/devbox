@@ -1,8 +1,8 @@
 # devbox v2
 
 A hardened development Island for macOS and Docker Desktop. The Island contains
-development tools, not host authority. Credentials, signing, orchestration, and
-other host capabilities arrive only through explicitly granted **Spans**.
+development tools, not host authority. Credentials, signing, and other host
+capabilities arrive only through explicitly granted **Spans**.
 It is installed as `devc2` and deliberately coexists with v1: it does not modify
 v1 files, resources, volumes, or a target repository's `.devcontainer/`.
 
@@ -17,9 +17,8 @@ while the selected worktree's complete administrative directory remains
 writable for its index, `HEAD`, logs, locks, and in-progress operations. The
 parent checkout's files are never mounted. Exotic external object stores are
 rejected rather than broadening the mount. devc2 never creates, lists, prunes,
-or removes worktrees; Herdr remains the intended lifecycle orchestrator. As with
-any writable checkout, Island code can still corrupt its own selected Git
-metadata.
+or removes worktrees; manage those from the host. As with any writable checkout,
+Island code can still corrupt its own selected Git metadata.
 The runtime is non-root, drops Linux capabilities, sets `no-new-privileges`, and
 has limits of 16 GiB memory, 8 CPUs, and 4096 PIDs. The Docker socket, host home,
 raw OAuth credentials, raw SSH-agent socket, and Span transport keys are never
@@ -51,19 +50,15 @@ devc2 rollback           # atomically return to the retained previous runtime
 devc2 run /path/to/repository
 devc2 run /path/to/repository --span openai --span github --span ssh-agent
 devc2 run /path/to/repository --span diagnostics
-devc2 run /path/to/repository --span herdr
 devc2 /path/to/repository       # retained shorthand, with no Spans
 devc2 reset /path/to/repository
 devc2 reset /path/to/repository --yes
 ```
 
 `devc2 run /path/to/repository` grants no Spans and opens a credential-free
-shell. `--span herdr` is an explicit grant: it resolves `herdr` from the
-host-owned catalog, starts its configured World scoped to that one Island, and
-projects devc2's single generic command shim under the exported name. Granting
-a Span does not automatically invoke the command. Inside the
-Island, the projected command and its private endpoint are `/run/devc2/bin/herdr` and
-`/run/devc2/spans/herdr.sock`.
+shell. Herdr is a regular executable in that shell. Run `herdr` when you want
+to orchestrate agents and other processes in the same Island; devc2 never
+starts it automatically and no Herdr host service or Span is involved.
 
 `reset` removes only that checkout's v2 Compose resources and state. It never
 removes the checkout or v1 resources.
@@ -100,9 +95,10 @@ writable Tact config, and the pinned Tact binary. It may trigger a 1Password
 approval and makes authenticated probes, including one minimal model response.
 It never mounts a real checkout and removes its project volumes during teardown.
 
-The image installs the stock Tact and Pi executables. Attachment environment is
-configured on the container itself, so ordinary shells and later Herdr workers
-receive the same transparent connection without modifying shell startup files.
+The image installs the stock Tact, Pi, and Herdr executables. Attachment
+environment is configured on the container itself, so ordinary shells and
+processes launched later from Herdr receive the same transparent connection
+without modifying shell startup files.
 
 ## Span contract
 
@@ -119,7 +115,7 @@ available in the host-owned catalog at
 ```json
 {
   "spans": {
-    "herdr": "/absolute/host/path/to/herdr-world"
+    "example": "/absolute/host/path/to/example-world"
   }
 }
 ```
@@ -151,7 +147,7 @@ and every other semantic decision belong to the World.
 
 World startup is structural, not a semantic health check: devc2 verifies that
 the configured executable starts and does not exit immediately, but it does not
-ask whether Herdr, Slack, or another World-specific upstream is ready. Links
+ask whether a World-specific upstream service is ready. Links
 surface those failures normally and Worlds may retry or recover without a new
 Island launch.
 
@@ -165,13 +161,6 @@ clock gap so a resumed agent opens a fresh connection instead of reusing a
 half-open tunnel; TCP keepalive provides an additional failure detector.
 Different Islands receive different World processes,
 instance IDs, endpoints, and transport credentials.
-
-`examples/herdr-span/` is the first production-oriented command-Link experiment. When devc2 is
-launched from a host Herdr pane, it can create host-visible panes whose fixed
-worker shim executes argv only inside that same Island. Its World owns the five
-command semantics while devc2 projects the same generic executable it would use
-for any command affordance. Its security boundary, manual proof, and
-intentionally omitted features are documented in the example README.
 
 Other command Worlds should install one immutable executable outside the
 workspace and register its absolute path in `spans.json`. There is no automatic
@@ -276,7 +265,8 @@ The opt-in test uses unique temporary image tags and removes only those tags.
 - ChatGPT subscription and GitHub account for their respective optional Spans
 - An SSH agent, such as 1Password, for the optional SSH-agent Span
 
-Tact remains the only bundled coding agent. Herdr is intentionally not bundled.
+Tact and Pi are bundled coding agents. Herdr v0.8.0 is bundled as their
+in-Island orchestrator.
 
 The devbox includes the v1 general developer toolset: build tools, Git and
 GitHub CLI, Jujutsu, zsh, ripgrep, fd, zoxide, PostgreSQL 17 server and
@@ -284,10 +274,11 @@ client programs, uv-managed Python 3.14, Foundry, and the standard
 network/process utilities.
 The latest standalone pnpm installs and manages the latest Node runtime through
 `pnpm runtime`; Corepack, fnm, and nvm are not used. Legacy v1 coding agents are
-not installed because v2 remains Tact-only.
+not installed.
 
-No terminal multiplexer is bundled; tmux remains intentionally absent. Herdr
-must arrive through an explicitly granted Span.
+Herdr is available on `PATH` but remains dormant until someone runs it. It then
+owns only panes and processes in that same Island. tmux remains intentionally
+absent.
 
-Pi, Prime Agent, Claude, Git LFS, and cross-repository private submodules are
+Prime Agent, Claude, Git LFS, and cross-repository private submodules are
 outside the initial scope.

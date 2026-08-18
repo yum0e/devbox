@@ -52,6 +52,29 @@ RUN pnpm add --global --ignore-scripts --no-optional \
       @earendil-works/pi-coding-agent@0.84.2 \
  && pnpm store prune
 
+# Herdr is an ordinary Island tool. Nothing starts it until a user invokes it.
+ARG TARGETARCH
+ARG HERDR_VERSION=0.8.0
+RUN set -eux; \
+    case "$TARGETARCH" in \
+      amd64) \
+        herdr_asset="herdr-linux-x86_64"; \
+        herdr_sha256="b872ea7e40fa2cb17e857ac9b62b1bf26db7b403c622f5d2f3f5b35f6e9acd28" \
+        ;; \
+      arm64) \
+        herdr_asset="herdr-linux-aarch64"; \
+        herdr_sha256="f647ac66468d9efbc642fe534fb284468f0aea60641606fc008dfc0d82a3ca87" \
+        ;; \
+      *) echo "unsupported architecture: $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    herdr_tag="v${HERDR_VERSION#v}"; \
+    curl -fsSL -o /tmp/herdr \
+      "https://github.com/herdrdev/herdr/releases/download/${herdr_tag}/${herdr_asset}"; \
+    echo "${herdr_sha256}  /tmp/herdr" | sha256sum -c -; \
+    install -m 0755 /tmp/herdr /usr/local/bin/herdr; \
+    rm -f /tmp/herdr; \
+    herdr --version
+
 # Match v1's managed Python and Ethereum development toolchain without placing
 # either installation in the persistent devbox home volume.
 RUN uv python install 3.14 \
@@ -67,7 +90,6 @@ RUN uv python install 3.14 \
  && anvil --version \
  && chisel --version
 
-ARG TARGETARCH
 RUN set -eux; \
     case "$TARGETARCH" in \
       amd64) jj_target=x86_64; jj_sha=0b2d7ca5f77ec6b109fc5b6f9328c8d764825d3976f874c99236481f5461a8a3 ;; \

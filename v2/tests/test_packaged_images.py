@@ -128,7 +128,8 @@ class PackagedImageTests(unittest.TestCase):
                 subprocess.run([docker, "run", "--rm", "--name", containers["runtime"],
                                 "--pull=never", "--entrypoint", "/bin/sh",
                                 tags["runtime"], "-ec",
-                                "command -v tact; command -v pi; command -v gh; test -x /usr/local/bin/devc2-entrypoint"],
+                                "command -v tact; command -v pi; command -v herdr; command -v gh; "
+                                "herdr --version; test -x /usr/local/bin/devc2-entrypoint"],
                                check=True, timeout=60)
                 subprocess.run([docker, "run", "--rm", "--name", containers["auth"],
                                 "--pull=never", "--entrypoint", "codex",
