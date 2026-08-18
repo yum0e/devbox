@@ -224,7 +224,9 @@ class CliTests(unittest.TestCase):
             agent_dir = Path(td) / ".pi" / "agent"
             agent_dir.mkdir(parents=True)
             models = agent_dir / "models.json"
+            settings = agent_dir / "settings.json"
             models.write_text(json.dumps({"providers": {"local": {"apiKey": "local-key"}}}))
+            settings.write_text(json.dumps({"theme": "dark"}))
             environment = {**os.environ, "PI_CODING_AGENT_DIR": str(agent_dir)}
             subprocess.run([str(configure)], env=environment, check=True)
             self.assertEqual(json.loads(models.read_text()), {
@@ -233,7 +235,18 @@ class CliTests(unittest.TestCase):
                     "openai-codex": {"apiKey": "$DEVC2_PI_OPENAI_TOKEN"},
                 },
             })
+            self.assertEqual(json.loads(settings.read_text()), {
+                "theme": "dark",
+                "npmCommand": ["pnpm"],
+            })
             self.assertEqual(stat.S_IMODE(models.stat().st_mode), 0o644)
+            self.assertEqual(stat.S_IMODE(settings.stat().st_mode), 0o644)
+
+            settings.write_text(json.dumps({"npmCommand": ["custom-npm"]}))
+            subprocess.run([str(configure)], env=environment, check=True)
+            self.assertEqual(json.loads(settings.read_text()), {
+                "npmCommand": ["custom-npm"],
+            })
             self.assertFalse((agent_dir / "auth.json").exists())
 
     def test_external_build_images_are_content_pinned(self):

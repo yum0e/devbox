@@ -284,8 +284,10 @@ GitHub CLI, Jujutsu, zsh, ripgrep, fd, zoxide, PostgreSQL 17 server and
 client programs, uv-managed Python 3.14, Foundry, and the standard
 network/process utilities.
 The latest standalone pnpm installs and manages the latest Node runtime through
-`pnpm runtime`; Corepack, fnm, and nvm are not used. Legacy v1 coding agents are
-not installed.
+`pnpm runtime`; Corepack, fnm, and nvm are not used. Pi defaults its
+`npmCommand` setting to pnpm so git and npm package dependencies can be
+installed without npm; an existing user-selected command is preserved. Legacy
+v1 coding agents are not installed.
 
 Herdr is available on `PATH` but remains dormant until someone runs it. It then
 owns only panes and processes in that same Island. tmux remains intentionally
