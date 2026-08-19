@@ -19,6 +19,20 @@ if [[ ! -r "$shared_tact_config" ]]; then
 fi
 rm -f -- "$TACT_CONFIG"
 install -m 0600 "$shared_tact_config" "$TACT_CONFIG"
+skills_config="$(mktemp /tmp/devc2-tact-skills.XXXXXX)"
+if ! tact config show | awk '
+  $0 == "[skills]" { in_skills=1; print; next }
+  in_skills && /^enabled = / { print "enabled = true"; configured=1; next }
+  in_skills && /^\[/ { in_skills=0 }
+  { print }
+  END { if (!configured) exit 1 }
+' >"$skills_config"; then
+  rm -f -- "$skills_config"
+  echo "devc2: could not enable Tact skill discovery" >&2
+  exit 1
+fi
+install -m 0600 "$skills_config" "$TACT_CONFIG"
+rm -f -- "$skills_config"
 
 if ! user_name="$(id -un 2>/dev/null)"; then
   readonly nss_directory="$(mktemp -d /tmp/devc2-nss.XXXXXX)"

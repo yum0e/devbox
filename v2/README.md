@@ -261,6 +261,30 @@ values in them because every devbox can read them.
 Tact sessions, checkpoints, transcripts, and `memory/v1.sqlite3` remain
 per-checkout even when `[memory] enabled = true` is set in the shared file.
 
+## Host skills
+
+Put portable Agent Skills in `~/.config/agent-skills/<name>/SKILL.md` (or the
+equivalent `XDG_CONFIG_HOME` path). On each launch, devc2 validates and snapshots
+that directory, then mounts the snapshot read-only at `~/.agents/skills` inside
+the Island. Pi discovers that standard path directly; devc2 enables Tact's
+native skill discovery in its per-launch configuration snapshot. Both harnesses
+therefore see the same immutable skills without wrappers or access to the rest
+of the host configuration.
+
+```text
+~/.config/agent-skills/
+└── release-review/
+    ├── SKILL.md
+    ├── references/
+    └── scripts/
+```
+
+The source may itself be a symlink into a dotfiles checkout, but its contents
+must contain only user-owned, non-writable-by-others directories and regular
+files. Nested symlinks, hard links, special files, oversized trees, invalid
+skill names, and skill directories without `SKILL.md` are rejected. Never put
+credentials in a skill; use a separately granted Span for authority.
+
 ## Requirements
 
 The normal test suite builds and validates the real release archive. On a host

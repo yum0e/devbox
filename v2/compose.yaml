@@ -29,6 +29,12 @@ services:
         source: ${DEVC2_PUBLIC_DIR:?set DEVC2_PUBLIC_DIR}
         target: /run/devc2-public
         read_only: true
+      - type: bind
+        source: ${DEVC2_PUBLIC_DIR:?set DEVC2_PUBLIC_DIR}/agent-skills
+        target: /home/devbox/.agents/skills
+        read_only: true
+        bind:
+          create_host_path: false
       - type: volume
         source: state-v2
         target: /home/devbox

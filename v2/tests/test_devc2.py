@@ -50,7 +50,7 @@ class CliTests(unittest.TestCase):
             subprocess.run(["git","-C",str(main),"config","user.email","test@example.invalid"],check=True)
             (main/"tracked").write_text("one\n")
             subprocess.run(["git","-C",str(main),"add","tracked"],check=True)
-            subprocess.run(["git","-C",str(main),"commit","-m","initial"],check=True,capture_output=True)
+            subprocess.run(["git","-C",str(main),"-c","commit.gpgsign=false","commit","-m","initial"],check=True,capture_output=True)
             subprocess.run(["git","-C",str(main),"worktree","add","-b","linked",str(checkout)],check=True,capture_output=True)
 
             projection=D.linked_worktree(checkout)
@@ -84,7 +84,7 @@ class CliTests(unittest.TestCase):
             subprocess.run(["git","init",str(main)],check=True,capture_output=True)
             subprocess.run(["git","-C",str(main),"config","user.name","Test"],check=True)
             subprocess.run(["git","-C",str(main),"config","user.email","test@example.invalid"],check=True)
-            subprocess.run(["git","-C",str(main),"commit","--allow-empty","-m","initial"],check=True,capture_output=True)
+            subprocess.run(["git","-C",str(main),"-c","commit.gpgsign=false","commit","--allow-empty","-m","initial"],check=True,capture_output=True)
             subprocess.run(["git","-C",str(main),"worktree","add","-b","linked",str(checkout)],check=True,capture_output=True)
             gitdir=Path((checkout/".git").read_text().strip().removeprefix("gitdir: "))
             (gitdir/"gitdir").write_text(str(root/"other"/".git")+"\n")
@@ -99,7 +99,7 @@ class CliTests(unittest.TestCase):
             subprocess.run(["git","init",str(main)],check=True,capture_output=True)
             subprocess.run(["git","-C",str(main),"config","user.name","Test"],check=True)
             subprocess.run(["git","-C",str(main),"config","user.email","test@example.invalid"],check=True)
-            subprocess.run(["git","-C",str(main),"commit","--allow-empty","-m","initial"],check=True,capture_output=True)
+            subprocess.run(["git","-C",str(main),"-c","commit.gpgsign=false","commit","--allow-empty","-m","initial"],check=True,capture_output=True)
             subprocess.run(["git","-C",str(main),"worktree","add","-b","linked",str(checkout)],check=True,capture_output=True)
             gitdir=main/".git"/"worktrees"/"linked"
             (checkout/".git").write_text("gitdir: ../main/.git/worktrees/linked\n")
@@ -119,7 +119,7 @@ class CliTests(unittest.TestCase):
             subprocess.run(["git","init",str(main)],check=True,capture_output=True)
             subprocess.run(["git","-C",str(main),"config","user.name","Test"],check=True)
             subprocess.run(["git","-C",str(main),"config","user.email","test@example.invalid"],check=True)
-            subprocess.run(["git","-C",str(main),"commit","--allow-empty","-m","initial"],check=True,capture_output=True)
+            subprocess.run(["git","-C",str(main),"-c","commit.gpgsign=false","commit","--allow-empty","-m","initial"],check=True,capture_output=True)
             subprocess.run(["git","-C",str(main),"worktree","add","-b","linked",str(checkout)],check=True,capture_output=True)
             external.mkdir(); alternates=main/".git"/"objects"/"info"/"alternates"
             alternates.write_text(str(external)+"\n")
@@ -152,8 +152,72 @@ class CliTests(unittest.TestCase):
         self.assertIn("target: /run/devc2-public", raw)
         self.assertIn("shared_tact_config=/run/devc2-public/tact-config.toml", entrypoint)
         self.assertIn('install -m 0600 "$shared_tact_config" "$TACT_CONFIG"', entrypoint)
+        self.assertIn("tact config show | awk",entrypoint)
+        self.assertIn('print "enabled = true"',entrypoint)
         self.assertIn("source: state-v2", raw)
         self.assertIn("target: /home/devbox", raw)
+
+    def test_tact_skill_enablement_preserves_the_canonical_effective_config(self):
+        entrypoint=(PATH.parents[1]/"devbox"/"entrypoint.sh").read_text()
+        program=re.search(r"tact config show \| awk '\n(.*?)\n' >",entrypoint,re.DOTALL).group(1)
+        original=(
+            '[agent]\nmax_subagents = 7\n\n[skills]\nenabled = false\n'
+            'roots = [\n    "/custom",\n]\n\n[memory]\nenabled = true\n'
+        )
+        transformed=subprocess.run(["awk",program],input=original,text=True,capture_output=True,check=True).stdout
+        self.assertEqual(transformed,original.replace("enabled = false","enabled = true",1))
+
+    def test_host_agent_skills_are_immutable_shared_harness_snapshots(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); source=root/"dotfiles"/"agent-skills"; source.mkdir(parents=True)
+            skill=source/"release-review"; skill.mkdir()
+            (skill/"SKILL.md").write_text("---\nname: release-review\ndescription: Review releases.\n---\n")
+            scripts=skill/"scripts"; scripts.mkdir()
+            script=scripts/"check.sh"; script.write_text("#!/bin/sh\nexit 0\n"); script.chmod(0o755)
+            link=root/"config-skills"; link.symlink_to(source,target_is_directory=True)
+            destination=root/"snapshot"
+            self.assertEqual(D.snapshot_agent_skills(link,destination),["release-review"])
+            self.assertEqual((destination/"release-review"/"SKILL.md").read_text(),(skill/"SKILL.md").read_text())
+            self.assertEqual(stat.S_IMODE((destination/"release-review").stat().st_mode),0o555)
+            self.assertEqual(stat.S_IMODE((destination/"release-review"/"SKILL.md").stat().st_mode),0o444)
+            self.assertEqual(stat.S_IMODE((destination/"release-review"/"scripts"/"check.sh").stat().st_mode),0o555)
+            (skill/"SKILL.md").write_text("changed\n")
+            self.assertNotEqual((destination/"release-review"/"SKILL.md").read_text(),"changed\n")
+
+    def test_agent_skill_snapshot_is_empty_when_unconfigured_and_rejects_unsafe_trees(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); destination=root/"empty"
+            self.assertEqual(D.snapshot_agent_skills(root/"missing",destination),[])
+            self.assertEqual(list(destination.iterdir()),[])
+            self.assertEqual(stat.S_IMODE(destination.stat().st_mode),0o555)
+        cases=("symlink","hardlink","world-writable","missing-manifest","invalid-name","too-deep","oversized")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as td:
+                root=Path(td); source=root/"skills"; source.mkdir(); skill=source/"safe-skill"; skill.mkdir()
+                manifest=skill/"SKILL.md"; manifest.write_text("---\nname: safe-skill\ndescription: Safe.\n---\n")
+                if case=="symlink": (skill/"escape").symlink_to(root)
+                elif case=="hardlink": os.link(manifest,skill/"copy.md")
+                elif case=="world-writable": manifest.chmod(0o666)
+                elif case=="missing-manifest": manifest.unlink()
+                elif case=="invalid-name": skill.rename(source/"INVALID")
+                elif case=="too-deep":
+                    nested=skill
+                    for index in range(9): nested=nested/f"d{index}"; nested.mkdir()
+                elif case=="oversized":
+                    with manifest.open("wb") as output: output.truncate(D.MAX_SKILL_FILE_BYTES+1)
+                with self.assertRaisesRegex(RuntimeError,"agent skill"):
+                    D.snapshot_agent_skills(source,root/"snapshot")
+
+    def test_compose_mounts_only_the_agent_skill_snapshot_at_the_standard_path(self):
+        raw=(PATH.parents[1]/"compose.yaml").read_text()
+        mount=(
+            "source: ${DEVC2_PUBLIC_DIR:?set DEVC2_PUBLIC_DIR}/agent-skills\n"
+            "        target: /home/devbox/.agents/skills\n"
+            "        read_only: true\n"
+            "        bind:\n"
+            "          create_host_path: false"
+        )
+        self.assertIn(mount,raw)
 
     def test_http_ca_umask_is_scoped_to_attachment_creation(self):
         entrypoint = (PATH.parents[1] / "devbox" / "entrypoint.sh").read_text()

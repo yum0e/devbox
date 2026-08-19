@@ -30,6 +30,7 @@ IMAGE_TAG_SUFFIX=f"{VERSION}-{ASSET_DIGEST[:12]}"
 
 def xdg(name, default): return Path(os.environ.get(name, Path.home()/default)).expanduser()
 CONFIG=xdg("XDG_CONFIG_HOME", ".config")/"devc2"
+AGENT_SKILLS=xdg("XDG_CONFIG_HOME", ".config")/"agent-skills"
 STATE=xdg("XDG_STATE_HOME", ".local/state")/"devc2"
 AUTH=CONFIG/"auth"
 TACT_CONFIG=CONFIG/"tact"/"config.toml"
@@ -45,6 +46,9 @@ RELEASE_API="https://api.github.com/repos/yum0e/devbox/releases/latest"
 RELEASE_ASSET="devc2.tar.gz"
 MAX_RELEASE_BYTES=32*1024*1024
 MAX_RELEASE_TAR_BYTES=40*1024*1024
+MAX_SKILL_FILES=512
+MAX_SKILL_BYTES=16*1024*1024
+MAX_SKILL_FILE_BYTES=4*1024*1024
 
 def run(argv, *, env=None, capture=True, check=True, timeout=120):
     try:
@@ -709,6 +713,94 @@ def ensure_tact_config():
         raise RuntimeError(f"shared Tact config must be a regular file: {TACT_CONFIG}")
     return TACT_CONFIG
 
+def _skill_manifest(root):
+    root_metadata=root.stat()
+    if (not stat.S_ISDIR(root_metadata.st_mode) or root_metadata.st_uid!=os.getuid()
+            or root_metadata.st_mode&0o022):
+        raise RuntimeError(f"agent skills root must be user-owned and not group/world-writable: {root}")
+    skill_name=re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
+    skills=[]; root_entries=0
+    with os.scandir(root) as candidates:
+        for candidate in candidates:
+            root_entries+=1
+            if root_entries>128: raise RuntimeError("agent skills root contains more than 128 entries")
+            if candidate.name.startswith("."): continue
+            if candidate.is_file(follow_symlinks=False): continue
+            if not candidate.is_dir(follow_symlinks=False):
+                raise RuntimeError(f"agent skills root contains an unsafe path: {candidate.name}")
+            if len(candidate.name)>64 or not skill_name.fullmatch(candidate.name):
+                raise RuntimeError(f"invalid agent skill directory name: {candidate.name!r}")
+            skills.append(Path(candidate.path))
+    if len(skills)>64: raise RuntimeError("agent skills root contains more than 64 skills")
+    entries=[]; total=0
+    def inspect(path,depth):
+        nonlocal total
+        relative=path.relative_to(root)
+        metadata=path.lstat()
+        if (metadata.st_uid!=os.getuid() or metadata.st_mode&0o022
+                or not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode))):
+            raise RuntimeError(f"agent skill contains an unsafe path: {relative}")
+        digest=None
+        if stat.S_ISREG(metadata.st_mode):
+            if metadata.st_nlink!=1: raise RuntimeError(f"agent skill contains a hard-linked file: {relative}")
+            if metadata.st_size>MAX_SKILL_FILE_BYTES:
+                raise RuntimeError(f"agent skill file exceeds 4 MiB: {relative}")
+            with path.open("rb") as source: payload=source.read(MAX_SKILL_FILE_BYTES+1)
+            if len(payload)>MAX_SKILL_FILE_BYTES:
+                raise RuntimeError(f"agent skill file exceeds 4 MiB: {relative}")
+            if len(payload)!=metadata.st_size:
+                raise RuntimeError(f"agent skill changed while being inspected: {relative}")
+            total+=len(payload)
+            if total>MAX_SKILL_BYTES: raise RuntimeError("agent skills exceed the 16 MiB size limit")
+            digest=hashlib.sha256(payload).hexdigest()
+        entries.append((relative,stat.S_ISDIR(metadata.st_mode),bool(metadata.st_mode&0o111),metadata.st_size,digest))
+        if len(entries)>MAX_SKILL_FILES: raise RuntimeError("agent skills contain more than 512 paths")
+        if stat.S_ISDIR(metadata.st_mode):
+            with os.scandir(path) as children:
+                for child in children:
+                    if depth>=8: raise RuntimeError(f"agent skill path is too deep: {relative/child.name}")
+                    inspect(Path(child.path),depth+1)
+    for skill in sorted(skills,key=lambda item:item.name):
+        first=len(entries); inspect(skill,0)
+        manifest=skill.relative_to(root)/"SKILL.md"
+        if not any(relative==manifest and not is_directory for relative,is_directory,*_rest in entries[first:]):
+            raise RuntimeError(f"agent skill lacks SKILL.md: {skill.name}")
+    entries.sort(key=lambda item:str(item[0]))
+    return entries
+
+def snapshot_agent_skills(source,destination):
+    destination.mkdir(mode=0o700)
+    if not source.exists() and not source.is_symlink():
+        destination.chmod(0o555)
+        return []
+    try: root=source.resolve(strict=True)
+    except OSError as error: raise RuntimeError(f"agent skills root is unavailable: {source}") from error
+    before=_skill_manifest(root)
+    for relative,is_directory,executable,size,digest in before:
+        target=destination/relative
+        if is_directory:
+            target.mkdir(mode=0o700)
+            continue
+        target.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+        flags=os.O_RDONLY|getattr(os,"O_CLOEXEC",0)|getattr(os,"O_NOFOLLOW",0)
+        descriptor=os.open(root/relative,flags)
+        try:
+            metadata=os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size!=size:
+                raise RuntimeError(f"agent skill changed while being copied: {relative}")
+            with os.fdopen(descriptor,"rb") as input_file:
+                descriptor=None; payload=input_file.read(MAX_SKILL_FILE_BYTES+1)
+            if len(payload)!=size or hashlib.sha256(payload).hexdigest()!=digest:
+                raise RuntimeError(f"agent skill changed while being copied: {relative}")
+            target.write_bytes(payload)
+            target.chmod(0o555 if executable else 0o444)
+        finally:
+            if descriptor is not None: os.close(descriptor)
+    if _skill_manifest(root)!=before: raise RuntimeError("agent skills changed while the snapshot was created")
+    for path in sorted((item for item in destination.rglob("*") if item.is_dir()),reverse=True): path.chmod(0o555)
+    destination.chmod(0o555)
+    return sorted({relative.parts[0] for relative,*_rest in before})
+
 def private_write(path, data):
     fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
     try: os.write(fd,data if isinstance(data,bytes) else data.encode())
@@ -949,8 +1041,9 @@ def worktree_compose_override(temp,worktree):
 
 def prepare(temp):
     public=temp/'public'; public.mkdir(0o700)
-    shutil.copyfile(TACT_CONFIG, public / 'tact-config.toml')
+    shutil.copyfile(TACT_CONFIG,public/'tact-config.toml')
     (public / 'tact-config.toml').chmod(0o644)
+    snapshot_agent_skills(AGENT_SKILLS,public/'agent-skills')
     (public / 'world.env').write_text('',encoding='utf-8')
     (public / 'world.env').chmod(0o600)
     return public
