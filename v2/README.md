@@ -46,6 +46,7 @@ devc2 auth               # one-time OpenAI + GitHub login and SSH key selection
 devc2 doctor             # fast host prerequisites
 devc2 doctor --runtime   # disposable live Docker/credential/signing checks
 devc2 repair /path/to/repository # reconnect one running Island's Spans
+devc2 skills refresh /path/to/repository # refresh host skills in a running Island
 devc2 update             # atomically update from the install source
 devc2 rollback           # atomically return to the retained previous runtime
 devc2 run /path/to/repository
@@ -266,12 +267,20 @@ per-checkout even when `[memory] enabled = true` is set in the shared file.
 ## Host skills
 
 Put portable Agent Skills in `~/.config/agent-skills/<name>/SKILL.md` (or the
-equivalent `XDG_CONFIG_HOME` path). On each launch, devc2 validates and snapshots
-that directory, then mounts the snapshot read-only at `~/.agents/skills` inside
-the Island. Pi discovers that standard path directly; devc2 enables Tact's
-native skill discovery in its per-launch configuration snapshot. Both harnesses
-therefore see the same immutable skills without wrappers or access to the rest
-of the host configuration.
+equivalent `XDG_CONFIG_HOME` path). On each launch, devc2 validates that directory
+and creates an immutable generation inside a read-only projection. The standard
+`~/.agents/skills` path selects its current generation. Pi discovers that path
+directly; devc2 enables Tact's native skill discovery in its per-launch
+configuration snapshot. Both harnesses therefore see the same skills without
+wrappers or access to the rest of the host configuration.
+
+After editing the host directory, run
+`devc2 skills refresh /path/to/repository` on the host to validate a replacement
+snapshot and switch the running Island to it atomically. The command does not
+restart the Island or any agent; reload or restart Tact, Pi, or Herdr when you
+want it to discover the refreshed skills. Older generations remain available
+for agents that already resolved them and are removed with the launch's
+temporary state when the Island exits.
 
 ```text
 ~/.config/agent-skills/

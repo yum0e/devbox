@@ -30,8 +30,8 @@ services:
         target: /run/devc2-public
         read_only: true
       - type: bind
-        source: ${DEVC2_PUBLIC_DIR:?set DEVC2_PUBLIC_DIR}/agent-skills
-        target: /home/devbox/.agents/skills
+        source: ${DEVC2_PUBLIC_DIR:?set DEVC2_PUBLIC_DIR}/agent-home
+        target: /home/devbox/.agents
         read_only: true
         bind:
           create_host_path: false

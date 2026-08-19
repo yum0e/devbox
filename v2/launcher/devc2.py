@@ -113,6 +113,15 @@ def repair_lock(repo):
         try: yield
         finally: fcntl.flock(lock,fcntl.LOCK_UN)
 
+@contextlib.contextmanager
+def skills_refresh_lock(repo):
+    locks=STATE/"skill-refresh"; locks.mkdir(parents=True,exist_ok=True,mode=0o700)
+    with (locks/f"{identity(repo)[0]}.lock").open("a+") as lock:
+        try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError as error: raise RuntimeError("another skill refresh is already active for this checkout") from error
+        try: yield
+        finally: fcntl.flock(lock,fcntl.LOCK_UN)
+
 def active_legacy_sessions():
     active=[]
     if not STATE.exists(): return active
@@ -801,6 +810,109 @@ def snapshot_agent_skills(source,destination):
     destination.chmod(0o555)
     return sorted({relative.parts[0] for relative,*_rest in before})
 
+def update_skill_projection(source,projection):
+    projection.mkdir(mode=0o700,exist_ok=True)
+    metadata=projection.lstat()
+    if (not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid!=os.getuid() or metadata.st_mode&0o022):
+        raise RuntimeError("agent skill projection is unsafe")
+    snapshots=projection/"snapshots"; snapshots.mkdir(mode=0o700,exist_ok=True)
+    metadata=snapshots.lstat()
+    if (not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid!=os.getuid() or metadata.st_mode&0o022):
+        raise RuntimeError("agent skill projection is unsafe")
+    name=f"snapshot-{secrets.token_hex(16)}"
+    snapshot=snapshots/name
+    temporary=projection/f".current-{secrets.token_hex(16)}"
+    current=projection/"current"
+    if current.exists() or current.is_symlink():
+        if not current.is_symlink(): raise RuntimeError("agent skill projection is unsafe")
+        target=Path(os.readlink(current))
+        if (target.is_absolute() or len(target.parts)!=2 or target.parts[0]!="snapshots"
+                or not re.fullmatch(r"snapshot-[a-f0-9]{32}",target.parts[1])):
+            raise RuntimeError("agent skill projection is unsafe")
+        try: resolved=current.resolve(strict=True)
+        except OSError as error: raise RuntimeError("agent skill projection is unsafe") from error
+        if resolved.parent!=snapshots: raise RuntimeError("agent skill projection is unsafe")
+    try:
+        skills=snapshot_agent_skills(source,snapshot)
+        temporary.symlink_to(Path("snapshots")/name)
+        os.replace(temporary,current)
+        directory=os.open(projection,os.O_RDONLY)
+        try: os.fsync(directory)
+        finally: os.close(directory)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        if snapshot.exists():
+            try: _remove_skill_snapshot(snapshot)
+            except (OSError,RuntimeError): pass
+        raise
+    return skills
+
+def _remove_skill_snapshot(path):
+    metadata=path.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise RuntimeError("agent skill projection contains an unsafe snapshot")
+    for directory,_children,_files in os.walk(path,topdown=False,followlinks=False):
+        current=Path(directory)
+        if any(item.is_symlink() for item in current.iterdir()):
+            raise RuntimeError("agent skill projection contains an unsafe snapshot")
+        current.chmod(0o700)
+    shutil.rmtree(path)
+
+def _running_skill_projection(devbox):
+    try:
+        mounts=json.loads(run([
+            "docker","inspect","--format","{{json .Mounts}}",devbox,
+        ],timeout=15).stdout)
+    except (ValueError,TypeError) as error:
+        raise RuntimeError("running devbox has invalid mount metadata") from error
+    if not isinstance(mounts,list):
+        raise RuntimeError("running devbox has invalid mount metadata")
+    by_target={}
+    for mount in mounts:
+        if not isinstance(mount,dict) or not isinstance(mount.get("Destination"),str): continue
+        by_target.setdefault(mount["Destination"],[]).append(mount)
+    def read_only_bind(target):
+        matches=by_target.get(target,[])
+        if (len(matches)!=1 or matches[0].get("Type")!="bind" or matches[0].get("RW") is not False
+                or not isinstance(matches[0].get("Source"),str)):
+            raise RuntimeError(f"running devbox lacks its expected read-only mount: {target}")
+        try: return Path(matches[0]["Source"]).resolve(strict=True)
+        except OSError as error: raise RuntimeError(f"running devbox mount is unavailable: {target}") from error
+    public=read_only_bind("/run/devc2-public")
+    projection=public/"agent-skills"
+    agent_home=read_only_bind("/home/devbox/.agents")
+    if agent_home!=public/"agent-home":
+        raise RuntimeError("running devbox has an invalid agent skills view")
+    for path in (public,agent_home,projection,projection/"snapshots"):
+        try: metadata=path.lstat()
+        except OSError as error: raise RuntimeError("running devbox has an unsafe agent skills projection") from error
+        if (not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid!=os.getuid() or metadata.st_mode&0o022):
+            raise RuntimeError("running devbox has an unsafe agent skills projection")
+    skills_view=agent_home/"skills"
+    if (not skills_view.is_symlink()
+            or os.readlink(skills_view)!="/run/devc2-public/agent-skills/current"):
+        raise RuntimeError("running devbox has an invalid agent skills view")
+    current=projection/"current"
+    if not current.is_symlink(): raise RuntimeError("running devbox has an invalid agent skills projection")
+    target=Path(os.readlink(current))
+    if (target.is_absolute() or len(target.parts)!=2 or target.parts[0]!="snapshots"
+            or not re.fullmatch(r"snapshot-[a-f0-9]{32}",target.parts[1])):
+        raise RuntimeError("running devbox has an invalid agent skills projection")
+    try: resolved=current.resolve(strict=True)
+    except OSError as error: raise RuntimeError("running devbox has an invalid agent skills projection") from error
+    if resolved.parent!=projection/"snapshots":
+        raise RuntimeError("running devbox has an invalid agent skills projection")
+    for snapshot in (projection/"snapshots").iterdir():
+        metadata=snapshot.lstat()
+        if (not re.fullmatch(r"snapshot-[a-f0-9]{32}",snapshot.name)
+                or not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid!=os.getuid() or metadata.st_mode&0o022):
+            raise RuntimeError("running devbox has an unsafe agent skills projection")
+    return projection
+
 def private_write(path, data):
     fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
     try: os.write(fd,data if isinstance(data,bytes) else data.encode())
@@ -1043,7 +1155,10 @@ def prepare(temp):
     public=temp/'public'; public.mkdir(0o700)
     shutil.copyfile(TACT_CONFIG,public/'tact-config.toml')
     (public / 'tact-config.toml').chmod(0o644)
-    snapshot_agent_skills(AGENT_SKILLS,public/'agent-skills')
+    update_skill_projection(AGENT_SKILLS,public/'agent-skills')
+    agent_home=public/'agent-home'; agent_home.mkdir(0o700)
+    (agent_home/'skills').symlink_to('/run/devc2-public/agent-skills/current')
+    agent_home.chmod(0o555)
     (public / 'world.env').write_text('',encoding='utf-8')
     (public / 'world.env').chmod(0o600)
     return public
@@ -1306,6 +1421,24 @@ def repair(repo):
         if has_github: print(f"✓ GitHub Span: authenticated as {login}")
         return 0
 
+def refresh_skills(repo):
+    with lifecycle_lock(False), skills_refresh_lock(repo):
+        require_docker()
+        digest,project=identity(repo)
+        devbox=_service_container(project,"devbox",digest)
+        user=run(["docker","inspect","--format","{{.Config.User}}",devbox],timeout=15).stdout.strip()
+        if user!="devbox":
+            raise RuntimeError(f"running devbox for {project} has unexpected runtime user")
+        projection=_running_skill_projection(devbox)
+        skills=update_skill_projection(AGENT_SKILLS,projection)
+        if (_service_container(project,"devbox",digest)!=devbox
+                or _running_skill_projection(devbox)!=projection):
+            raise RuntimeError(f"running devbox for {project} changed during skill refresh")
+        names=", ".join(skills) if skills else "none"
+        print(f"refreshed {len(skills)} host skill(s) for {project}: {names}")
+        print("restart or reload agents in the Island when ready")
+        return 0
+
 def authenticate():
     require_docker()
     AUTH.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1431,7 +1564,7 @@ def usage_parser():
     parser = argparse.ArgumentParser(
         prog="devc2",
         description="Open a hardened, credential-isolated development environment.",
-        epilog="commands: devc2 run <repo> [--span NAME] | devc2 <repo> | devc2 auth | devc2 doctor [--runtime] | devc2 repair <repo> | devc2 update | devc2 rollback | devc2 reset <repo> [--yes]",
+        epilog="commands: devc2 run <repo> [--span NAME] | devc2 <repo> | devc2 auth | devc2 doctor [--runtime] | devc2 repair <repo> | devc2 skills refresh <repo> | devc2 update | devc2 rollback | devc2 reset <repo> [--yes]",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {installed_version(ROOT)}")
     return parser
@@ -1467,6 +1600,13 @@ def parse_cli(argv):
         parser.add_argument("repo")
         args = parser.parse_args(argv[1:])
         return "repair", args.repo, False, ()
+    if argv[:2] == ["skills","refresh"]:
+        parser = argparse.ArgumentParser(prog="devc2 skills refresh")
+        parser.add_argument("repo")
+        args = parser.parse_args(argv[2:])
+        return "skills-refresh", args.repo, False, ()
+    if argv[0] == "skills":
+        raise RuntimeError("usage: devc2 skills refresh <repo>")
     explicit_run=argv[0]=="run" and len(argv)>1
     parser=argparse.ArgumentParser(prog="devc2 run" if explicit_run else "devc2")
     parser.add_argument("repo")
@@ -1495,6 +1635,7 @@ def main(argv=None):
         repo = canonical_repo(raw_repo)
         if command == "reset": return reset(repo, yes)
         if command == "repair": return repair(repo)
+        if command == "skills-refresh": return refresh_skills(repo)
         return start(repo,span_names=spans)
     except RuntimeError as error:
         print(f"devc2: error: {error}", file=sys.stderr)
