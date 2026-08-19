@@ -456,6 +456,7 @@ class CliTests(unittest.TestCase):
     def test_herdr_is_bundled_but_never_started_by_the_entrypoint(self):
         dockerfile = (PATH.parents[1] / "Dockerfile").read_text()
         entrypoint = (PATH.parents[1] / "devbox" / "entrypoint.sh").read_text()
+        herdr_config = (PATH.parents[1] / "devbox" / "herdr-config.toml").read_text()
         self.assertIn("ARG HERDR_VERSION=0.8.0", dockerfile)
         self.assertIn('herdr_asset="herdr-linux-x86_64"', dockerfile)
         self.assertIn('herdr_asset="herdr-linux-aarch64"', dockerfile)
@@ -467,6 +468,15 @@ class CliTests(unittest.TestCase):
         skill=(PATH.parents[1]/"devbox"/"agent-skills"/"herdr"/"SKILL.md").read_text()
         self.assertIn("herdr agent prompt reviewer",skill)
         self.assertIn("--no-focus",skill)
+        self.assertIn(
+            "COPY --chown=devbox:devbox --chmod=0600 devbox/herdr-config.toml "
+            "/home/devbox/.config/herdr/config.toml",
+            dockerfile,
+        )
+        self.assertEqual(
+            herdr_config,
+            '[terminal]\ndefault_shell = "/usr/local/bin/tact"\n',
+        )
         self.assertNotIn("herdr", entrypoint.lower())
         self.assertNotIn("herdr-wrapper", dockerfile)
         self.assertFalse((PATH.parents[1] / "devbox" / "herdr-wrapper.py").exists())

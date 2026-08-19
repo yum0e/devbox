@@ -59,8 +59,11 @@ devc2 reset /path/to/repository --yes
 
 `devc2 run /path/to/repository` grants no Spans and opens a credential-free
 shell. Herdr is a regular executable in that shell. Run `herdr` when you want
-to orchestrate agents and other processes in the same Island; devc2 never
-starts it automatically and no Herdr host service or Span is involved.
+to orchestrate agents and other processes in the same Island. In a fresh box,
+Herdr opens Tact in its initial pane and in new tabs and splits by default;
+change `terminal.default_shell` in `~/.config/herdr/config.toml` to override
+that behavior. devc2 never starts Herdr automatically and no Herdr host service
+or Span is involved.
 
 The matching Herdr agent skill is included in the immutable skill snapshot, so
 Tact, Pi, and other compatible harnesses discover its focus-free pane and agent
