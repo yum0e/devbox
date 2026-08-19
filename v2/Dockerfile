@@ -53,6 +53,7 @@ RUN pnpm add --global --ignore-scripts --no-optional \
  && pnpm store prune
 
 # Herdr is an ordinary Island tool. Nothing starts it until a user invokes it.
+COPY devbox/agent-skills/herdr/SKILL.md /tmp/herdr-skill.expected
 ARG TARGETARCH
 ARG HERDR_VERSION=0.8.0
 RUN set -eux; \
@@ -73,7 +74,10 @@ RUN set -eux; \
     echo "${herdr_sha256}  /tmp/herdr" | sha256sum -c -; \
     install -m 0755 /tmp/herdr /usr/local/bin/herdr; \
     rm -f /tmp/herdr; \
-    herdr --version
+    herdr --version; \
+    herdr --skill >/tmp/herdr-skill.actual; \
+    cmp /tmp/herdr-skill.expected /tmp/herdr-skill.actual; \
+    rm -f /tmp/herdr-skill.expected /tmp/herdr-skill.actual
 
 # Match v1's managed Python and Ethereum development toolchain without placing
 # either installation in the persistent devbox home volume.

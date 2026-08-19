@@ -202,12 +202,16 @@ class CliTests(unittest.TestCase):
             root=Path(td); source=root/"skills"; source.mkdir(); skill=source/"first-skill"; skill.mkdir()
             (skill/"SKILL.md").write_text("first\n")
             projection=root/"projection"
-            self.assertEqual(D.update_skill_projection(source,projection),["first-skill"])
+            self.assertEqual(D.update_skill_projection(source,projection),["first-skill","herdr"])
             current=projection/"current"
             inode=current.stat().st_ino
             self.assertEqual((current/"first-skill"/"SKILL.md").read_text(),"first\n")
+            self.assertEqual(
+                (current/"herdr"/"SKILL.md").read_bytes(),
+                (D.BUILTIN_AGENT_SKILLS/"herdr"/"SKILL.md").read_bytes(),
+            )
             (skill/"SKILL.md").write_text("second\n")
-            self.assertEqual(D.update_skill_projection(source,projection),["first-skill"])
+            self.assertEqual(D.update_skill_projection(source,projection),["first-skill","herdr"])
             self.assertEqual(current.stat().st_ino,inode)
             self.assertEqual((current/"first-skill"/"SKILL.md").read_text(),"second\n")
             self.assertEqual(len(list((projection/"snapshots").iterdir())),2)
@@ -215,6 +219,24 @@ class CliTests(unittest.TestCase):
             D.update_skill_projection(source,projection)
             self.assertEqual(current.stat().st_ino,inode)
             self.assertEqual(len(list((projection/"snapshots").iterdir())),3)
+
+    def test_host_skill_cannot_shadow_the_bundled_herdr_skill(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); source=root/"skills"; skill=source/"herdr"; skill.mkdir(parents=True)
+            (skill/"SKILL.md").write_text("unsafe replacement\n")
+            projection=root/"projection"
+            self.assertEqual(D.update_skill_projection(source,projection),["herdr"])
+            self.assertEqual(
+                (projection/"current"/"herdr"/"SKILL.md").read_bytes(),
+                (D.BUILTIN_AGENT_SKILLS/"herdr"/"SKILL.md").read_bytes(),
+            )
+            (skill/"SKILL.md").chmod(0o666)
+            with self.assertRaisesRegex(RuntimeError,"unsafe path"):
+                D.update_skill_projection(source,projection)
+            self.assertEqual(
+                (projection/"current"/"herdr"/"SKILL.md").read_bytes(),
+                (D.BUILTIN_AGENT_SKILLS/"herdr"/"SKILL.md").read_bytes(),
+            )
 
     def test_failed_agent_skill_refresh_keeps_the_active_snapshot(self):
         with tempfile.TemporaryDirectory() as td:
@@ -280,6 +302,7 @@ class CliTests(unittest.TestCase):
                 D.TACT_CONFIG.write_text("[agent]\n")
                 launch=root/"launch"; launch.mkdir(); public=D.prepare(launch)
             self.assertEqual(os.readlink(public/"agent-home"/"skills"),"/run/devc2-public/agent-skills/current")
+            self.assertTrue((public/"agent-skills"/"current"/"herdr"/"SKILL.md").is_file())
 
     def test_http_ca_umask_is_scoped_to_attachment_creation(self):
         entrypoint = (PATH.parents[1] / "devbox" / "entrypoint.sh").read_text()
@@ -439,6 +462,11 @@ class CliTests(unittest.TestCase):
         self.assertIn("b872ea7e40fa2cb17e857ac9b62b1bf26db7b403c622f5d2f3f5b35f6e9acd28", dockerfile)
         self.assertIn("f647ac66468d9efbc642fe534fb284468f0aea60641606fc008dfc0d82a3ca87", dockerfile)
         self.assertIn("install -m 0755 /tmp/herdr /usr/local/bin/herdr", dockerfile)
+        self.assertIn("herdr --skill >/tmp/herdr-skill.actual",dockerfile)
+        self.assertIn("cmp /tmp/herdr-skill.expected /tmp/herdr-skill.actual",dockerfile)
+        skill=(PATH.parents[1]/"devbox"/"agent-skills"/"herdr"/"SKILL.md").read_text()
+        self.assertIn("herdr agent prompt reviewer",skill)
+        self.assertIn("--no-focus",skill)
         self.assertNotIn("herdr", entrypoint.lower())
         self.assertNotIn("herdr-wrapper", dockerfile)
         self.assertFalse((PATH.parents[1] / "devbox" / "herdr-wrapper.py").exists())
@@ -924,7 +952,7 @@ class SkillRefreshTests(unittest.TestCase):
                  contextlib.redirect_stdout(output):
                 self.assertEqual(D.refresh_skills(repo),0)
             self.assertEqual((projection/"current"/"safe-skill"/"SKILL.md").read_text(),"refreshed\n")
-            self.assertIn(f"refreshed 1 host skill(s) for {project}: safe-skill",output.getvalue())
+            self.assertIn(f"refreshed 2 agent skill(s) for {project}: herdr, safe-skill",output.getvalue())
             commands=[call.args[0] for call in run.call_args_list]
             self.assertIn(f"label=dev.devbox.workspace-hash={D.identity(repo)[0]}",commands[0])
             self.assertEqual(commands[1],["docker","inspect","--format","{{.Config.User}}","a"*12])

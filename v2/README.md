@@ -62,6 +62,10 @@ shell. Herdr is a regular executable in that shell. Run `herdr` when you want
 to orchestrate agents and other processes in the same Island; devc2 never
 starts it automatically and no Herdr host service or Span is involved.
 
+The matching Herdr agent skill is included in the immutable skill snapshot, so
+Tact, Pi, and other compatible harnesses discover its focus-free pane and agent
+APIs without a wrapper. Host skill refreshes cannot shadow this bundled skill.
+
 `reset` removes only that checkout's v2 Compose resources and state. It never
 removes the checkout or v1 resources.
 

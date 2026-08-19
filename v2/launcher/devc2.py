@@ -13,6 +13,7 @@ VERSION="0.2.0"
 SOURCE_ROOT=Path(__file__).resolve().parents[1]
 INSTALLED_ROOT=Path(os.environ.get("DEVC2_RUNTIME_ROOT",os.environ.get("DEVC2_SHARE_DIR",Path.home()/".local/share/devc2"))).expanduser().resolve()
 ROOT=INSTALLED_ROOT if (INSTALLED_ROOT/"compose.yaml").is_file() else SOURCE_ROOT
+BUILTIN_AGENT_SKILLS=ROOT/"devbox"/"agent-skills"
 
 def asset_digest(source):
     digest=hashlib.sha256(); runtime_roots={"Dockerfile","compose.yaml","README.md","devbox","credential_proxy","launcher","spans"}
@@ -796,15 +797,23 @@ def _skill_manifest(root):
     entries.sort(key=lambda item:str(item[0]))
     return entries
 
-def snapshot_agent_skills(source,destination):
-    destination.mkdir(mode=0o700)
+def snapshot_agent_skills(source,destination,*,append=False,reserved=frozenset()):
+    if append:
+        metadata=destination.lstat()
+        if (not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid!=os.getuid() or metadata.st_mode&0o022):
+            raise RuntimeError("agent skill snapshot is unsafe")
+        destination.chmod(0o700)
+    else:
+        destination.mkdir(mode=0o700)
     if not source.exists() and not source.is_symlink():
         destination.chmod(0o555)
         return []
     try: root=source.resolve(strict=True)
     except OSError as error: raise RuntimeError(f"agent skills root is unavailable: {source}") from error
     before=_skill_manifest(root)
-    for relative,is_directory,executable,size,digest in before:
+    selected=[entry for entry in before if entry[0].parts[0] not in reserved]
+    for relative,is_directory,executable,size,digest in selected:
         target=destination/relative
         if is_directory:
             target.mkdir(mode=0o700)
@@ -827,7 +836,7 @@ def snapshot_agent_skills(source,destination):
     if _skill_manifest(root)!=before: raise RuntimeError("agent skills changed while the snapshot was created")
     for path in sorted((item for item in destination.rglob("*") if item.is_dir()),reverse=True): path.chmod(0o555)
     destination.chmod(0o555)
-    return sorted({relative.parts[0] for relative,*_rest in before})
+    return sorted({relative.parts[0] for relative,*_rest in selected})
 
 def _publish_skill_view(snapshot,view):
     view.mkdir(mode=0o700,exist_ok=True)
@@ -882,7 +891,13 @@ def update_skill_projection(source,projection):
     snapshot=snapshots/name
     current=projection/"current"
     try:
-        skills=snapshot_agent_skills(source,snapshot)
+        if not BUILTIN_AGENT_SKILLS.is_dir():
+            raise RuntimeError("bundled agent skills are unavailable")
+        bundled=snapshot_agent_skills(BUILTIN_AGENT_SKILLS,snapshot)
+        host=snapshot_agent_skills(
+            source,snapshot,append=True,reserved=frozenset(bundled),
+        )
+        skills=sorted(bundled+host)
         _publish_skill_view(snapshot,current)
         atomic_write(current/".devc2-generation",name+"\n",0o444)
         directory=os.open(projection,os.O_RDONLY)
@@ -1491,7 +1506,7 @@ def refresh_skills(repo):
         if visible.returncode!=0 or visible.stdout!=expected:
             raise RuntimeError("refreshed agent skills are not visible inside the running devbox")
         names=", ".join(skills) if skills else "none"
-        print(f"refreshed {len(skills)} host skill(s) for {project}: {names}")
+        print(f"refreshed {len(skills)} agent skill(s) for {project}: {names}")
         print("restart or reload agents in the Island when ready")
         return 0
 
