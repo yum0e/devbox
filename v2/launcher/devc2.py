@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Trusted macOS launcher for devbox v2."""
 from __future__ import annotations
-import argparse, base64, contextlib, fcntl, gzip, hashlib, json, os, platform, re, secrets, shlex, shutil, signal, stat, subprocess, sys, tarfile, tempfile, time, unicodedata, urllib.error, urllib.parse, urllib.request
+import argparse, base64, contextlib, errno, fcntl, gzip, hashlib, json, os, platform, re, secrets, shlex, shutil, signal, stat, subprocess, sys, tarfile, tempfile, time, unicodedata, urllib.error, urllib.parse, urllib.request
 from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 
@@ -155,6 +155,25 @@ def atomic_write(path,data,mode=0o600):
         except OSError: pass
         temp.unlink(missing_ok=True)
         raise
+
+@contextlib.contextmanager
+def launch_directory():
+    path=Path(tempfile.mkdtemp(prefix="devc2-")); path.chmod(0o700)
+    try: yield path
+    finally:
+        deadline=time.monotonic()+5
+        while True:
+            try:
+                shutil.rmtree(path)
+                break
+            except FileNotFoundError:
+                break
+            except OSError as error:
+                if error.errno not in {errno.EBUSY,errno.ENOTEMPTY}:
+                    raise RuntimeError("could not remove the temporary launch directory") from error
+                if time.monotonic()>=deadline:
+                    raise RuntimeError("Docker did not release the temporary launch directory after teardown") from error
+                time.sleep(0.05)
 
 def source_version(source):
     import re
@@ -810,6 +829,44 @@ def snapshot_agent_skills(source,destination):
     destination.chmod(0o555)
     return sorted({relative.parts[0] for relative,*_rest in before})
 
+def _publish_skill_view(snapshot,view):
+    view.mkdir(mode=0o700,exist_ok=True)
+    metadata=view.lstat()
+    if (not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid!=os.getuid() or metadata.st_mode&0o022):
+        raise RuntimeError("agent skill view is unsafe")
+    existing=[]
+    for path in view.rglob("*"):
+        metadata=path.lstat(); relative=path.relative_to(view)
+        if (metadata.st_uid!=os.getuid() or metadata.st_mode&0o022
+                or not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode))
+                or (stat.S_ISREG(metadata.st_mode) and metadata.st_nlink!=1)):
+            raise RuntimeError(f"agent skill view contains an unsafe path: {relative}")
+        existing.append((relative,stat.S_ISDIR(metadata.st_mode)))
+    desired={}
+    for path in snapshot.rglob("*"):
+        metadata=path.lstat(); relative=path.relative_to(snapshot)
+        desired[relative]=(stat.S_ISDIR(metadata.st_mode),bool(metadata.st_mode&0o111))
+    for relative,(is_directory,_executable) in sorted(desired.items(),key=lambda item:len(item[0].parts)):
+        if not is_directory: continue
+        target=view/relative
+        if target.is_file(): target.unlink()
+        target.mkdir(mode=0o700,parents=True,exist_ok=True)
+        target.chmod(0o700)
+    for relative,(is_directory,executable) in desired.items():
+        if is_directory: continue
+        target=view/relative
+        if target.is_dir():
+            for directory,_children,_files in os.walk(target,topdown=False): Path(directory).chmod(0o700)
+            shutil.rmtree(target)
+        atomic_write(target,(snapshot/relative).read_bytes(),0o555 if executable else 0o444)
+    for relative,is_directory in sorted(existing,key=lambda item:len(item[0].parts),reverse=True):
+        if relative in desired: continue
+        target=view/relative
+        if is_directory:
+            target.chmod(0o700); target.rmdir()
+        else: target.unlink()
+
 def update_skill_projection(source,projection):
     projection.mkdir(mode=0o700,exist_ok=True)
     metadata=projection.lstat()
@@ -823,26 +880,15 @@ def update_skill_projection(source,projection):
         raise RuntimeError("agent skill projection is unsafe")
     name=f"snapshot-{secrets.token_hex(16)}"
     snapshot=snapshots/name
-    temporary=projection/f".current-{secrets.token_hex(16)}"
     current=projection/"current"
-    if current.exists() or current.is_symlink():
-        if not current.is_symlink(): raise RuntimeError("agent skill projection is unsafe")
-        target=Path(os.readlink(current))
-        if (target.is_absolute() or len(target.parts)!=2 or target.parts[0]!="snapshots"
-                or not re.fullmatch(r"snapshot-[a-f0-9]{32}",target.parts[1])):
-            raise RuntimeError("agent skill projection is unsafe")
-        try: resolved=current.resolve(strict=True)
-        except OSError as error: raise RuntimeError("agent skill projection is unsafe") from error
-        if resolved.parent!=snapshots: raise RuntimeError("agent skill projection is unsafe")
     try:
         skills=snapshot_agent_skills(source,snapshot)
-        temporary.symlink_to(Path("snapshots")/name)
-        os.replace(temporary,current)
+        _publish_skill_view(snapshot,current)
+        atomic_write(current/".devc2-generation",name+"\n",0o444)
         directory=os.open(projection,os.O_RDONLY)
         try: os.fsync(directory)
         finally: os.close(directory)
     except Exception:
-        temporary.unlink(missing_ok=True)
         if snapshot.exists():
             try: _remove_skill_snapshot(snapshot)
             except (OSError,RuntimeError): pass
@@ -873,13 +919,22 @@ def _running_skill_projection(devbox):
     for mount in mounts:
         if not isinstance(mount,dict) or not isinstance(mount.get("Destination"),str): continue
         by_target.setdefault(mount["Destination"],[]).append(mount)
+    def host_source(raw,target):
+        candidates=[Path(raw)]
+        parsed=PurePosixPath(raw)
+        if (platform.system()=="Darwin" and parsed.is_absolute()
+                and len(parsed.parts)>2 and parsed.parts[1]=="host_mnt"):
+            candidates.append(Path("/").joinpath(*parsed.parts[2:]))
+        for candidate in candidates:
+            try: return candidate.resolve(strict=True)
+            except OSError: pass
+        raise RuntimeError(f"running devbox mount is unavailable: {target}")
     def read_only_bind(target):
         matches=by_target.get(target,[])
         if (len(matches)!=1 or matches[0].get("Type")!="bind" or matches[0].get("RW") is not False
                 or not isinstance(matches[0].get("Source"),str)):
             raise RuntimeError(f"running devbox lacks its expected read-only mount: {target}")
-        try: return Path(matches[0]["Source"]).resolve(strict=True)
-        except OSError as error: raise RuntimeError(f"running devbox mount is unavailable: {target}") from error
+        return host_source(matches[0]["Source"],target)
     public=read_only_bind("/run/devc2-public")
     projection=public/"agent-skills"
     agent_home=read_only_bind("/home/devbox/.agents")
@@ -896,14 +951,10 @@ def _running_skill_projection(devbox):
             or os.readlink(skills_view)!="/run/devc2-public/agent-skills/current"):
         raise RuntimeError("running devbox has an invalid agent skills view")
     current=projection/"current"
-    if not current.is_symlink(): raise RuntimeError("running devbox has an invalid agent skills projection")
-    target=Path(os.readlink(current))
-    if (target.is_absolute() or len(target.parts)!=2 or target.parts[0]!="snapshots"
-            or not re.fullmatch(r"snapshot-[a-f0-9]{32}",target.parts[1])):
-        raise RuntimeError("running devbox has an invalid agent skills projection")
-    try: resolved=current.resolve(strict=True)
+    try: metadata=current.lstat()
     except OSError as error: raise RuntimeError("running devbox has an invalid agent skills projection") from error
-    if resolved.parent!=projection/"snapshots":
+    if (not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid!=os.getuid() or metadata.st_mode&0o022):
         raise RuntimeError("running devbox has an invalid agent skills projection")
     for snapshot in (projection/"snapshots").iterdir():
         metadata=snapshot.lstat()
@@ -1193,8 +1244,7 @@ def _start_unlocked(repo, runtime_doctor=False, span_names=()):
     worktree=linked_worktree(repo)
     digest, _project = identity(repo)
     with repository_lock(repo):
-        with tempfile.TemporaryDirectory(prefix='devc2-') as raw:
-            temp=Path(raw); temp.chmod(0o700)
+        with launch_directory() as temp:
             worktree_override=worktree_compose_override(temp,worktree) if worktree else None
             span_clients=temp/'span-clients'; span_providers=temp/'span-providers'
             granted_spans=span_runtime.load_catalog(SPAN_CATALOG,span_names,repo,span_clients,span_providers,ROOT/'spans',ROOT/'launcher'/'command_projection.py')
@@ -1434,6 +1484,12 @@ def refresh_skills(repo):
         if (_service_container(project,"devbox",digest)!=devbox
                 or _running_skill_projection(devbox)!=projection):
             raise RuntimeError(f"running devbox for {project} changed during skill refresh")
+        expected=(projection/"current"/".devc2-generation").read_text(encoding="utf-8")
+        visible=run([
+            "docker","exec",devbox,"cat","/home/devbox/.agents/skills/.devc2-generation",
+        ],check=False,timeout=15)
+        if visible.returncode!=0 or visible.stdout!=expected:
+            raise RuntimeError("refreshed agent skills are not visible inside the running devbox")
         names=", ".join(skills) if skills else "none"
         print(f"refreshed {len(skills)} host skill(s) for {project}: {names}")
         print("restart or reload agents in the Island when ready")

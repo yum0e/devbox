@@ -1,5 +1,5 @@
 from __future__ import annotations
-import base64, contextlib, importlib.util, io, json, os, re, stat, subprocess, sys, tempfile, unittest
+import base64, contextlib, errno, importlib.util, io, json, os, re, stat, subprocess, sys, tempfile, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -42,6 +42,18 @@ class CliTests(unittest.TestCase):
         repo=Path("/tmp/repo")
         self.assertEqual(D.identity(repo),D.identity(repo))
         self.assertTrue(D.identity(repo)[1].startswith("devc2-"))
+
+    def test_launch_directory_retries_delayed_docker_desktop_unmount(self):
+        with tempfile.TemporaryDirectory() as td:
+            path=Path(td)/"launch"; path.mkdir()
+            delayed=OSError(errno.ENOTEMPTY,"not empty")
+            with mock.patch.object(D.tempfile,"mkdtemp",return_value=str(path)), \
+                 mock.patch.object(D.shutil,"rmtree",side_effect=[delayed,None]) as remove, \
+                 mock.patch.object(D.time,"sleep") as sleep:
+                with D.launch_directory() as created:
+                    self.assertEqual(created,path)
+            self.assertEqual(remove.call_count,2)
+            sleep.assert_called_once_with(0.05)
 
     def test_linked_worktree_projects_only_its_pointer_and_common_git_metadata(self):
         with tempfile.TemporaryDirectory() as td:
@@ -185,26 +197,23 @@ class CliTests(unittest.TestCase):
             (skill/"SKILL.md").write_text("changed\n")
             self.assertNotEqual((destination/"release-review"/"SKILL.md").read_text(),"changed\n")
 
-    def test_agent_skill_projection_switches_atomically_and_retains_old_snapshots(self):
+    def test_agent_skill_projection_updates_a_stable_view_and_retains_snapshots(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); source=root/"skills"; source.mkdir(); skill=source/"first-skill"; skill.mkdir()
             (skill/"SKILL.md").write_text("first\n")
             projection=root/"projection"
-            with mock.patch.object(D.os,"replace",wraps=os.replace) as replace:
-                self.assertEqual(D.update_skill_projection(source,projection),["first-skill"])
-            replace.assert_called_once()
+            self.assertEqual(D.update_skill_projection(source,projection),["first-skill"])
             current=projection/"current"
-            first=current.resolve()
+            inode=current.stat().st_ino
             self.assertEqual((current/"first-skill"/"SKILL.md").read_text(),"first\n")
             (skill/"SKILL.md").write_text("second\n")
             self.assertEqual(D.update_skill_projection(source,projection),["first-skill"])
-            self.assertNotEqual(current.resolve(),first)
+            self.assertEqual(current.stat().st_ino,inode)
             self.assertEqual((current/"first-skill"/"SKILL.md").read_text(),"second\n")
-            self.assertTrue(first.exists())
             self.assertEqual(len(list((projection/"snapshots").iterdir())),2)
             (skill/"SKILL.md").write_text("third\n")
             D.update_skill_projection(source,projection)
-            self.assertTrue(first.exists())
+            self.assertEqual(current.stat().st_ino,inode)
             self.assertEqual(len(list((projection/"snapshots").iterdir())),3)
 
     def test_failed_agent_skill_refresh_keeps_the_active_snapshot(self):
@@ -213,12 +222,24 @@ class CliTests(unittest.TestCase):
             (skill/"SKILL.md").write_text("safe\n")
             projection=root/"projection"
             D.update_skill_projection(source,projection)
-            current=projection/"current"; target=os.readlink(current)
+            current=projection/"current"; inode=current.stat().st_ino
             with mock.patch.object(D,"snapshot_agent_skills",side_effect=RuntimeError("copy failed")):
                 with self.assertRaisesRegex(RuntimeError,"copy failed"):
                     D.update_skill_projection(source,projection)
-            self.assertEqual(os.readlink(current),target)
+            self.assertEqual(current.stat().st_ino,inode)
             self.assertEqual((current/"safe-skill"/"SKILL.md").read_text(),"safe\n")
+
+    def test_stable_view_does_not_depend_on_live_symlink_replacement(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); source=root/"skills"; source.mkdir(); skill=source/"safe-skill"; skill.mkdir()
+            (skill/"SKILL.md").write_text("first\n")
+            projection=root/"projection"; D.update_skill_projection(source,projection)
+            current=projection/"current"; inode=current.stat().st_ino
+            (skill/"SKILL.md").write_text("second\n")
+            with mock.patch.object(D.platform,"system",return_value="Darwin"):
+                D.update_skill_projection(source,projection)
+            self.assertEqual(current.stat().st_ino,inode)
+            self.assertEqual((current/"safe-skill"/"SKILL.md").read_text(),"second\n")
 
     def test_agent_skill_snapshot_is_empty_when_unconfigured_and_rejects_unsafe_trees(self):
         with tempfile.TemporaryDirectory() as td:
@@ -858,10 +879,11 @@ class SkillRefreshTests(unittest.TestCase):
         D.update_skill_projection(source,projection)
         return public,projection,source
 
-    def inspect_result(self,public,public_rw=False):
+    def inspect_result(self,public,public_rw=False,docker_desktop=False):
+        source=lambda path: "/host_mnt"+str(path) if docker_desktop else str(path)
         mounts=[
-            {"Type":"bind","Source":str(public),"Destination":"/run/devc2-public","RW":public_rw},
-            {"Type":"bind","Source":str(public/"agent-home"),"Destination":"/home/devbox/.agents","RW":False},
+            {"Type":"bind","Source":source(public),"Destination":"/run/devc2-public","RW":public_rw},
+            {"Type":"bind","Source":source(public/"agent-home"),"Destination":"/home/devbox/.agents","RW":False},
         ]
         return subprocess.CompletedProcess([],0,json.dumps(mounts),"")
 
@@ -869,6 +891,9 @@ class SkillRefreshTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             public,projection,_source=self.projection(Path(td))
             with mock.patch.object(D,"run",return_value=self.inspect_result(public)):
+                self.assertEqual(D._running_skill_projection("a"*12),projection)
+            with mock.patch.object(D,"run",return_value=self.inspect_result(public,docker_desktop=True)), \
+                 mock.patch.object(D.platform,"system",return_value="Darwin"):
                 self.assertEqual(D._running_skill_projection("a"*12),projection)
             with mock.patch.object(D,"run",return_value=self.inspect_result(public,True)), \
                  self.assertRaisesRegex(RuntimeError,"expected read-only mount"):
@@ -887,12 +912,14 @@ class SkillRefreshTests(unittest.TestCase):
             results=[
                 completed("a"*12+"\n"),completed("devbox\n"),self.inspect_result(public),
                 completed("a"*12+"\n"),self.inspect_result(public),
+                completed("snapshot-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"),
             ]
             output=io.StringIO()
             with mock.patch.object(D,"AGENT_SKILLS",source), \
                  mock.patch.object(D,"require_docker"), \
                  mock.patch.object(D,"lifecycle_lock",return_value=contextlib.nullcontext()), \
                  mock.patch.object(D,"skills_refresh_lock",return_value=contextlib.nullcontext()), \
+                 mock.patch.object(D.secrets,"token_hex",return_value="b"*32), \
                  mock.patch.object(D,"run",side_effect=results) as run, \
                  contextlib.redirect_stdout(output):
                 self.assertEqual(D.refresh_skills(repo),0)
@@ -903,5 +930,6 @@ class SkillRefreshTests(unittest.TestCase):
             self.assertEqual(commands[1],["docker","inspect","--format","{{.Config.User}}","a"*12])
             self.assertEqual(commands[2],["docker","inspect","--format","{{json .Mounts}}","a"*12])
             self.assertEqual(commands[4],["docker","inspect","--format","{{json .Mounts}}","a"*12])
+            self.assertEqual(commands[5],["docker","exec","a"*12,"cat","/home/devbox/.agents/skills/.devc2-generation"])
 
 if __name__=="__main__": unittest.main()

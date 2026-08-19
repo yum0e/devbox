@@ -268,19 +268,18 @@ per-checkout even when `[memory] enabled = true` is set in the shared file.
 
 Put portable Agent Skills in `~/.config/agent-skills/<name>/SKILL.md` (or the
 equivalent `XDG_CONFIG_HOME` path). On each launch, devc2 validates that directory
-and creates an immutable generation inside a read-only projection. The standard
-`~/.agents/skills` path selects its current generation. Pi discovers that path
+and creates an immutable generation before publishing it into a stable read-only
+projection. The standard `~/.agents/skills` path selects that view. Pi discovers that path
 directly; devc2 enables Tact's native skill discovery in its per-launch
 configuration snapshot. Both harnesses therefore see the same skills without
 wrappers or access to the rest of the host configuration.
 
 After editing the host directory, run
 `devc2 skills refresh /path/to/repository` on the host to validate a replacement
-snapshot and switch the running Island to it atomically. The command does not
+snapshot and update the stable view only after validation completes. The command does not
 restart the Island or any agent; reload or restart Tact, Pi, or Herdr when you
-want it to discover the refreshed skills. Older generations remain available
-for agents that already resolved them and are removed with the launch's
-temporary state when the Island exits.
+want it to discover the refreshed skills. Staged generations are removed with
+the launch's temporary state when the Island exits.
 
 ```text
 ~/.config/agent-skills/
