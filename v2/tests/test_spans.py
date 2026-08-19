@@ -750,6 +750,45 @@ class BridgeConfigTests(unittest.TestCase):
                 bridge.server.close()
                 bridge.path.unlink(missing_ok=True)
 
+    def test_host_relay_retries_world_connection_before_forwarding(self):
+        relay = object.__new__(span_runtime.OpaqueRelay)
+        relay.upstream = ("127.0.0.1", 1234)
+        relay.name = "openai"
+        relay.stopping = threading.Event()
+        relay.diagnostics = mock.Mock()
+        connected = mock.MagicMock(spec=socket.socket)
+        with mock.patch.object(
+            span_runtime.socket, "create_connection",
+            side_effect=[ConnectionRefusedError(), connected],
+        ) as connect, mock.patch.object(relay.stopping, "wait", return_value=False) as wait:
+            self.assertIs(relay._connect_world(), connected)
+        self.assertEqual(connect.call_count, 2)
+        wait.assert_called_once_with(span_runtime.WORLD_CONNECT_BACKOFF[0])
+        relay.diagnostics.recovery_started.assert_called_once_with("openai")
+        relay.diagnostics.recovery_succeeded.assert_called_once_with("openai")
+        relay.diagnostics.recovery_failed.assert_not_called()
+
+    def test_host_relay_stops_after_bounded_world_connection_retries(self):
+        relay = object.__new__(span_runtime.OpaqueRelay)
+        relay.upstream = ("127.0.0.1", 1234)
+        relay.name = "github"
+        relay.stopping = threading.Event()
+        relay.diagnostics = mock.Mock()
+        failure = ConnectionRefusedError()
+        with mock.patch.object(
+            span_runtime.socket, "create_connection", side_effect=failure,
+        ) as connect, mock.patch.object(relay.stopping, "wait", return_value=False) as wait, \
+             self.assertRaises(ConnectionRefusedError):
+            relay._connect_world()
+        self.assertEqual(connect.call_count, len(span_runtime.WORLD_CONNECT_BACKOFF) + 1)
+        self.assertEqual(
+            [call.args[0] for call in wait.call_args_list],
+            list(span_runtime.WORLD_CONNECT_BACKOFF),
+        )
+        relay.diagnostics.recovery_started.assert_called_once_with("github")
+        relay.diagnostics.recovery_succeeded.assert_not_called()
+        relay.diagnostics.recovery_failed.assert_called_once_with("github")
+
     def test_bridge_config_knows_only_names_and_ports(self):
         with tempfile.TemporaryDirectory() as raw:
             path = Path(raw) / "spans.json"
@@ -810,6 +849,7 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertIn("profiles: [spans]", bridge)
         self.assertIn('user: "0:0"', bridge)
         self.assertIn("credential_proxy.span_bridge", bridge)
+        self.assertIn('restart: "on-failure:5"',bridge)
         self.assertIn("mem_limit: 128m", bridge)
         self.assertIn("pids_limit: 64", bridge)
         self.assertEqual(span_bridge.MAX_CONNECTIONS, 16)

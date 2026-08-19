@@ -24,6 +24,7 @@ MAX_CLIENT_BYTES = 64 * 1024 * 1024
 MAX_PROVIDER_BYTES = 64 * 1024 * 1024
 MAX_CONNECTIONS = 64
 MAX_SPANS = 16
+WORLD_CONNECT_BACKOFF = (0.1, 0.5)
 HTTP_ATTACHMENT_BUILTINS = {"github", "openai"}
 STREAM_BUILTINS = {"ssh-agent"}
 COMMAND_BUILTINS = {"diagnostics"}
@@ -178,6 +179,9 @@ class Provider:
         self._address = self.listener.getsockname()
         lifetime_read, self.lifetime_write = os.pipe()
         self.started_read, started_write = os.pipe()
+        self.recovery_read = None
+        self.recovery_monitored = False
+        recovery_write = None
         environment = dict(os.environ)
         environment.update({
             "DEVC2_SPAN_SOCKET_FD": str(self.listener.fileno()),
@@ -186,18 +190,26 @@ class Provider:
         })
         if diagnostics_path is not None and span.name == "diagnostics":
             environment["DEVC2_DIAGNOSTICS_FILE"] = str(diagnostics_path)
+        if diagnostics_path is not None:
+            self.recovery_read, recovery_write = os.pipe()
+            environment["DEVC2_RECOVERY_FD"] = str(recovery_write)
+        arguments = [
+            sys.executable, os.fspath(SUPERVISOR),
+            "--provider", os.fspath(span.provider),
+            "--listener-fd", str(self.listener.fileno()),
+            "--lifetime-fd", str(lifetime_read),
+            "--started-fd", str(started_write),
+        ]
+        pass_fds = [self.listener.fileno(), lifetime_read, started_write]
+        if recovery_write is not None:
+            arguments.extend(("--recovery-fd", str(recovery_write)))
+            pass_fds.append(recovery_write)
         try:
             self.process = subprocess.Popen(
-                [
-                    sys.executable, os.fspath(SUPERVISOR),
-                    "--provider", os.fspath(span.provider),
-                    "--listener-fd", str(self.listener.fileno()),
-                    "--lifetime-fd", str(lifetime_read),
-                    "--started-fd", str(started_write),
-                ],
+                arguments,
                 env=environment,
                 stdin=subprocess.DEVNULL,
-                pass_fds=(self.listener.fileno(), lifetime_read, started_write),
+                pass_fds=tuple(pass_fds),
                 start_new_session=True,
             )
         except Exception:
@@ -206,10 +218,16 @@ class Provider:
             os.close(self.started_read)
             os.close(self.lifetime_write)
             self.lifetime_write = None
+            if self.recovery_read is not None:
+                os.close(self.recovery_read)
+            if recovery_write is not None:
+                os.close(recovery_write)
             self.listener.close()
             raise
         os.close(lifetime_read)
         os.close(started_write)
+        if recovery_write is not None:
+            os.close(recovery_write)
         self.listener.close()
 
     @property
@@ -243,6 +261,9 @@ class Provider:
         except OSError:
             pass
         if self.process.poll() is not None:
+            if self.recovery_read is not None and not self.recovery_monitored:
+                os.close(self.recovery_read)
+                self.recovery_read = None
             return
         try:
             self.process.wait(timeout=5)
@@ -253,6 +274,9 @@ class Provider:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait(timeout=5)
+        if self.recovery_read is not None and not self.recovery_monitored:
+            os.close(self.recovery_read)
+            self.recovery_read = None
 
 
 class DiagnosticsState:
@@ -275,6 +299,9 @@ class DiagnosticsState:
                 "last_stage": "startup",
                 "last_result": "ready",
                 "last_error": None,
+                "recovery_state": "healthy",
+                "recoveries": 0,
+                "recovery_failures": 0,
             }
             for name in names
         }
@@ -331,6 +358,29 @@ class DiagnosticsState:
                 last_stage="accept",
                 last_result="rejected",
                 last_error="connection limit",
+            )
+            self.sequence += 1
+            self._persist()
+
+    def recovery_started(self, name: str) -> None:
+        self.update(name, recovery_state="recovering")
+
+    def recovery_succeeded(self, name: str) -> None:
+        with self.lock:
+            state = self.links[name]
+            state.update(
+                recovery_state="healthy",
+                recoveries=state["recoveries"] + 1,
+            )
+            self.sequence += 1
+            self._persist()
+
+    def recovery_failed(self, name: str) -> None:
+        with self.lock:
+            state = self.links[name]
+            state.update(
+                recovery_state="degraded",
+                recovery_failures=state["recovery_failures"] + 1,
             )
             self.sequence += 1
             self._persist()
@@ -433,7 +483,7 @@ class OpaqueRelay:
                 stage = "World connection"
                 if self.diagnostics is not None:
                     self.diagnostics.update(self.name, last_stage=stage)
-                with socket.create_connection(self.upstream, timeout=10) as upstream:
+                with self._connect_world() as upstream:
                     stage = "stream relay"
                     if self.diagnostics is not None:
                         self.diagnostics.update(self.name, last_stage=stage)
@@ -458,6 +508,26 @@ class OpaqueRelay:
             except OSError:
                 pass
             self.slots.release()
+
+    def _connect_world(self) -> socket.socket:
+        failure = None
+        for attempt in range(len(WORLD_CONNECT_BACKOFF) + 1):
+            try:
+                connection = socket.create_connection(self.upstream, timeout=10)
+                if attempt and self.diagnostics is not None:
+                    self.diagnostics.recovery_succeeded(self.name)
+                return connection
+            except OSError as error:
+                failure = error
+                if attempt == 0 and self.diagnostics is not None:
+                    self.diagnostics.recovery_started(self.name)
+                if attempt == len(WORLD_CONNECT_BACKOFF):
+                    break
+                if self.stopping.wait(WORLD_CONNECT_BACKOFF[attempt]):
+                    break
+        if self.diagnostics is not None:
+            self.diagnostics.recovery_failed(self.name)
+        raise failure or ConnectionError("World connection recovery stopped")
 
     def stop(self) -> None:
         self.stopping.set()
@@ -501,7 +571,12 @@ class SpanRuntime:
                         args=(provider,),
                         daemon=True,
                     )
-                    monitor.start()
+                    provider.recovery_monitored = True
+                    try:
+                        monitor.start()
+                    except RuntimeError:
+                        provider.recovery_monitored = False
+                        raise
                     self.monitors.append(monitor)
                 relay = OpaqueRelay(provider.address, tls_directory, span.name, self.diagnostics)
                 self.relays.append(relay)
@@ -519,17 +594,41 @@ class SpanRuntime:
         return world_attachment.materialize(public, worlds)
 
     def _monitor_provider(self, provider: Provider) -> None:
-        while not self.stopping.is_set():
-            status = provider.process.poll()
-            if status is not None:
-                if self.diagnostics is not None:
-                    self.diagnostics.update(
-                        provider.span.name,
-                        world_status="exited",
-                        world_exit=status,
+        recovery = provider.recovery_read
+        try:
+            while not self.stopping.is_set():
+                if recovery is not None:
+                    readable, _writable, _errors = select.select(
+                        [recovery], [], [], 0.1,
                     )
-                return
-            self.stopping.wait(0.1)
+                    if readable:
+                        events = os.read(recovery, 64)
+                        if not events:
+                            os.close(recovery)
+                            recovery = None
+                        for event in events:
+                            if event == ord("S"):
+                                self.diagnostics.recovery_started(provider.span.name)
+                            elif event == ord("R"):
+                                self.diagnostics.recovery_succeeded(provider.span.name)
+                            elif event == ord("F"):
+                                self.diagnostics.recovery_failed(provider.span.name)
+                else:
+                    self.stopping.wait(0.1)
+                status = provider.process.poll()
+                if status is not None:
+                    if self.diagnostics is not None:
+                        self.diagnostics.update(
+                            provider.span.name,
+                            world_status="exited",
+                            world_exit=status,
+                        )
+                    return
+        finally:
+            if recovery is not None:
+                os.close(recovery)
+            provider.recovery_read = None
+            provider.recovery_monitored = False
 
     def stop(self) -> None:
         self.stopping.set()

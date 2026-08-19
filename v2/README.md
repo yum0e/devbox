@@ -82,12 +82,20 @@ Jujutsu signing with its single exposed identity.
 
 Grant `--span diagnostics` to inspect one running Island from inside itself.
 `diagnostics report` returns sanitized per-Link lifecycle stages, connection
-counters, and the last exception class. Its World can read only a bounded
-launch-local snapshot: it has no Docker access, host command execution, host
+counters, recovery state, and the last exception class. Its World can read only
+a bounded launch-local snapshot: it has no Docker access, host command execution, host
 paths, traffic contents, credentials, process environment, mutation commands,
 or visibility into other Islands. Other Worlds are not told where its snapshot
 lives. This makes transport failures self-observable without adding debugging
 tools or host authority to the Island.
+
+Span transport recovery is automatic. A resumed or replaced bridge retires old
+streams, the host relay retries a World connection before forwarding bytes, and
+the OpenAI/GitHub Worlds replace an exited or unreachable credential helper
+with a bounded cooldown. Recovery never replays tunneled TLS or application
+requests; an already-started request fails normally and the agent's next request
+uses the repaired path. `devc2 repair` remains the manual fallback for a broader
+session repair.
 
 `devc2 doctor --runtime` creates a disposable temporary checkout and validates
 an end-to-end Pi response through the OpenAI Span, along with

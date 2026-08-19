@@ -42,6 +42,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--listener-fd", required=True, type=int)
     parser.add_argument("--lifetime-fd", required=True, type=int)
     parser.add_argument("--started-fd", required=True, type=int)
+    parser.add_argument("--recovery-fd", type=int)
     args = parser.parse_args(argv)
     stopping = False
 
@@ -52,13 +53,18 @@ def main(argv: list[str] | None = None) -> int:
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(signum, request_stop)
 
+    pass_fds = [args.listener_fd]
+    if args.recovery_fd is not None:
+        pass_fds.append(args.recovery_fd)
     provider = subprocess.Popen(
         [args.provider],
         stdin=subprocess.DEVNULL,
-        pass_fds=(args.listener_fd,),
+        pass_fds=tuple(pass_fds),
         start_new_session=True,
     )
     os.close(args.listener_fd)
+    if args.recovery_fd is not None:
+        os.close(args.recovery_fd)
     try:
         deadline = time.monotonic() + 0.1
         while time.monotonic() < deadline and provider.poll() is None and not stopping:

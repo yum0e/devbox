@@ -122,6 +122,34 @@ class WorldTests(unittest.TestCase):
             "XDG_RUNTIME_DIR": "/trusted/runtime",
         })
 
+    def test_cancelled_docker_operation_terminates_the_cli(self):
+        stopping = threading.Event()
+        stopping.set()
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.communicate.return_value = ("", "")
+        with mock.patch.object(P, "docker_executable", return_value="/usr/bin/docker"), \
+             mock.patch.object(P.subprocess, "Popen", return_value=process), \
+             self.assertRaisesRegex(P.ProviderError, "stopped"):
+            P.run_docker(["version"], stopping=stopping)
+        process.terminate.assert_called_once_with()
+        process.communicate.assert_called_once_with(timeout=1)
+
+    def test_failed_detached_launch_is_cleaned_by_name_without_an_id(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            manager = P.ProxyManager()
+            with mock.patch.object(P, "read_auth", return_value=("access", "account")), \
+                 mock.patch.object(P, "run_docker", side_effect=P.ProviderError("failed")), \
+                 mock.patch.object(P, "remove_named_container", return_value=True) as remove, \
+                 self.assertRaisesRegex(P.ProviderError, "failed"):
+                manager._launch(root, "workspace-tag")
+        remove.assert_called_once()
+        self.assertRegex(
+            remove.call_args.args[0],
+            r"^devc2-openai-proxy-[0-9a-f]{32}$",
+        )
+
     def test_connect_scope_is_exact_and_rejects_header_ambiguity(self):
         accepted = (
             (b"CONNECT chatgpt.com:443 HTTP/1.1\r\n"
@@ -177,7 +205,7 @@ class WorldTests(unittest.TestCase):
             root.mkdir()
             calls = []
 
-            def docker(arguments, timeout=120):
+            def docker(arguments, timeout=120, stopping=None):
                 calls.append(arguments)
                 if arguments[:2] == ["ps", "--all"]:
                     return subprocess.CompletedProcess(arguments, 0, "", "")
@@ -289,7 +317,7 @@ class WorldTests(unittest.TestCase):
             manager.proxy = proxy
 
             calls = []
-            def docker(arguments, timeout=120):
+            def docker(arguments, timeout=120, stopping=None):
                 calls.append(arguments)
                 if arguments[:3] == ["run", "--pull", "never"]:
                     return subprocess.CompletedProcess(arguments, 0, "b" * 64 + "\n", "")
@@ -336,6 +364,123 @@ class WorldTests(unittest.TestCase):
              self.assertRaisesRegex(P.ProviderError, "cleanup"):
             manager.get()
         launch.assert_not_called()
+
+    def test_running_but_unreachable_helper_is_recycled_once(self):
+        manager = P.ProxyManager()
+        proxy = P.Proxy(Path("/private"), "a" * 64, 1111, b"certificate")
+        manager.proxy = proxy
+        with mock.patch.object(P, "remove_container", return_value=True) as remove, \
+             mock.patch.object(manager, "_launch", return_value=("b" * 64, 2222)) as launch, \
+             mock.patch.object(manager, "workspace_tag", return_value="tag"), \
+             mock.patch.object(P, "recovery_event") as event:
+            self.assertIs(manager.recover(proxy, "a" * 64), proxy)
+            self.assertIs(manager.recover(proxy, "a" * 64), proxy)
+        remove.assert_called_once_with("a" * 64)
+        launch.assert_called_once_with(Path("/private"), "tag")
+        self.assertEqual((proxy.container, proxy.port), ("b" * 64, 2222))
+        self.assertEqual([call.args[0] for call in event.call_args_list], [b"S", b"R"])
+
+    def test_recovery_fails_closed_and_has_a_bounded_cooldown(self):
+        manager = P.ProxyManager()
+        proxy = P.Proxy(Path("/private"), "a" * 64, 1111, b"certificate")
+        manager.proxy = proxy
+        with mock.patch.object(P.time, "monotonic", return_value=10.0), \
+             mock.patch.object(P, "remove_container", return_value=False), \
+             mock.patch.object(manager, "_launch") as launch, \
+             mock.patch.object(P, "recovery_event") as event, \
+             self.assertRaisesRegex(P.ProviderError, "cleanup"):
+            manager.recover(proxy, proxy.container)
+        launch.assert_not_called()
+        self.assertEqual([call.args[0] for call in event.call_args_list], [b"S", b"F"])
+
+        with mock.patch.object(manager, "_state", return_value="exited"), \
+             mock.patch.object(P.time, "monotonic", return_value=11.0), \
+             mock.patch.object(P, "remove_container") as remove, \
+             self.assertRaisesRegex(P.ProviderError, "cooling down"):
+            manager.get()
+        remove.assert_not_called()
+
+    def test_stopping_manager_cannot_resurrect_a_helper(self):
+        manager = P.ProxyManager()
+        proxy = P.Proxy(Path("/private"), "a" * 64, 1111, b"certificate")
+        manager.proxy = proxy
+        manager.stopping.set()
+        with mock.patch.object(P, "remove_container") as remove, \
+             mock.patch.object(manager, "_launch") as launch, \
+             self.assertRaisesRegex(P.ProviderError, "stopping"):
+            manager.recover(proxy, proxy.container)
+        remove.assert_not_called()
+        launch.assert_not_called()
+
+    def test_replacement_is_removed_if_shutdown_wins_before_publish(self):
+        manager = P.ProxyManager()
+        original = "a" * 64
+        replacement = "b" * 64
+        proxy = P.Proxy(Path("/private"), original, 1111, b"certificate")
+        manager.proxy = proxy
+
+        def launch(_root, _tag):
+            manager.stopping.set()
+            return replacement, 2222
+
+        with mock.patch.object(P, "remove_container", return_value=True) as remove, \
+             mock.patch.object(manager, "_launch", side_effect=launch), \
+             mock.patch.object(manager, "workspace_tag", return_value="tag"), \
+             self.assertRaisesRegex(P.ProviderError, "stopping"):
+            manager.recover(proxy, original)
+        self.assertEqual(remove.call_args_list, [mock.call(original), mock.call(replacement)])
+        self.assertEqual((proxy.container, proxy.port), (original, 1111))
+
+    def test_upstream_proxy_failure_never_recycles_the_helper(self):
+        request = b"CONNECT chatgpt.com:443 HTTP/1.1\r\n\r\n"
+        proxy = P.Proxy(Path("/private"), "a" * 64, 1111, b"certificate")
+        manager = mock.Mock()
+        manager.get.return_value = proxy
+        upstream = mock.MagicMock(spec=socket.socket)
+        upstream.recv.return_value = b"HTTP/1.1 503 Service Unavailable\r\n\r\n"
+        with mock.patch.object(P.socket, "create_connection", return_value=upstream):
+            result, response = P.open_proxy_tunnel(manager, request)
+        self.assertIsNone(result)
+        self.assertEqual(response, b"HTTP/1.1 503 Service Unavailable\r\n\r\n")
+        manager.recover.assert_not_called()
+        upstream.close.assert_called_once_with()
+
+    def test_connect_recovery_happens_before_tunnel_bytes_are_exposed(self):
+        request = b"CONNECT chatgpt.com:443 HTTP/1.1\r\n\r\n"
+        proxy = P.Proxy(Path("/private"), "a" * 64, 1111, b"certificate")
+        manager = mock.Mock()
+        manager.get.return_value = proxy
+        manager.recover.return_value = proxy
+        healthy = mock.MagicMock(spec=socket.socket)
+        healthy.recv.return_value = b"HTTP/1.1 200 Connection Established\r\n\r\n"
+        with mock.patch.object(
+            P.socket, "create_connection",
+            side_effect=[ConnectionRefusedError(), healthy],
+        ), mock.patch.object(P.time, "sleep") as sleep:
+            upstream, response = P.open_proxy_tunnel(manager, request)
+        self.assertIs(upstream, healthy)
+        self.assertEqual(response, b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        manager.recover.assert_called_once_with(proxy, "a" * 64)
+        healthy.sendall.assert_called_once_with(request)
+        sleep.assert_called_once_with(0.25)
+
+    def test_handle_never_replays_trailing_tls_or_application_bytes(self):
+        connection = mock.MagicMock(spec=socket.socket)
+        connection.__enter__.return_value = connection
+        connection.recv.return_value = b"T"
+        upstream = mock.MagicMock(spec=socket.socket)
+        upstream.__enter__.return_value = upstream
+        request = b"CONNECT chatgpt.com:443 HTTP/1.1\r\n\r\n"
+        trailing = b"tls-and-opaque-application"
+        with mock.patch.object(P, "read_connect", return_value=(request, trailing)), \
+             mock.patch.object(
+                 P, "open_proxy_tunnel",
+                 return_value=(upstream, b"HTTP/1.1 200 OK\r\n\r\n"),
+             ), mock.patch.object(P, "relay") as relay:
+            P.handle(connection, mock.Mock(policy=P.POLICIES["openai"]))
+        upstream.sendall.assert_called_once_with(trailing)
+        connection.sendall.assert_called_once_with(b"HTTP/1.1 200 OK\r\n\r\n")
+        relay.assert_called_once_with(connection,upstream)
 
     def test_bootstrap_returns_only_public_and_fake_material(self):
         certificate = b"-----BEGIN CERTIFICATE-----\npublic\n-----END CERTIFICATE-----\n"

@@ -56,6 +56,7 @@ services:
 
   span-proxy:
     profiles: [spans]
+    restart: "on-failure:5"
     user: "0:0"
     build:
       context: ${DEVC2_INSTALL_DIR:?set DEVC2_INSTALL_DIR}

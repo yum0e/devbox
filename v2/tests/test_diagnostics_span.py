@@ -67,6 +67,9 @@ class DiagnosticsWorldTests(unittest.TestCase):
             self.assertEqual(ssh["last_error"], "ConnectionRefusedError")
             self.assertEqual(ssh["world_status"], "starting")
             self.assertIsNone(ssh["world_exit"])
+            self.assertEqual(ssh["recovery_state"], "healthy")
+            self.assertEqual(ssh["recoveries"], 0)
+            self.assertEqual(ssh["recovery_failures"], 0)
             self.assertEqual((root / "state.json").stat().st_mode & 0o777, 0o600)
 
     def test_world_serves_report_and_rejects_extra_authority(self):
@@ -108,6 +111,23 @@ class DiagnosticsWorldTests(unittest.TestCase):
             state.update("ssh-agent", last_stage="stream relay")
             state.finished("ssh-agent", "stream relay", None)
             self.assertEqual(state.links["ssh-agent"]["completed"], 1)
+
+    def test_recovery_state_is_bounded_and_contains_no_error_details(self):
+        with tempfile.TemporaryDirectory() as raw:
+            state = span_runtime.DiagnosticsState(Path(raw) / "state.json", ["openai"])
+            state.recovery_started("openai")
+            state.recovery_failed("openai")
+            state.recovery_started("openai")
+            state.recovery_succeeded("openai")
+            link = state.links["openai"]
+            self.assertEqual(link["recovery_state"], "healthy")
+            self.assertEqual(link["recoveries"], 1)
+            self.assertEqual(link["recovery_failures"], 1)
+            self.assertEqual(set(link), {
+                "startup", "world_status", "world_exit", "accepted", "active",
+                "completed", "failed", "rejected", "last_stage", "last_result",
+                "last_error", "recovery_state", "recoveries", "recovery_failures",
+            })
 
     def test_runtime_records_a_world_that_exits_after_structural_startup(self):
         with tempfile.TemporaryDirectory() as raw:

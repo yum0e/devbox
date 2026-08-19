@@ -110,7 +110,7 @@ class GitHubPolicyTests(unittest.TestCase):
             proxy = W.Proxy(root, "a" * 64, 1111, certificate)
             manager.proxy = proxy
 
-            def docker(arguments, timeout=120):
+            def docker(arguments, timeout=120, stopping=None):
                 if arguments[:3] == ["run", "--pull", "never"]:
                     return subprocess.CompletedProcess(arguments, 0, "b" * 64 + "\n", "")
                 if arguments[:2] == ["port", "b" * 64]:
