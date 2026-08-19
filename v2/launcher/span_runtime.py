@@ -421,11 +421,14 @@ class OpaqueRelay:
         try:
             enable_tcp_keepalive(raw)
             raw.settimeout(5)
-            with self.context.wrap_socket(raw, server_side=True) as incoming:
+            with self.context.wrap_socket(
+                raw,server_side=True,do_handshake_on_connect=False,
+            ) as incoming:
                 tracked = incoming
                 with self.connections_lock:
                     self.connections.discard(raw)
                     self.connections.add(incoming)
+                incoming.do_handshake()
                 incoming.settimeout(None)
                 stage = "World connection"
                 if self.diagnostics is not None:

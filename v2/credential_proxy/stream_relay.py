@@ -1,6 +1,7 @@
 """Bounded single-owner duplex relay for plain and TLS sockets."""
 from __future__ import annotations
 
+import math
 import selectors
 import socket
 import ssl
@@ -14,14 +15,22 @@ MAX_PENDING = 256 * 1024
 KEEPALIVE_IDLE_SECONDS = 30
 KEEPALIVE_INTERVAL_SECONDS = 10
 KEEPALIVE_PROBES = 3
+RESUME_GAP_SECONDS = 15
 
 
-def suspend_clock() -> float:
-    """Elapsed time including Linux suspend; wall time is only a portability fallback."""
+def transport_clocks() -> tuple[float, float]:
+    """Return VM boot time and wall time so either can reveal host suspension."""
     clock = getattr(time, "CLOCK_BOOTTIME", None)
-    if clock is not None:
-        return time.clock_gettime(clock)
-    return time.time()
+    boot = time.clock_gettime(clock) if clock is not None else time.monotonic()
+    return boot, time.time()
+
+
+def transport_gap(previous: tuple[float, float], current: tuple[float, float]) -> float:
+    """Measure forward elapsed time despite VM pause or wall-clock correction."""
+    deltas = current[0] - previous[0], current[1] - previous[1]
+    if any(not math.isfinite(delta) or delta < 0 for delta in deltas):
+        return math.inf
+    return max(deltas)
 
 
 def enable_tcp_keepalive(connection: socket.socket) -> None:
@@ -61,6 +70,7 @@ def duplex_stream(
     write_closed = {left: False, right: False}
     receive_wants_write = {left: False, right: False}
     send_wants_read = {left: False, right: False}
+    observed_clocks = transport_clocks()
 
     def retire(connection: socket.socket) -> None:
         # A receive reset closes the endpoint. Preserve bytes already queued
@@ -169,6 +179,10 @@ def duplex_stream(
             if not any(readable.values()) and not any(pending.values()):
                 return
             ready = list(selector.select(0.5))
+            current_clocks = transport_clocks()
+            if transport_gap(observed_clocks,current_clocks) > RESUME_GAP_SECONDS:
+                return
+            observed_clocks = current_clocks
             for connection in (left, right):
                 if (isinstance(connection, ssl.SSLSocket)
                         and readable[connection] and connection.pending()):

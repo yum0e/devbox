@@ -21,10 +21,8 @@ READY_TOKEN = re.compile(r"^[a-f0-9]{32}$")
 # stays comfortably below Compose's pids_limit of 64.
 MAX_CONNECTIONS = 16
 MAX_SPANS = 16
-RESUME_GAP_SECONDS = 15
-
 from .http_projection import HttpProjection, load_routes
-from .stream_relay import duplex_stream, enable_tcp_keepalive, suspend_clock
+from .stream_relay import RESUME_GAP_SECONDS, duplex_stream, enable_tcp_keepalive, transport_clocks, transport_gap
 
 
 class Bridge:
@@ -36,9 +34,10 @@ class Bridge:
         self.slots = slots or threading.BoundedSemaphore(MAX_CONNECTIONS)
         self.connections: set[socket.socket] = set()
         self.connections_lock = threading.Lock()
+        self.resume_epoch = 0
         self.reported_failures: set[tuple[str, str]] = set()
         self.failure_lock = threading.Lock()
-        self.last_observed_time = suspend_clock()
+        self.last_observed_time = transport_clocks()
         try:
             metadata = self.path.lstat()
         except FileNotFoundError:
@@ -79,13 +78,15 @@ class Bridge:
                     client, _address = self.server.accept()
                 except socket.timeout:
                     pass
-                self._retire_after_resume(suspend_clock())
+                self._retire_after_resume(transport_clocks())
                 if client is None:
                     continue
                 if not self.slots.acquire(blocking=False):
                     client.close()
                     continue
-                thread = threading.Thread(target=self._connection, args=(client,), daemon=True)
+                with self.connections_lock:
+                    epoch=self.resume_epoch
+                thread = threading.Thread(target=self._connection, args=(client,epoch), daemon=True)
                 try:
                     thread.start()
                 except RuntimeError:
@@ -100,16 +101,19 @@ class Bridge:
                 self.failed.set()
                 self.stopping.set()
 
-    def _retire_after_resume(self, observed_time: float) -> bool:
-        gap = observed_time - self.last_observed_time
+    def _retire_after_resume(self, observed_time: tuple[float, float]) -> bool:
+        gap = transport_gap(self.last_observed_time, observed_time)
         self.last_observed_time = observed_time
         if gap <= RESUME_GAP_SECONDS:
             return False
-        self._retire_connections()
+        retired=self._retire_connections()
+        if retired:
+            print(f"span-bridge: Span {self.name!r} retired pre-resume transport",flush=True)
         return True
 
-    def _retire_connections(self) -> None:
+    def _retire_connections(self) -> int:
         with self.connections_lock:
+            self.resume_epoch += 1
             connections = tuple(self.connections)
         for connection in connections:
             try:
@@ -120,32 +124,49 @@ class Bridge:
                 connection.close()
             except OSError:
                 pass
+        return len(connections)
 
-    def _connection(self, client: socket.socket) -> None:
+    def _remember(self, connection: socket.socket, epoch: int, previous: socket.socket | None = None) -> bool:
+        with self.connections_lock:
+            if previous is not None:
+                self.connections.discard(previous)
+            current=epoch==self.resume_epoch
+            if current:
+                self.connections.add(connection)
+        if not current:
+            connection.close()
+        return current
+
+    def _connection(self, client: socket.socket, epoch: int | None = None) -> None:
         tracked: list[socket.socket] = [client]
         stage = "host connection"
-        with self.connections_lock:
-            self.connections.add(client)
+        if epoch is None:
+            with self.connections_lock: epoch=self.resume_epoch
+        if not self._remember(client,epoch):
+            self.slots.release()
+            return
         try:
             with client:
                 try:
                     with socket.create_connection((self.host, self.port), timeout=10) as raw:
                         tracked.append(raw)
-                        with self.connections_lock:
-                            self.connections.add(raw)
+                        if not self._remember(raw,epoch): return
                         enable_tcp_keepalive(raw)
                         stage = "TLS handshake"
-                        with self.context.wrap_socket(raw, server_hostname=self.host) as remote:
+                        with self.context.wrap_socket(
+                            raw,server_hostname=self.host,do_handshake_on_connect=False,
+                        ) as remote:
                             tracked.append(remote)
-                            with self.connections_lock:
-                                self.connections.discard(raw)
-                                self.connections.add(remote)
+                            if not self._remember(remote,epoch,raw): return
+                            remote.do_handshake()
                             client.settimeout(None)
                             remote.settimeout(None)
                             stage = "stream relay"
                             duplex_stream(client, remote, self.stopping)
                 except (OSError, ssl.SSLError, RuntimeError) as error:
-                    if not self.stopping.is_set():
+                    with self.connections_lock:
+                        retired=epoch!=self.resume_epoch
+                    if not self.stopping.is_set() and not retired:
                         self._report_failure(stage, error)
                     return
         finally:

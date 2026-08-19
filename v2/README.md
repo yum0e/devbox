@@ -167,9 +167,11 @@ to Linux. The transport therefore uses a per-launch mutually authenticated TLS
 hop. Its keys enter only the protocol-blind bridge sidecar, never the Island.
 The bridge owns the socket directory; Island processes may connect to granted
 endpoints but cannot replace them. The World process and transport stop when
-the Island exits. The bridge retires existing streams after a suspend-sized
-clock gap so a resumed agent opens a fresh connection instead of reusing a
-half-open tunnel; TCP keepalive provides an additional failure detector.
+the Island exits. The bridge compares VM boot time with wall time and retires
+existing streams after a suspend-sized gap. Relays check that discontinuity
+before forwarding the first post-resume bytes, so a resumed agent opens a fresh
+connection instead of reusing a half-open tunnel; TCP keepalive provides an
+additional failure detector.
 Different Islands receive different World processes,
 instance IDs, endpoints, and transport credentials.
 

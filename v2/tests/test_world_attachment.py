@@ -240,6 +240,22 @@ class HttpProjectionTests(unittest.TestCase):
             )
             direct.assert_not_called()
 
+    def test_http_projection_retires_pre_resume_tunnels_on_a_wall_clock_gap(self):
+        with tempfile.TemporaryDirectory() as raw:
+            projection=self.projection({},Path(raw))
+            projection.last_observed_time=(100,1000)
+            proxy,client=socket.socketpair()
+            projection._remember(proxy)
+            try:
+                with mock.patch("builtins.print") as output:
+                    self.assertTrue(projection._retire_after_resume((101,1020)))
+                output.assert_called_once_with(
+                    "span-bridge: HTTP projection retired pre-resume transport",flush=True,
+                )
+                client.settimeout(1); self.assertEqual(client.recv(1),b"")
+            finally:
+                projection._retire_connections(); proxy.close(); client.close()
+
     def test_undeclared_route_uses_direct_fallback_without_forwarding_connect_headers(self):
         with tempfile.TemporaryDirectory() as raw:
             projection = self.projection({}, Path(raw))

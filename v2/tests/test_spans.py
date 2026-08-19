@@ -585,24 +585,48 @@ class ProviderLifecycleTests(unittest.TestCase):
 
 
 class BridgeConfigTests(unittest.TestCase):
+    def test_transport_gap_detects_host_sleep_even_when_vm_boot_clock_pauses(self):
+        self.assertEqual(stream_relay.transport_gap((100,1000),(101,1020)),20)
+        self.assertEqual(stream_relay.transport_gap((100,1000),(120,1001)),20)
+        self.assertEqual(stream_relay.transport_gap((100,1000),(101,900)),float("inf"))
+        self.assertEqual(stream_relay.transport_gap((100,1000),(101,float("nan"))),float("inf"))
+
+    def test_duplex_relay_drops_first_post_resume_bytes_before_forwarding(self):
+        island,relay_left=socket.socketpair(); relay_right,world=socket.socketpair()
+        try:
+            island.sendall(b"must not be replayed")
+            with mock.patch.object(
+                stream_relay,"transport_clocks",side_effect=[(100,1000),(101,1020)],
+            ):
+                stream_relay.duplex_stream(relay_left,relay_right,threading.Event())
+            world.setblocking(False)
+            with self.assertRaises(BlockingIOError): world.recv(1)
+        finally:
+            for connection in (island,relay_left,relay_right,world): connection.close()
+
     def test_bridge_retires_existing_streams_after_a_suspend_gap(self):
         with tempfile.TemporaryDirectory() as raw:
             bridge = span_bridge.Bridge("openai", 1, Path(raw), "127.0.0.1", mock.Mock())
-            bridge.last_observed_time = 100
+            bridge.last_observed_time = (100,1000)
             bridge_side, island_side = socket.socketpair()
             with bridge.connections_lock:
                 bridge.connections.add(bridge_side)
             try:
                 self.assertFalse(
-                    bridge._retire_after_resume(100 + span_bridge.RESUME_GAP_SECONDS)
+                    bridge._retire_after_resume((100 + span_bridge.RESUME_GAP_SECONDS,1001))
                 )
                 island_side.sendall(b"still connected")
                 self.assertEqual(bridge_side.recv(15), b"still connected")
 
-                self.assertTrue(
-                    bridge._retire_after_resume(
-                        100 + 2 * span_bridge.RESUME_GAP_SECONDS + 1
+                with mock.patch("builtins.print") as output:
+                    self.assertTrue(
+                        bridge._retire_after_resume((
+                            100 + span_bridge.RESUME_GAP_SECONDS,
+                            1000 + 2 * span_bridge.RESUME_GAP_SECONDS + 1,
+                        ))
                     )
+                output.assert_called_once_with(
+                    "span-bridge: Span 'openai' retired pre-resume transport",flush=True,
                 )
                 island_side.settimeout(1)
                 self.assertEqual(island_side.recv(1), b"")
@@ -618,9 +642,8 @@ class BridgeConfigTests(unittest.TestCase):
             bridge_side, island_side = socket.socketpair()
             with bridge.connections_lock:
                 bridge.connections.add(bridge_side)
-            bridge.last_observed_time = (
-                span_bridge.suspend_clock() - span_bridge.RESUME_GAP_SECONDS - 1
-            )
+            observed=span_bridge.transport_clocks()
+            bridge.last_observed_time=(observed[0],observed[1]-span_bridge.RESUME_GAP_SECONDS-1)
             bridge.start()
             try:
                 island_side.settimeout(2)
@@ -637,18 +660,24 @@ class BridgeConfigTests(unittest.TestCase):
             raw_connection = mock.MagicMock(spec=socket.socket)
             raw_context = mock.MagicMock()
             raw_context.__enter__.return_value = raw_connection
-            remote = mock.MagicMock(spec=socket.socket)
+            remote = mock.MagicMock(spec=ssl.SSLSocket)
             remote_context = mock.MagicMock()
             remote_context.__enter__.return_value = remote
 
-            def wrap_socket(connection, server_hostname):
+            def wrap_socket(connection, server_hostname, do_handshake_on_connect):
                 self.assertIs(connection, raw_connection)
                 self.assertEqual(server_hostname, "127.0.0.1")
+                self.assertFalse(do_handshake_on_connect)
                 with bridge.connections_lock:
                     self.assertIn(raw_connection, bridge.connections)
                 return remote_context
 
+            def handshake():
+                with bridge.connections_lock:
+                    self.assertIn(remote,bridge.connections)
+
             bridge.context.wrap_socket.side_effect = wrap_socket
+            remote.do_handshake.side_effect=handshake
             self.assertTrue(bridge.slots.acquire(blocking=False))
             try:
                 with mock.patch.object(
@@ -660,9 +689,35 @@ class BridgeConfigTests(unittest.TestCase):
                 ) as keepalive, mock.patch.object(span_bridge, "duplex_stream"):
                     bridge._connection(client)
                 keepalive.assert_called_once_with(raw_connection)
+                remote.do_handshake.assert_called_once_with()
             finally:
                 bridge.server.close()
                 bridge.path.unlink(missing_ok=True)
+
+    def test_resume_retirement_can_interrupt_an_in_progress_tls_handshake(self):
+        with tempfile.TemporaryDirectory() as raw:
+            bridge=span_bridge.Bridge("openai",1,Path(raw),"127.0.0.1",mock.Mock())
+            client=mock.MagicMock(spec=socket.socket); raw_connection=mock.MagicMock(spec=socket.socket)
+            raw_context=mock.MagicMock(); raw_context.__enter__.return_value=raw_connection
+            remote=mock.MagicMock(spec=ssl.SSLSocket); remote_context=mock.MagicMock(); remote_context.__enter__.return_value=remote
+            bridge.context.wrap_socket.return_value=remote_context
+            def interrupted():
+                self.assertGreaterEqual(bridge._retire_connections(),1)
+                raise ssl.SSLError("retired")
+            remote.do_handshake.side_effect=interrupted
+            self.assertTrue(bridge.slots.acquire(blocking=False))
+            try:
+                with mock.patch.object(span_bridge.socket,"create_connection",return_value=raw_context), \
+                     mock.patch.object(span_bridge,"duplex_stream") as relay, \
+                     mock.patch.object(bridge,"_report_failure") as failure:
+                    bridge._connection(client)
+                remote.close.assert_called()
+                relay.assert_not_called()
+                failure.assert_not_called()
+                self.assertTrue(bridge.slots.acquire(blocking=False))
+            finally:
+                bridge.slots.release()
+                bridge.server.close(); bridge.path.unlink(missing_ok=True)
 
     def test_tcp_keepalive_is_enabled_for_relay_connections(self):
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

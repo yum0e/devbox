@@ -7,13 +7,12 @@ import re
 import socket
 import threading
 
-from .stream_relay import duplex_stream, enable_tcp_keepalive, suspend_clock
+from .stream_relay import RESUME_GAP_SECONDS, duplex_stream, enable_tcp_keepalive, transport_clocks, transport_gap
 
 
 MAX_CONFIG = 64 * 1024
 MAX_HEADERS = 16 * 1024
 MAX_CONNECTIONS = 16
-RESUME_GAP_SECONDS = 15
 NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
@@ -73,7 +72,7 @@ class HttpProjection:
         self.lock = threading.Lock()
         self.connections: set[socket.socket] = set()
         self.threads: set[threading.Thread] = set()
-        self.last_observed_time = suspend_clock()
+        self.last_observed_time = transport_clocks()
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server.bind(("0.0.0.0", port))
@@ -84,16 +83,7 @@ class HttpProjection:
     def start(self) -> None:
         self.thread.start()
 
-    def _remember(self, *connections: socket.socket) -> None:
-        with self.lock:
-            self.connections.update(connections)
-
-    def _forget(self, *connections: socket.socket) -> None:
-        with self.lock:
-            for connection in connections:
-                self.connections.discard(connection)
-
-    def _retire_connections(self) -> None:
+    def _retire_connections(self) -> int:
         with self.lock:
             connections = tuple(self.connections)
         for connection in connections:
@@ -105,13 +95,25 @@ class HttpProjection:
                 connection.close()
             except OSError:
                 pass
+        return len(connections)
 
-    def _retire_after_resume(self, observed_time: float) -> bool:
-        gap = observed_time - self.last_observed_time
+    def _remember(self, *connections: socket.socket) -> None:
+        with self.lock:
+            self.connections.update(connections)
+
+    def _forget(self, *connections: socket.socket) -> None:
+        with self.lock:
+            for connection in connections:
+                self.connections.discard(connection)
+
+    def _retire_after_resume(self, observed_time: tuple[float, float]) -> bool:
+        gap = transport_gap(self.last_observed_time, observed_time)
         self.last_observed_time = observed_time
         if gap <= RESUME_GAP_SECONDS:
             return False
-        self._retire_connections()
+        retired=self._retire_connections()
+        if retired:
+            print("span-bridge: HTTP projection retired pre-resume transport",flush=True)
         return True
 
     def _serve(self) -> None:
@@ -122,7 +124,7 @@ class HttpProjection:
                     client, _address = self.server.accept()
                 except socket.timeout:
                     pass
-                self._retire_after_resume(suspend_clock())
+                self._retire_after_resume(transport_clocks())
                 if client is None:
                     continue
                 if not self.slots.acquire(blocking=False):
