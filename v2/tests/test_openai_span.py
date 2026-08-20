@@ -45,6 +45,16 @@ def receive(connection: socket.socket, size: int) -> bytes:
 
 
 class WorldTests(unittest.TestCase):
+    def test_http_world_capacity_matches_transport_limit(self):
+        self.assertEqual(P.MAX_HANDLERS, 256)
+
+    def test_http_world_waits_for_handler_capacity_instead_of_resetting(self):
+        slots = mock.Mock()
+        slots.acquire.side_effect = [False, False, True]
+        self.assertTrue(P.wait_for_handler_slot(slots, threading.Event()))
+        self.assertEqual(slots.acquire.call_count, 3)
+        slots.acquire.assert_called_with(timeout=0.5)
+
     def test_stale_private_roots_are_removed_only_when_safe(self):
         with tempfile.TemporaryDirectory() as raw:
             temporary = Path(raw)

@@ -22,7 +22,8 @@ NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 MAX_CATALOG_BYTES = 64 * 1024
 MAX_CLIENT_BYTES = 64 * 1024 * 1024
 MAX_PROVIDER_BYTES = 64 * 1024 * 1024
-MAX_CONNECTIONS = 64
+MAX_CONNECTIONS = 256
+LISTEN_BACKLOG = 1024
 MAX_SPANS = 16
 WORLD_CONNECT_BACKOFF = (0.1, 0.5)
 HTTP_ATTACHMENT_BUILTINS = {"github", "openai"}
@@ -175,7 +176,7 @@ class Provider:
         self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.listener.bind(("127.0.0.1", 0))
-        self.listener.listen(64)
+        self.listener.listen(LISTEN_BACKLOG)
         self._address = self.listener.getsockname()
         lifetime_read, self.lifetime_write = os.pipe()
         self.started_read, started_write = os.pipe()
@@ -422,7 +423,7 @@ class OpaqueRelay:
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server.bind(("0.0.0.0", 0))
-        self.server.listen(64)
+        self.server.listen(LISTEN_BACKLOG)
         self.server.settimeout(0.5)
         self.stopping = threading.Event()
         self.connections: set[socket.socket] = set()
@@ -445,9 +446,10 @@ class OpaqueRelay:
                 if self.stopping.is_set():
                     return
                 raise
-            if not self.slots.acquire(blocking=False):
-                if self.diagnostics is not None:
-                    self.diagnostics.rejected(self.name)
+            while not self.stopping.is_set():
+                if self.slots.acquire(timeout=0.5):
+                    break
+            else:
                 connection.close()
                 continue
             if self.diagnostics is not None:

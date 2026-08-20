@@ -132,10 +132,10 @@ without modifying shell startup files.
 Installing a World is not a grant. `devc2` launches no World or Span
 transport unless its name appears in `--span`.
 An Island may grant at most 16 Spans; excess grants are rejected. The HTTP
-projection and Span relay each admit up to 256 concurrent
-connections, with a 1,024-connection listen backlog for bursts. A saturated
-worker layer stops accepting until capacity returns, so queued clients receive
-backpressure instead of an immediate connection reset.
+projection, Span relay, and HTTP World handler layers each admit up to 256
+concurrent connections, with a 1,024-connection listen backlog for bursts. A
+saturated worker layer stops accepting until capacity returns, so queued clients
+receive backpressure instead of an immediate connection reset.
 
 First-party Spans are immutable release assets outside the Island
 image and cannot be shadowed by configuration. Additional Spans are made

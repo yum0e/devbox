@@ -860,6 +860,8 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(span_bridge.LISTEN_BACKLOG, 1024)
         self.assertEqual(http_projection.MAX_CONNECTIONS, 256)
         self.assertEqual(http_projection.LISTEN_BACKLOG, 1024)
+        self.assertEqual(span_runtime.MAX_CONNECTIONS, 256)
+        self.assertEqual(span_runtime.LISTEN_BACKLOG, 1024)
         span_slots, http_slots = span_bridge.worker_budgets()
         self.assertIsNot(span_slots, http_slots)
         for _connection in range(256):
