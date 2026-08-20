@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -301,9 +302,10 @@ class WorldTests(unittest.TestCase):
         first = P.ProxyManager()
         second = P.ProxyManager()
         first.proxy = P.Proxy(Path("/unused"), "a" * 64, 1234, certificate)
-        with mock.patch.object(first, "_state", return_value="running"):
+        with mock.patch.object(first, "_state") as state:
             one = first.bootstrap()
             two = first.bootstrap()
+        state.assert_not_called()
         self.assertIs(one, two)
         self.assertEqual(one, two)
         self.assertNotEqual(first.fake_account, second.fake_account)
@@ -313,6 +315,16 @@ class WorldTests(unittest.TestCase):
         auth = json.loads(base64.b64decode(document["files"][0]["contents_b64"]))
         self.assertEqual(auth["tokens"]["account_id"], first.fake_account)
         self.assertEqual(auth["tokens"]["access_token"], first.fake_access)
+
+    def test_cached_helper_avoids_docker_inspection_under_parallel_load(self):
+        manager = P.ProxyManager()
+        proxy = P.Proxy(Path("/unused"), "a" * 64, 1234, b"certificate")
+        manager.proxy = proxy
+        with mock.patch.object(manager, "_state") as state, \
+             ThreadPoolExecutor(max_workers=128) as workers:
+            resolved = list(workers.map(lambda _index: manager.get(), range(128)))
+        self.assertTrue(all(candidate is proxy for candidate in resolved))
+        state.assert_not_called()
 
     def test_exited_helper_restarts_with_refreshed_auth_and_same_identity(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -335,14 +347,14 @@ class WorldTests(unittest.TestCase):
                     return subprocess.CompletedProcess(arguments, 0, "127.0.0.1:43210\n", "")
                 raise AssertionError(arguments)
 
-            with mock.patch.object(manager, "_state", side_effect=["running", "exited"]), \
+            with mock.patch.object(manager, "_state", return_value="exited"), \
                  mock.patch.object(P, "remove_container", return_value=True), \
                  mock.patch.object(P, "read_auth", return_value=("new-access", "new-account")), \
                  mock.patch.object(P, "run_docker", side_effect=docker), \
                  mock.patch.object(P.socket, "create_connection", return_value=mock.MagicMock()), \
                  mock.patch.dict(P.os.environ, {"DEVC2_WORKSPACE": "/workspace"}, clear=True):
                 manifest = manager.bootstrap()
-                restarted = manager.get()
+                restarted = manager.recover(proxy, proxy.container)
 
             self.assertIs(restarted, proxy)
             self.assertEqual(restarted.container, "b" * 64)
@@ -350,8 +362,7 @@ class WorldTests(unittest.TestCase):
             self.assertEqual(restarted.certificate, b"certificate")
             self.assertEqual((root / "access-token").read_text(), "new-access")
             self.assertEqual((root / "account-id").read_text(), "new-account")
-            with mock.patch.object(manager, "_state", return_value="running"):
-                self.assertEqual(manager.bootstrap(), manifest)
+            self.assertEqual(manager.bootstrap(), manifest)
             self.assertEqual(
                 json.loads((root / "proxy.yaml").read_text())["transforms"][0]["config"]["secrets"][0]["replace"]["proxy_value"],
                 manager.fake_access,
@@ -366,35 +377,38 @@ class WorldTests(unittest.TestCase):
         failed = subprocess.CompletedProcess([], 1, "", "daemon unavailable")
         with mock.patch.object(P, "run_docker", side_effect=[failed, failed]), \
              self.assertRaisesRegex(P.ProviderError, "verify"):
-            manager.get()
+            manager.recover(manager.proxy, manager.proxy.container)
 
         with mock.patch.object(manager, "_state", return_value="exited"), \
              mock.patch.object(P, "remove_container", return_value=False), \
              mock.patch.object(manager, "_launch") as launch, \
              self.assertRaisesRegex(P.ProviderError, "cleanup"):
-            manager.get()
+            manager.recover(manager.proxy, manager.proxy.container)
         launch.assert_not_called()
 
-    def test_running_but_unreachable_helper_is_recycled_once(self):
+    def test_running_helper_is_not_recycled_after_transient_connect_failure(self):
         manager = P.ProxyManager()
         proxy = P.Proxy(Path("/private"), "a" * 64, 1111, b"certificate")
         manager.proxy = proxy
-        with mock.patch.object(P, "remove_container", return_value=True) as remove, \
+        with mock.patch.object(manager, "_state", return_value="running") as state, \
+             mock.patch.object(P, "remove_container", return_value=True) as remove, \
              mock.patch.object(manager, "_launch", return_value=("b" * 64, 2222)) as launch, \
              mock.patch.object(manager, "workspace_tag", return_value="tag"), \
              mock.patch.object(P, "recovery_event") as event:
             self.assertIs(manager.recover(proxy, "a" * 64), proxy)
             self.assertIs(manager.recover(proxy, "a" * 64), proxy)
-        remove.assert_called_once_with("a" * 64)
-        launch.assert_called_once_with(Path("/private"), "tag")
-        self.assertEqual((proxy.container, proxy.port), ("b" * 64, 2222))
-        self.assertEqual([call.args[0] for call in event.call_args_list], [b"S", b"R"])
+        self.assertEqual(state.call_count, 2)
+        remove.assert_not_called()
+        launch.assert_not_called()
+        event.assert_not_called()
+        self.assertEqual((proxy.container, proxy.port), ("a" * 64, 1111))
 
     def test_recovery_fails_closed_and_has_a_bounded_cooldown(self):
         manager = P.ProxyManager()
         proxy = P.Proxy(Path("/private"), "a" * 64, 1111, b"certificate")
         manager.proxy = proxy
-        with mock.patch.object(P.time, "monotonic", return_value=10.0), \
+        with mock.patch.object(manager, "_state", return_value="exited"), \
+             mock.patch.object(P.time, "monotonic", return_value=10.0), \
              mock.patch.object(P, "remove_container", return_value=False), \
              mock.patch.object(manager, "_launch") as launch, \
              mock.patch.object(P, "recovery_event") as event, \
@@ -407,7 +421,7 @@ class WorldTests(unittest.TestCase):
              mock.patch.object(P.time, "monotonic", return_value=11.0), \
              mock.patch.object(P, "remove_container") as remove, \
              self.assertRaisesRegex(P.ProviderError, "cooling down"):
-            manager.get()
+            manager.recover(proxy, proxy.container)
         remove.assert_not_called()
 
     def test_stopping_manager_cannot_resurrect_a_helper(self):
@@ -433,7 +447,8 @@ class WorldTests(unittest.TestCase):
             manager.stopping.set()
             return replacement, 2222
 
-        with mock.patch.object(P, "remove_container", return_value=True) as remove, \
+        with mock.patch.object(manager, "_state", return_value="exited"), \
+             mock.patch.object(P, "remove_container", return_value=True) as remove, \
              mock.patch.object(manager, "_launch", side_effect=launch), \
              mock.patch.object(manager, "workspace_tag", return_value="tag"), \
              self.assertRaisesRegex(P.ProviderError, "stopping"):

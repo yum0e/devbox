@@ -117,20 +117,19 @@ class GitHubPolicyTests(unittest.TestCase):
                     return subprocess.CompletedProcess(arguments, 0, "127.0.0.1:43210\n", "")
                 raise AssertionError(arguments)
 
-            with mock.patch.object(manager, "_state", side_effect=["running", "exited"]), \
+            with mock.patch.object(manager, "_state", return_value="exited"), \
                  mock.patch.object(W, "remove_container", return_value=True), \
                  mock.patch.object(W, "read_github_auth", return_value=("new-token", "")), \
                  mock.patch.object(W, "run_docker", side_effect=docker), \
                  mock.patch.object(W.socket, "create_connection", return_value=mock.MagicMock()), \
                  mock.patch.dict(W.os.environ, {"DEVC2_WORKSPACE": "/workspace"}, clear=True):
                 manifest = manager.bootstrap()
-                restarted = manager.get()
+                restarted = manager.recover(proxy, proxy.container)
 
             self.assertIs(restarted, proxy)
             self.assertEqual((root / "github-token").read_text(), "new-token")
             self.assertNotIn("new-token", (root / "proxy.yaml").read_text())
-            with mock.patch.object(manager, "_state", return_value="running"):
-                self.assertIs(manager.bootstrap(), manifest)
+            self.assertIs(manager.bootstrap(), manifest)
 
     def test_single_executable_source_contract(self):
         self.assertTrue(WORLD.stat().st_mode & stat.S_IXUSR)
