@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
-ARG TACT_VERSION=0.6.1
-FROM ghcr.io/clabby/tact:${TACT_VERSION}@sha256:f832481864ecf41574333dc848f1ad65ac8ab98d4b5a832cbeb254ecd2cb5428 AS tact
+ARG TACT_VERSION=0.6.3
+FROM ghcr.io/clabby/tact:${TACT_VERSION}@sha256:ac02066f6c839c0741d894e02417609ac72f27b9729f1d3de736dfb4ed54fcf7 AS tact
 FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS island
 
 RUN apt-get update \

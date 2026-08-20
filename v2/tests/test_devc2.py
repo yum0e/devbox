@@ -402,7 +402,12 @@ class CliTests(unittest.TestCase):
         dockerfile = (PATH.parents[1] / "Dockerfile").read_text()
         proxy_dockerfile = (PATH.parents[1] / "credential_proxy" / "Dockerfile").read_text()
         self.assertIn("docker/dockerfile:1.7@sha256:", dockerfile)
-        self.assertIn("ghcr.io/clabby/tact:${TACT_VERSION}@sha256:", dockerfile)
+        self.assertIn("ARG TACT_VERSION=0.6.3", dockerfile)
+        self.assertIn(
+            "ghcr.io/clabby/tact:${TACT_VERSION}@sha256:"
+            "ac02066f6c839c0741d894e02417609ac72f27b9729f1d3de736dfb4ed54fcf7",
+            dockerfile,
+        )
         self.assertIn("ghcr.io/astral-sh/uv:0.9.26@sha256:", dockerfile)
         self.assertIn("python:3.12-alpine@sha256:", proxy_dockerfile)
         self.assertNotIn("COPY credential_proxy /app/credential_proxy", proxy_dockerfile)

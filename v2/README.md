@@ -336,8 +336,9 @@ The opt-in test uses unique temporary image tags and removes only those tags.
 - ChatGPT subscription and GitHub account for their respective optional Spans
 - An SSH agent, such as 1Password, for the optional SSH-agent Span
 
-Tact and Pi are bundled coding agents. Herdr v0.8.0 is bundled as their
-in-Island orchestrator.
+Tact v0.6.3 and Pi are bundled coding agents. Tact reports its idle/working
+lifecycle and session identity directly to the bundled Herdr v0.8.0 agent panel;
+Herdr derives the current branch from the Git checkout assigned to the Space.
 
 The devbox includes the v1 general developer toolset: build tools, Git and
 GitHub CLI, Jujutsu, zsh, ripgrep, fd, zoxide, PostgreSQL 17 server and
