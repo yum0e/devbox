@@ -141,6 +141,9 @@ serialized Docker inspection. A transient local connect failure is retried
 without restarting that healthy helper and dropping its other tunnels.
 Each OpenAI or GitHub credential helper has 512 MiB, 2 CPUs, and a 512-PID
 ceiling so its resources match the 256-tunnel transport budget.
+The host launcher raises its inherited open-file soft limit toward 4,096 before
+starting Span processes, and relay listeners retry transient descriptor or
+socket-buffer exhaustion instead of permanently dropping their accept loop.
 
 First-party Spans are immutable release assets outside the Island
 image and cannot be shadowed by configuration. Additional Spans are made

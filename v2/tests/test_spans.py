@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import errno
 import json
 import contextlib
 import os
@@ -789,6 +790,33 @@ class BridgeConfigTests(unittest.TestCase):
         relay.diagnostics.recovery_succeeded.assert_not_called()
         relay.diagnostics.recovery_failed.assert_called_once_with("github")
 
+    def test_host_relay_retries_transient_accept_exhaustion(self):
+        relay = object.__new__(span_runtime.OpaqueRelay)
+        relay.stopping = threading.Event()
+        relay.server = mock.Mock()
+        attempts = 0
+
+        def accept():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OSError(errno.EMFILE, "open file limit")
+            relay.stopping.set()
+            raise socket.timeout()
+
+        relay.server.accept.side_effect = accept
+        relay._serve()
+        self.assertEqual(attempts, 2)
+
+    def test_runtime_raises_inherited_open_file_soft_limit(self):
+        with mock.patch.object(
+            span_runtime.resource, "getrlimit", return_value=(256, 8192),
+        ), mock.patch.object(span_runtime.resource, "setrlimit") as set_limit:
+            self.assertEqual(span_runtime.ensure_open_file_capacity(), 4096)
+        set_limit.assert_called_once_with(
+            span_runtime.resource.RLIMIT_NOFILE, (4096, 8192),
+        )
+
     def test_bridge_config_knows_only_names_and_ports(self):
         with tempfile.TemporaryDirectory() as raw:
             path = Path(raw) / "spans.json"
@@ -862,6 +890,7 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(http_projection.LISTEN_BACKLOG, 1024)
         self.assertEqual(span_runtime.MAX_CONNECTIONS, 256)
         self.assertEqual(span_runtime.LISTEN_BACKLOG, 1024)
+        self.assertEqual(span_runtime.MIN_OPEN_FILES, 4096)
         span_slots, http_slots = span_bridge.worker_budgets()
         self.assertIsNot(span_slots, http_slots)
         for _connection in range(256):

@@ -2,9 +2,11 @@
 """The small host half of the experimental devc2 Span contract."""
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
+import resource
 import shutil
 import select
 import socket
@@ -24,6 +26,7 @@ MAX_CLIENT_BYTES = 64 * 1024 * 1024
 MAX_PROVIDER_BYTES = 64 * 1024 * 1024
 MAX_CONNECTIONS = 256
 LISTEN_BACKLOG = 1024
+MIN_OPEN_FILES = 4096
 MAX_SPANS = 16
 WORLD_CONNECT_BACKOFF = (0.1, 0.5)
 HTTP_ATTACHMENT_BUILTINS = {"github", "openai"}
@@ -45,6 +48,15 @@ class Span:
 
 def valid_name(name: str) -> bool:
     return bool(NAME.fullmatch(name))
+
+
+def ensure_open_file_capacity() -> int:
+    """Raise the inherited soft descriptor limit for all Span processes."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    target = MIN_OPEN_FILES if hard == resource.RLIM_INFINITY else min(MIN_OPEN_FILES, hard)
+    if soft < target:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    return max(soft, target)
 
 
 def _inside(path: Path, root: Path | None) -> bool:
@@ -442,9 +454,12 @@ class OpaqueRelay:
                 connection, _address = self.server.accept()
             except socket.timeout:
                 continue
-            except OSError:
+            except OSError as error:
                 if self.stopping.is_set():
                     return
+                if error.errno in {errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM}:
+                    self.stopping.wait(0.05)
+                    continue
                 raise
             while not self.stopping.is_set():
                 if self.slots.acquire(timeout=0.5):
@@ -546,6 +561,7 @@ class OpaqueRelay:
 
 class SpanRuntime:
     def __init__(self, spans: list[Span], workspace: Path, instance_id: str, tls_directory: Path):
+        ensure_open_file_capacity()
         self.providers: list[Provider] = []
         self.relays: list[OpaqueRelay] = []
         self.ports: dict[str, int] = {}
