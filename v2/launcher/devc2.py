@@ -186,7 +186,7 @@ def source_version(source):
     return match.group(1)
 
 def validate_asset_tree(source,strict=False):
-    required=("Dockerfile","compose.yaml","devbox/entrypoint.sh","devbox/configure-pi.sh","devbox/configure-signing.sh","launcher/devc2.py","launcher/span_runtime.py","launcher/span_supervisor.py","launcher/dispatcher.py","launcher/command_projection.py","launcher/world_attachment.py","credential_proxy/span_bridge.py","credential_proxy/stream_relay.py","credential_proxy/http_projection.py","spans/http-credential-world","spans/ssh-agent/world","spans/diagnostics/world")
+    required=("Dockerfile","compose.yaml","devbox/entrypoint.sh","devbox/configure-pi.sh","devbox/configure-signing.sh","devbox/configure-herdr.sh","devbox/herdr-git-metadata","devbox/herdr-zsh-integration.zsh","launcher/devc2.py","launcher/span_runtime.py","launcher/span_supervisor.py","launcher/dispatcher.py","launcher/command_projection.py","launcher/world_attachment.py","credential_proxy/span_bridge.py","credential_proxy/stream_relay.py","credential_proxy/http_projection.py","spans/http-credential-world","spans/ssh-agent/world","spans/diagnostics/world")
     if not source.is_dir() or source.is_symlink(): raise RuntimeError("release asset root must be a directory")
     total=0; count=0; allowed={"Dockerfile","compose.yaml","README.md","install.sh","devbox","credential_proxy","launcher","spans"}
     for path in source.rglob("*"):
@@ -301,14 +301,14 @@ def copy_release_assets(source,destination):
     for path in destination.rglob("*"):
         if path.is_dir(): path.chmod(0o755)
         elif path.is_file(): path.chmod(0o644)
-    for relative in ("launcher/devc2.py","launcher/dispatcher.py","launcher/command_projection.py","devbox/entrypoint.sh","devbox/configure-pi.sh","devbox/configure-signing.sh","spans/http-credential-world","spans/ssh-agent/world","spans/diagnostics/world"):
+    for relative in ("launcher/devc2.py","launcher/dispatcher.py","launcher/command_projection.py","devbox/entrypoint.sh","devbox/configure-pi.sh","devbox/configure-signing.sh","devbox/configure-herdr.sh","devbox/herdr-git-metadata","spans/http-credential-world","spans/ssh-agent/world","spans/diagnostics/world"):
         (destination/relative).chmod(0o755)
 
 def freeze_asset_tree(destination):
     for path in destination.rglob("*"):
         if path.is_dir(): path.chmod(0o555)
         elif path.is_file(): path.chmod(0o444)
-    for relative in ("launcher/devc2.py","launcher/dispatcher.py","launcher/command_projection.py","devbox/entrypoint.sh","devbox/configure-pi.sh","devbox/configure-signing.sh","spans/http-credential-world","spans/ssh-agent/world","spans/diagnostics/world"):
+    for relative in ("launcher/devc2.py","launcher/dispatcher.py","launcher/command_projection.py","devbox/entrypoint.sh","devbox/configure-pi.sh","devbox/configure-signing.sh","devbox/configure-herdr.sh","devbox/herdr-git-metadata","spans/http-credential-world","spans/ssh-agent/world","spans/diagnostics/world"):
         (destination/relative).chmod(0o555)
     destination.chmod(0o555)
 

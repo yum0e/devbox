@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -u
+
+readonly pane_id="${1:?pane id is required}"
+readonly shell_pid="${2:?shell pid is required}"
+readonly pane_checkout="${3:?pane checkout is required}"
+readonly fallback_checkout="${4:-$pane_checkout}"
+readonly metadata_source="devc2:git"
+git_directory="$(git -C "$pane_checkout" rev-parse --absolute-git-dir 2>/dev/null || true)"
+if [[ -z "$git_directory" && "$fallback_checkout" != "$pane_checkout" ]]; then
+  git_directory="$(git -C "$fallback_checkout" rev-parse --absolute-git-dir 2>/dev/null || true)"
+fi
+last_branch="__devc2_unreported__"
+last_refresh=0
+
+clear_branch() {
+  herdr pane report-metadata "$pane_id" \
+    --source "$metadata_source" --clear-token branch >/dev/null 2>&1
+}
+
+cleanup() {
+  clear_branch || true
+}
+
+trap cleanup EXIT
+trap 'exit 0' HUP INT TERM
+
+while kill -0 "$shell_pid" 2>/dev/null; do
+  head=""
+  if [[ -n "$git_directory" && -r "$git_directory/HEAD" ]]; then
+    IFS= read -r head <"$git_directory/HEAD" || true
+  fi
+  if [[ "$head" == "ref: refs/heads/"* ]]; then
+    branch="${head#ref: refs/heads/}"
+  elif [[ "$head" == "ref: "* ]]; then
+    branch="${head#ref: }"
+  elif [[ "$head" =~ ^[0-9a-fA-F]{12,}$ ]]; then
+    branch="detached@${head:0:12}"
+  else
+    branch=""
+  fi
+  branch="${branch:0:80}"
+
+  if [[ "$branch" != "$last_branch" ]] || (( SECONDS - last_refresh >= 4 )); then
+    if [[ -n "$branch" ]]; then
+      if herdr pane report-metadata "$pane_id" \
+        --source "$metadata_source" --token "branch=$branch" \
+        --ttl-ms 10000 >/dev/null 2>&1; then
+        last_branch="$branch"
+        last_refresh=$SECONDS
+      fi
+    else
+      if clear_branch; then
+        last_branch=""
+        last_refresh=$SECONDS
+      fi
+    fi
+  fi
+  sleep 2
+done

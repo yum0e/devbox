@@ -339,6 +339,10 @@ The opt-in test uses unique temporary image tags and removes only those tags.
 Tact v0.6.3 and Pi are bundled coding agents. Tact reports its idle/working
 lifecycle and session identity directly to the bundled Herdr v0.8.0 agent panel;
 Herdr derives the current branch from the Git checkout assigned to the Space.
+In Herdr panes, devc2 also reports the mounted checkout's live branch beside
+the agent name in the Agent panel. Each pane follows its own checkout, including
+linked worktrees and worktrees opened through Herdr, with `/workspace` as the
+fallback for restored panes that start outside a checkout.
 
 The devbox includes the v1 general developer toolset: build tools, Git and
 GitHub CLI, Jujutsu, zsh, ripgrep, fd, zoxide, PostgreSQL 17 server and

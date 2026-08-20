@@ -129,11 +129,17 @@ RUN set -eux; \
 COPY devbox/entrypoint.sh /usr/local/bin/devc2-entrypoint
 COPY devbox/configure-pi.sh /usr/local/libexec/devc2/configure-pi
 COPY devbox/configure-signing.sh /usr/local/libexec/devc2/configure-signing
+COPY devbox/configure-herdr.sh /usr/local/libexec/devc2/configure-herdr
+COPY devbox/herdr-git-metadata /usr/local/libexec/devc2/herdr-git-metadata
+COPY devbox/herdr-zsh-integration.zsh /etc/zsh/zshrc.d/devc2-herdr-metadata.zsh
 COPY devbox/github-known-hosts /etc/ssh/ssh_known_hosts
 RUN chmod 0755 /usr/local/bin/devc2-entrypoint /usr/local/bin/tact \
       /usr/local/libexec/devc2/configure-pi \
       /usr/local/libexec/devc2/configure-signing \
+      /usr/local/libexec/devc2/configure-herdr \
+      /usr/local/libexec/devc2/herdr-git-metadata \
       /usr/local/share/pnpm/bin/pi \
+ && printf '\nsource /etc/zsh/zshrc.d/devc2-herdr-metadata.zsh\n' >>/etc/zsh/zshrc \
  && groupadd --gid 1000 devbox \
  && useradd --uid 1000 --gid devbox --create-home --shell /bin/zsh devbox \
  && mkdir -p /workspace /home/devbox/.cache /home/devbox/.local/share/tact \
@@ -142,8 +148,9 @@ RUN chmod 0755 /usr/local/bin/devc2-entrypoint /usr/local/bin/tact \
  && chmod 0777 /home/devbox
 
 # A fresh persistent home volume is initialized from the image. Seed Herdr so
-# its initial pane, new tabs, and splits open zsh by default without changing
-# existing homes that already contain user configuration.
+# its initial pane, new tabs, and splits open zsh by default. The entrypoint
+# upgrades the prior untouched default while preserving user-managed configs.
+COPY --chmod=0644 devbox/herdr-config.toml /usr/local/share/devc2-herdr-config.toml
 COPY --chown=devbox:devbox --chmod=0600 devbox/herdr-config.toml /home/devbox/.config/herdr/config.toml
 
 ENV HOME=/home/devbox \

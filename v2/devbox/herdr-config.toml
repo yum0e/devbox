@@ -1,2 +1,8 @@
 [terminal]
 default_shell = "/usr/bin/zsh"
+
+[ui.sidebar.agents]
+rows = [
+  ["state_icon", "workspace", "tab"],
+  ["agent", { token = "$branch", fg = "#a6e3a1", bold = true, dim = false }],
+]

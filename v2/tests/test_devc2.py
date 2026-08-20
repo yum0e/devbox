@@ -1,5 +1,5 @@
 from __future__ import annotations
-import base64, contextlib, errno, importlib.util, io, json, os, re, stat, subprocess, sys, tempfile, unittest
+import base64, contextlib, errno, importlib.util, io, json, os, re, stat, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -466,9 +466,12 @@ class CliTests(unittest.TestCase):
             self.assertIn(probe, entrypoint)
 
     def test_herdr_is_bundled_but_never_started_by_the_entrypoint(self):
+        root = PATH.parents[1]
         dockerfile = (PATH.parents[1] / "Dockerfile").read_text()
         entrypoint = (PATH.parents[1] / "devbox" / "entrypoint.sh").read_text()
         herdr_config = (PATH.parents[1] / "devbox" / "herdr-config.toml").read_text()
+        git_metadata = (root / "devbox" / "herdr-git-metadata").read_text()
+        zsh_integration = (root / "devbox" / "herdr-zsh-integration.zsh").read_text()
         self.assertIn("ARG HERDR_VERSION=0.8.0", dockerfile)
         self.assertIn('herdr_asset="herdr-linux-x86_64"', dockerfile)
         self.assertIn('herdr_asset="herdr-linux-aarch64"', dockerfile)
@@ -485,16 +488,166 @@ class CliTests(unittest.TestCase):
             "/home/devbox/.config/herdr/config.toml",
             dockerfile,
         )
-        self.assertEqual(
-            herdr_config,
-            '[terminal]\ndefault_shell = "/usr/bin/zsh"\n',
-        )
-        self.assertNotIn("herdr", entrypoint.lower())
+        self.assertIn('[terminal]\ndefault_shell = "/usr/bin/zsh"', herdr_config)
+        self.assertIn('[ui.sidebar.agents]', herdr_config)
+        self.assertIn('token = "$branch"', herdr_config)
+        self.assertIn('fg = "#a6e3a1"', herdr_config)
+        self.assertIn("/usr/local/libexec/devc2/configure-herdr", entrypoint)
+        self.assertNotIn("herdr server", entrypoint.lower())
         self.assertNotIn("herdr-wrapper", dockerfile)
         self.assertFalse((PATH.parents[1] / "devbox" / "herdr-wrapper.py").exists())
+        self.assertIn("devbox/herdr-git-metadata /usr/local/libexec/devc2/herdr-git-metadata", dockerfile)
+        self.assertIn("devbox/configure-herdr.sh /usr/local/libexec/devc2/configure-herdr", dockerfile)
+        self.assertIn("devbox/herdr-config.toml /usr/local/share/devc2-herdr-config.toml", dockerfile)
+        self.assertIn("devc2-herdr-metadata.zsh", dockerfile)
+        self.assertIn('rev-parse --absolute-git-dir', git_metadata)
+        self.assertIn('${head#ref: refs/heads/}', git_metadata)
+        self.assertIn('--token "branch=$branch"', git_metadata)
+        self.assertIn('--ttl-ms 10000', git_metadata)
+        self.assertIn('--clear-token branch', git_metadata)
+        self.assertIn('"${HERDR_PANE_ID:-}"', zsh_integration)
+        self.assertIn('"$HERDR_PANE_ID" "$$" "$PWD" "${TACT_WORKSPACE:-$PWD}"', zsh_integration)
         self.assertTrue(entrypoint.rstrip().endswith('exec /bin/zsh'))
         runtime_path=dockerfile.split("ENV HOME=",1)[1]
         self.assertIn(":/bin:/run/devc2/bin:/home/devbox/.local/bin",runtime_path)
+
+    def test_herdr_git_metadata_retries_failed_reports_and_clears_on_exit(self):
+        reporter = PATH.parents[1] / "devbox" / "herdr-git-metadata"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            checkout = root / "checkout"
+            subprocess.run(
+                ["git", "init", "-q", "-b", "worktree/feature", str(checkout)],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git", "-C", str(checkout), "-c", "user.name=Test",
+                    "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+                    "commit", "-q", "--allow-empty", "-m", "initial",
+                ],
+                check=True,
+            )
+            fallback_checkout = root / "fallback"
+            subprocess.run(
+                ["git", "init", "-q", "-b", "fallback/base", str(fallback_checkout)],
+                check=True,
+            )
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            log = root / "herdr.log"
+            failed_once = root / "failed-once"
+            fake_herdr = fake_bin / "herdr"
+            fake_herdr.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' \"$*\" >>\"$HERDR_TEST_LOG\"\n"
+                "case \" $* \" in\n"
+                "  *' --token branch=worktree/feature '*)\n"
+                "    if [ ! -e \"$HERDR_TEST_FAILED_ONCE\" ]; then\n"
+                "      : >\"$HERDR_TEST_FAILED_ONCE\"\n"
+                "      exit 1\n"
+                "    fi\n"
+                "    ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            fake_herdr.chmod(0o755)
+            environment = {
+                **os.environ,
+                "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
+                "HERDR_TEST_LOG": str(log),
+                "HERDR_TEST_FAILED_ONCE": str(failed_once),
+            }
+            process = subprocess.Popen(
+                [
+                    str(reporter), "w1:p1", str(os.getpid()), str(checkout),
+                    str(fallback_checkout),
+                ],
+                env=environment,
+            )
+            try:
+                deadline = time.monotonic() + 6
+                reports = []
+                while time.monotonic() < deadline:
+                    if log.exists():
+                        reports = [
+                            line for line in log.read_text().splitlines()
+                            if "--token branch=worktree/feature" in line
+                        ]
+                    if len(reports) >= 2:
+                        break
+                    time.sleep(0.05)
+                self.assertGreaterEqual(len(reports), 2, reports)
+                self.assertTrue(failed_once.exists())
+                self.assertIn("--ttl-ms 10000", reports[-1])
+                subprocess.run(
+                    ["git", "-C", str(checkout), "checkout", "-q", "-b", "worktree/next"],
+                    check=True,
+                )
+                deadline = time.monotonic() + 4
+                while time.monotonic() < deadline:
+                    if "--token branch=worktree/next" in log.read_text():
+                        break
+                    time.sleep(0.05)
+                self.assertIn("--token branch=worktree/next", log.read_text())
+            finally:
+                process.terminate()
+                process.wait(timeout=5)
+            self.assertIn("--clear-token branch", log.read_text().splitlines()[-1])
+
+            outside_checkout = root / "outside"
+            outside_checkout.mkdir()
+            fallback_log = root / "fallback.log"
+            fallback_environment = {**environment, "HERDR_TEST_LOG": str(fallback_log)}
+            fallback_process = subprocess.Popen(
+                [
+                    str(reporter), "w1:p2", str(os.getpid()), str(outside_checkout),
+                    str(checkout),
+                ],
+                env=fallback_environment,
+            )
+            try:
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    if fallback_log.exists() and "--token branch=worktree/next" in fallback_log.read_text():
+                        break
+                    time.sleep(0.05)
+                self.assertIn("--token branch=worktree/next", fallback_log.read_text())
+            finally:
+                fallback_process.terminate()
+                fallback_process.wait(timeout=5)
+
+    def test_herdr_config_adds_branch_layout_without_replacing_user_settings(self):
+        root = PATH.parents[1]
+        configure = root / "devbox" / "configure-herdr.sh"
+        managed = root / "devbox" / "herdr-config.toml"
+        with tempfile.TemporaryDirectory() as td:
+            temporary = Path(td)
+            config = temporary / "config.toml"
+            original = (
+                'onboarding = false\n[terminal]\ndefault_shell = "/usr/bin/zsh"\n\n'
+                '[theme]\nname = "catppuccin"\nauto_switch = false\n'
+            )
+            config.write_text(original)
+            environment = {
+                **os.environ,
+                "HERDR_CONFIG_PATH": str(config),
+                "DEVC2_HERDR_MANAGED_CONFIG": str(managed),
+            }
+            subprocess.run([str(configure)], env=environment, check=True)
+            migrated = config.read_text()
+            self.assertTrue(migrated.startswith(original))
+            self.assertEqual(migrated.count("[ui.sidebar.agents]"), 1)
+            self.assertIn('token = "$branch"', migrated)
+            self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o600)
+            subprocess.run([str(configure)], env=environment, check=True)
+            self.assertEqual(config.read_text(), migrated)
+
+            custom = temporary / "custom.toml"
+            custom.write_text('[ui.sidebar.agents]\nrows = [["agent"]]\n')
+            custom_environment = {**environment, "HERDR_CONFIG_PATH": str(custom)}
+            subprocess.run([str(configure)], env=custom_environment, check=True)
+            self.assertEqual(custom.read_text(), '[ui.sidebar.agents]\nrows = [["agent"]]\n')
 
     def test_runtime_doctor_is_disposable_and_exercises_live_boundaries(self):
         source = PATH.read_text()
