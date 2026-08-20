@@ -18,7 +18,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from credential_proxy import span_bridge, stream_relay
+from credential_proxy import http_projection, span_bridge, stream_relay
 from launcher import devc2
 from launcher import span_runtime
 
@@ -804,7 +804,7 @@ class BridgeConfigTests(unittest.TestCase):
         entrypoint = (Path(__file__).parents[1] / "devbox" / "entrypoint.sh").read_text()
         self.assertIn("cmp -s /run/devc2-public/span-ready /run/devc2/spans/.ready", entrypoint)
 
-    def test_saturated_bridge_rejects_without_killing_accept_loop(self):
+    def test_saturated_bridge_backpressures_until_capacity_is_available(self):
         with tempfile.TemporaryDirectory() as raw, mock.patch.object(span_bridge, "MAX_CONNECTIONS", 1):
             root = Path(raw)
             bridge = span_bridge.Bridge("echo", 1, root, "127.0.0.1", mock.Mock())
@@ -812,12 +812,15 @@ class BridgeConfigTests(unittest.TestCase):
             bridge.start()
             try:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-                    client.settimeout(1)
+                    client.settimeout(0.1)
                     client.connect(str(root / "echo.sock"))
+                    with self.assertRaises(TimeoutError):
+                        client.recv(1)
+                    bridge.slots.release()
+                    client.settimeout(2)
                     self.assertEqual(client.recv(1), b"")
                 self.assertTrue(bridge.thread.is_alive())
             finally:
-                bridge.slots.release()
                 bridge.stop()
 
     def test_fatal_bridge_listener_failure_stops_the_sidecar(self):
@@ -850,12 +853,24 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertIn('user: "0:0"', bridge)
         self.assertIn("credential_proxy.span_bridge", bridge)
         self.assertIn('restart: "on-failure:5"',bridge)
-        self.assertIn("mem_limit: 128m", bridge)
-        self.assertIn("pids_limit: 64", bridge)
-        self.assertEqual(span_bridge.MAX_CONNECTIONS, 16)
+        self.assertIn("mem_limit: 1g", bridge)
+        self.assertIn("cpus: 2", bridge)
+        self.assertIn("pids_limit: 1024", bridge)
+        self.assertEqual(span_bridge.MAX_CONNECTIONS, 256)
+        self.assertEqual(span_bridge.LISTEN_BACKLOG, 1024)
+        self.assertEqual(http_projection.MAX_CONNECTIONS, 256)
+        self.assertEqual(http_projection.LISTEN_BACKLOG, 1024)
+        span_slots, http_slots = span_bridge.worker_budgets()
+        self.assertIsNot(span_slots, http_slots)
+        for _connection in range(256):
+            self.assertTrue(span_slots.acquire(blocking=False))
+            self.assertTrue(http_slots.acquire(blocking=False))
+        self.assertFalse(span_slots.acquire(blocking=False))
+        self.assertFalse(http_slots.acquire(blocking=False))
         self.assertLessEqual(
-            2 * span_bridge.MAX_CONNECTIONS * stream_relay.MAX_PENDING,
-            8 * 1024 * 1024,
+            2 * (span_bridge.MAX_CONNECTIONS + http_projection.MAX_CONNECTIONS)
+            * stream_relay.MAX_PENDING,
+            256 * 1024 * 1024,
         )
 
     def test_fatal_listener_before_readiness_returns_failure(self):

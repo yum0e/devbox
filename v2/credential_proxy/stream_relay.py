@@ -9,8 +9,8 @@ import threading
 import time
 
 
-# This is a per-direction cap. With the sidecar-wide 16-connection budget,
-# relay payload buffers consume at most 8 MiB of the 128 MiB container limit.
+# This is a per-direction cap. Independent 256-worker HTTP and Span budgets
+# consume at most 256 MiB of relay payload buffers in the 1 GiB sidecar.
 MAX_PENDING = 256 * 1024
 KEEPALIVE_IDLE_SECONDS = 30
 KEEPALIVE_INTERVAL_SECONDS = 10

@@ -12,7 +12,8 @@ from .stream_relay import RESUME_GAP_SECONDS, duplex_stream, enable_tcp_keepaliv
 
 MAX_CONFIG = 64 * 1024
 MAX_HEADERS = 16 * 1024
-MAX_CONNECTIONS = 16
+MAX_CONNECTIONS = 256
+LISTEN_BACKLOG = 1024
 NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
@@ -76,7 +77,7 @@ class HttpProjection:
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server.bind(("0.0.0.0", port))
-        self.server.listen(MAX_CONNECTIONS)
+        self.server.listen(LISTEN_BACKLOG)
         self.server.settimeout(0.5)
         self.thread = threading.Thread(target=self._serve, name="http-world-projection", daemon=True)
 
@@ -127,7 +128,11 @@ class HttpProjection:
                 self._retire_after_resume(transport_clocks())
                 if client is None:
                     continue
-                if not self.slots.acquire(blocking=False):
+                while not self.stopping.is_set():
+                    if self.slots.acquire(timeout=0.5):
+                        break
+                    self._retire_after_resume(transport_clocks())
+                else:
                     client.close()
                     continue
                 thread = threading.Thread(target=self._handle, args=(client,), daemon=True)

@@ -16,12 +16,13 @@ from pathlib import Path
 
 NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 READY_TOKEN = re.compile(r"^[a-f0-9]{32}$")
-# Every accepted Span or HTTP connection consumes one worker thread. The
-# sidecar shares this budget across both listeners so its peak thread count
-# stays comfortably below Compose's pids_limit of 64.
-MAX_CONNECTIONS = 16
+# HTTP tunnels pass through both the HTTP projection and a named Span bridge,
+# so the two layers need independent worker budgets. Sharing one budget makes
+# every routed OpenAI/GitHub tunnel count twice and can deadlock admission.
+MAX_CONNECTIONS = 256
+LISTEN_BACKLOG = 1024
 MAX_SPANS = 16
-from .http_projection import HttpProjection, load_routes
+from .http_projection import MAX_CONNECTIONS as MAX_HTTP_CONNECTIONS, HttpProjection, load_routes
 from .stream_relay import RESUME_GAP_SECONDS, duplex_stream, enable_tcp_keepalive, transport_clocks, transport_gap
 
 
@@ -52,7 +53,7 @@ class Bridge:
         # root-owned directory prevents Island code from replacing endpoints;
         # the socket itself remains connectable by the unprivileged Island UID.
         os.chmod(self.path, 0o666)
-        self.server.listen(64)
+        self.server.listen(LISTEN_BACKLOG)
         self.server.settimeout(0.5)
         self.thread = threading.Thread(target=self._serve, daemon=True)
 
@@ -81,7 +82,11 @@ class Bridge:
                 self._retire_after_resume(transport_clocks())
                 if client is None:
                     continue
-                if not self.slots.acquire(blocking=False):
+                while not self.stopping.is_set():
+                    if self.slots.acquire(timeout=0.5):
+                        break
+                    self._retire_after_resume(transport_clocks())
+                else:
                     client.close()
                     continue
                 with self.connections_lock:
@@ -209,6 +214,14 @@ def load_config(path: Path) -> list[tuple[str, int]]:
     return result
 
 
+def worker_budgets() -> tuple[threading.BoundedSemaphore, threading.BoundedSemaphore]:
+    """Return independent budgets for Span and HTTP relay worker layers."""
+    return (
+        threading.BoundedSemaphore(MAX_CONNECTIONS),
+        threading.BoundedSemaphore(MAX_HTTP_CONNECTIONS),
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
@@ -233,14 +246,14 @@ def main(argv: list[str] | None = None) -> int:
     context.load_cert_chain(certfile=args.tls_cert, keyfile=args.tls_key)
     stopping = threading.Event()
     failed = threading.Event()
-    slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+    span_slots, http_slots = worker_budgets()
     entries = load_config(args.config)
-    bridges = [Bridge(name, port, args.socket_dir, args.host, context, slots, stopping, failed) for name, port in entries]
+    bridges = [Bridge(name, port, args.socket_dir, args.host, context, span_slots, stopping, failed) for name, port in entries]
     http = HttpProjection(
         load_routes(args.http_config, {name for name, _port in entries}),
         args.socket_dir,
         args.http_port,
-        slots,
+        http_slots,
         stopping,
         failed,
     )

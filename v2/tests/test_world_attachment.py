@@ -256,6 +256,35 @@ class HttpProjectionTests(unittest.TestCase):
             finally:
                 projection._retire_connections(); proxy.close(); client.close()
 
+    def test_saturated_http_projection_backpressures_until_capacity_is_available(self):
+        with tempfile.TemporaryDirectory() as raw:
+            slots = threading.BoundedSemaphore(1)
+            self.assertTrue(slots.acquire(blocking=False))
+            projection = http_projection.HttpProjection(
+                {}, Path(raw), port=0, slots=slots,
+            )
+            handled = threading.Event()
+
+            def handle(client):
+                with client:
+                    client.sendall(b"accepted")
+                slots.release()
+                handled.set()
+
+            projection._handle = handle
+            projection.start()
+            try:
+                with socket.create_connection(projection.server.getsockname(), timeout=1) as client:
+                    client.settimeout(0.1)
+                    with self.assertRaises(TimeoutError):
+                        client.recv(1)
+                    slots.release()
+                    client.settimeout(2)
+                    self.assertEqual(client.recv(8), b"accepted")
+                self.assertTrue(handled.wait(1))
+            finally:
+                projection.stop()
+
     def test_undeclared_route_uses_direct_fallback_without_forwarding_connect_headers(self):
         with tempfile.TemporaryDirectory() as raw:
             projection = self.projection({}, Path(raw))
