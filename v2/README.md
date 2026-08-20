@@ -139,6 +139,8 @@ receive backpressure instead of an immediate connection reset.
 Steady-state HTTP tunnels reuse their published credential helper without a
 serialized Docker inspection. A transient local connect failure is retried
 without restarting that healthy helper and dropping its other tunnels.
+Each OpenAI or GitHub credential helper has 512 MiB, 2 CPUs, and a 512-PID
+ceiling so its resources match the 256-tunnel transport budget.
 
 First-party Spans are immutable release assets outside the Island
 image and cannot be shadowed by configuration. Additional Spans are made

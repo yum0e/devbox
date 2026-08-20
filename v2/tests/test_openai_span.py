@@ -244,8 +244,9 @@ class WorldTests(unittest.TestCase):
             helper = next(call for call in launches if "--detach" in call)
             for option in ("--read-only", "--cap-drop", "--security-opt", "--log-driver"):
                 self.assertIn(option, helper)
-            self.assertEqual(helper[helper.index("--memory") + 1], "128m")
-            self.assertEqual(helper[helper.index("--pids-limit") + 1], "64")
+            self.assertEqual(helper[helper.index("--memory") + 1], "512m")
+            self.assertEqual(helper[helper.index("--cpus") + 1], "2")
+            self.assertEqual(helper[helper.index("--pids-limit") + 1], "512")
             self.assertIn("127.0.0.1::8080", helper)
             config = (root / "proxy.yaml").read_text()
             self.assertNotIn("real-secret", config)
