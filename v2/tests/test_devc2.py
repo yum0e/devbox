@@ -475,7 +475,7 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(
             herdr_config,
-            '[terminal]\ndefault_shell = "/usr/local/bin/tact"\n',
+            '[terminal]\ndefault_shell = "/usr/bin/zsh"\n',
         )
         self.assertNotIn("herdr", entrypoint.lower())
         self.assertNotIn("herdr-wrapper", dockerfile)

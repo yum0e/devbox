@@ -124,7 +124,7 @@ RUN chmod 0755 /usr/local/bin/devc2-entrypoint /usr/local/bin/tact \
  && chmod 0777 /home/devbox
 
 # A fresh persistent home volume is initialized from the image. Seed Herdr so
-# its initial pane, new tabs, and splits open Tact by default without changing
+# its initial pane, new tabs, and splits open zsh by default without changing
 # existing homes that already contain user configuration.
 COPY --chown=devbox:devbox --chmod=0600 devbox/herdr-config.toml /home/devbox/.config/herdr/config.toml
 
