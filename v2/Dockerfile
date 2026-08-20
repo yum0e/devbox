@@ -79,6 +79,24 @@ RUN set -eux; \
     cmp /tmp/herdr-skill.expected /tmp/herdr-skill.actual; \
     rm -f /tmp/herdr-skill.expected /tmp/herdr-skill.actual
 
+# Install the official Helm client with architecture-specific release checksums.
+ARG HELM_VERSION=4.2.4
+RUN set -eux; \
+    case "$TARGETARCH" in \
+      amd64) helm_sha256="c306b46f719b0a4da32d0f78ee21bf90ce8d602f15b22ab753f0674d1670a7f3" ;; \
+      arm64) helm_sha256="564de2191b881e9f71b5606b25345821ea1682f06ab90499d3ab22b530176da1" ;; \
+      *) echo "unsupported architecture: $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    helm_tag="v${HELM_VERSION#v}"; \
+    helm_archive="/tmp/helm-${helm_tag}-linux-${TARGETARCH}.tar.gz"; \
+    curl -fsSL -o "$helm_archive" \
+      "https://get.helm.sh/helm-${helm_tag}-linux-${TARGETARCH}.tar.gz"; \
+    echo "${helm_sha256}  ${helm_archive}" | sha256sum -c -; \
+    tar -xzf "$helm_archive" -C /tmp "linux-${TARGETARCH}/helm"; \
+    install -m 0755 "/tmp/linux-${TARGETARCH}/helm" /usr/local/bin/helm; \
+    rm -rf "$helm_archive" "/tmp/linux-${TARGETARCH}"; \
+    helm version --short
+
 # Match v1's managed Python and Ethereum development toolchain without placing
 # either installation in the persistent devbox home volume.
 RUN uv python install 3.14 \

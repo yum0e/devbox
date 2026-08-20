@@ -141,6 +141,7 @@ if [[ "${DEVC2_RUNTIME_DOCTOR:-}" == "1" ]]; then
   echo "✓ pnpm: $(pnpm --version)"
   echo "✓ managed Python: $(python3.14 --version)"
   echo "✓ Foundry forge: $(forge --version | head -n 1)"
+  echo "✓ Helm: $(helm version --short)"
   if [[ -n "${SSH_AUTH_SOCK:-}" ]]; then
     mapfile -t doctor_identities < <(ssh-add -L)
     test "${#doctor_identities[@]}" -eq 1

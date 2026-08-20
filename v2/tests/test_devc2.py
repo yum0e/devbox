@@ -442,6 +442,12 @@ class CliTests(unittest.TestCase):
         self.assertIn("curl --fail --location --show-error --silent https://getfoundry.sh/install", dockerfile)
         self.assertIn("head -n 1 /tmp/foundry-install.sh | grep -q '^#!'", dockerfile)
         self.assertIn("$FOUNDRY_DIR/bin/foundryup", dockerfile)
+        self.assertIn("ARG HELM_VERSION=4.2.4", dockerfile)
+        self.assertIn("https://get.helm.sh/helm-${helm_tag}-linux-${TARGETARCH}.tar.gz", dockerfile)
+        self.assertIn("c306b46f719b0a4da32d0f78ee21bf90ce8d602f15b22ab753f0674d1670a7f3", dockerfile)
+        self.assertIn("564de2191b881e9f71b5606b25345821ea1682f06ab90499d3ab22b530176da1", dockerfile)
+        self.assertIn("install -m 0755 \"/tmp/linux-${TARGETARCH}/helm\" /usr/local/bin/helm", dockerfile)
+        self.assertIn("helm version --short", dockerfile)
         self.assertNotIn("corepack enable", dockerfile)
         self.assertNotIn("fnm env", dockerfile)
         self.assertNotIn("nvm install", dockerfile)
@@ -450,6 +456,7 @@ class CliTests(unittest.TestCase):
         for probe in (
             "pi --version", "psql --version", "node --version",
             "pnpm --version", "python3.14 --version", "forge --version",
+            "helm version --short",
         ):
             self.assertIn(probe, entrypoint)
 
