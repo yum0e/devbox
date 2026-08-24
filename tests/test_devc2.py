@@ -494,6 +494,12 @@ class CliTests(unittest.TestCase):
         self.assertIn("curl --fail --location --show-error --silent https://getfoundry.sh/install", dockerfile)
         self.assertIn("head -n 1 /tmp/foundry-install.sh | grep -q '^#!'", dockerfile)
         self.assertIn("$FOUNDRY_DIR/bin/foundryup", dockerfile)
+        self.assertIn("ARG KUBECTL_VERSION=1.36.4", dockerfile)
+        self.assertIn("https://dl.k8s.io/release/${kubectl_tag}/bin/linux/${TARGETARCH}/kubectl", dockerfile)
+        self.assertIn("8b8f088da2dab964f853b38464033b1be15ede2839eca751482357c45abdd05a", dockerfile)
+        self.assertIn("0ecf44450ee6063bf19dd166a103ee6df4a9034455c2abce626e6eea657d73fb", dockerfile)
+        self.assertIn("install -m 0755 /tmp/kubectl /usr/local/bin/kubectl", dockerfile)
+        self.assertIn("kubectl version --client", dockerfile)
         self.assertIn("ARG HELM_VERSION=4.2.4", dockerfile)
         self.assertIn("https://get.helm.sh/helm-${helm_tag}-linux-${TARGETARCH}.tar.gz", dockerfile)
         self.assertIn("c306b46f719b0a4da32d0f78ee21bf90ce8d602f15b22ab753f0674d1670a7f3", dockerfile)
@@ -508,7 +514,7 @@ class CliTests(unittest.TestCase):
         for probe in (
             "pi --version", "psql --version", "node --version",
             "pnpm --version", "python3.14 --version", "forge --version",
-            "helm version --short",
+            "kubectl version --client", "helm version --short",
         ):
             self.assertIn(probe, entrypoint)
 

@@ -97,6 +97,23 @@ RUN set -eux; \
     rm -f /tmp/gh-stack; \
     /usr/local/libexec/devc2/gh-stack --help >/dev/null
 
+# Install the official Kubernetes client with architecture-specific release
+# checksums.
+ARG KUBECTL_VERSION=1.36.4
+RUN set -eux; \
+    case "$TARGETARCH" in \
+      amd64) kubectl_sha256="8b8f088da2dab964f853b38464033b1be15ede2839eca751482357c45abdd05a" ;; \
+      arm64) kubectl_sha256="0ecf44450ee6063bf19dd166a103ee6df4a9034455c2abce626e6eea657d73fb" ;; \
+      *) echo "unsupported architecture: $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    kubectl_tag="v${KUBECTL_VERSION#v}"; \
+    curl -fsSL -o /tmp/kubectl \
+      "https://dl.k8s.io/release/${kubectl_tag}/bin/linux/${TARGETARCH}/kubectl"; \
+    echo "${kubectl_sha256}  /tmp/kubectl" | sha256sum -c -; \
+    install -m 0755 /tmp/kubectl /usr/local/bin/kubectl; \
+    rm -f /tmp/kubectl; \
+    kubectl version --client
+
 # Install the official Helm client with architecture-specific release checksums.
 ARG HELM_VERSION=4.2.4
 RUN set -eux; \
