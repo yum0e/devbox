@@ -55,16 +55,16 @@ RUN pnpm add --global --ignore-scripts --no-optional \
 # Herdr is an ordinary Island tool. Nothing starts it until a user invokes it.
 COPY devbox/agent-skills/herdr/SKILL.md /tmp/herdr-skill.expected
 ARG TARGETARCH
-ARG HERDR_VERSION=0.8.0
+ARG HERDR_VERSION=0.8.2
 RUN set -eux; \
     case "$TARGETARCH" in \
       amd64) \
         herdr_asset="herdr-linux-x86_64"; \
-        herdr_sha256="b872ea7e40fa2cb17e857ac9b62b1bf26db7b403c622f5d2f3f5b35f6e9acd28" \
+        herdr_sha256="976150a14d490c94b243ea2e1a7eb2dfb67f12e36b182db90936f6728e6aecf4" \
         ;; \
       arm64) \
         herdr_asset="herdr-linux-aarch64"; \
-        herdr_sha256="f647ac66468d9efbc642fe534fb284468f0aea60641606fc008dfc0d82a3ca87" \
+        herdr_sha256="f55610658e1c2e0d2aaef730b4b2ab885f7f8ba00285ab372bfb14f2e3d5b40d" \
         ;; \
       *) echo "unsupported architecture: $TARGETARCH" >&2; exit 1 ;; \
     esac; \
@@ -144,6 +144,8 @@ RUN chmod 0755 /usr/local/bin/devc2-entrypoint /usr/local/bin/tact \
  && useradd --uid 1000 --gid devbox --create-home --shell /bin/zsh devbox \
  && mkdir -p /workspace /home/devbox/.cache /home/devbox/.local/share/tact \
       /run/devc2-public /run/devc2/spans \
+ && install -d -m 0700 -o devbox -g devbox \
+      /home/devbox/.config /home/devbox/.config/herdr \
  && chown -R devbox:devbox /workspace /home/devbox \
  && chmod 0777 /home/devbox
 

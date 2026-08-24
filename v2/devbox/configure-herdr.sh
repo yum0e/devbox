@@ -9,6 +9,17 @@ if [[ ! -r "$managed_config" ]]; then
   exit 1
 fi
 
+# Images built before the Herdr config directories were explicitly created
+# seeded fresh home volumes with mode 0600 directories. Repair only that managed
+# path and only real directories; never follow or modify user-managed symlinks.
+if [[ "$config" == "$HOME/.config/herdr/config.toml" ]]; then
+  for directory in "$HOME/.config" "$HOME/.config/herdr"; do
+    if [[ -d "$directory" && ! -L "$directory" && -O "$directory" && ! -x "$directory" ]]; then
+      chmod u+rwx -- "$directory"
+    fi
+  done
+fi
+
 mkdir -p "$(dirname "$config")"
 if [[ ! -e "$config" && ! -L "$config" ]]; then
   install -m 0600 "$managed_config" "$config"

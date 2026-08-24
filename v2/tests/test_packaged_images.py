@@ -132,7 +132,10 @@ class PackagedImageTests(unittest.TestCase):
                                 "--pull=never", "--entrypoint", "/bin/sh",
                                 tags["runtime"], "-ec",
                                 "command -v tact; command -v pi; command -v herdr; command -v gh; "
-                                "herdr --version; test -x /usr/local/bin/devc2-entrypoint"],
+                                "test \"$(herdr --version)\" = 'herdr 0.8.2'; "
+                                "test \"$(stat -c '%u:%g:%a' /home/devbox/.config)\" = '1000:1000:700'; "
+                                "test \"$(stat -c '%u:%g:%a' /home/devbox/.config/herdr)\" = '1000:1000:700'; "
+                                "test -x /usr/local/bin/devc2-entrypoint"],
                                check=True, timeout=60)
                 subprocess.run([docker, "run", "--rm", "--name", containers["auth"],
                                 "--pull=never", "--entrypoint", "codex",

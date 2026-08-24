@@ -65,7 +65,7 @@ herdr_repo="${herdr_result[0]}"
 herdr_log="${herdr_result[1]}"
 grep -Fqx -- "up --workspace-folder $herdr_repo" "$herdr_log"
 grep -Fqx -- "exec --workspace-folder $herdr_repo herdr" "$herdr_log"
-grep -Fq '"HERDR_VERSION": "0.8.0"' "$herdr_repo/.devcontainer/devcontainer.json"
+grep -Fq '"HERDR_VERSION": "0.8.2"' "$herdr_repo/.devcontainer/devcontainer.json"
 grep -Fq '/usr/local/bin/herdr --version' "$herdr_repo/.devcontainer/Dockerfile"
 ! grep -Fq 'target=/home/node/.config/herdr' "$herdr_repo/.devcontainer/devcontainer.json"
 

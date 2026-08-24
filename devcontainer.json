@@ -12,7 +12,7 @@
       "PRIME_AGENT_CHANNEL": "stable",
       "JJ_VERSION": "latest",
       "FNM_VERSION": "latest",
-      "HERDR_VERSION": "0.8.0"
+      "HERDR_VERSION": "0.8.2"
     }
   },
   "overrideCommand": false,

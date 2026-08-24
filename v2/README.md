@@ -57,6 +57,10 @@ devc2 reset /path/to/repository
 devc2 reset /path/to/repository --yes
 ```
 
+`devc2 reset` is destructive: it permanently removes that checkout's
+persistent home volume, including Tact sessions and other user state. Ordinary
+launch teardown, reinstall, update, rollback, and host restart preserve it.
+
 `devc2 run /path/to/repository` grants no Spans and opens a credential-free
 shell. Herdr is a regular executable in that shell. Run `herdr` when you want
 to orchestrate agents and other processes in the same Island. In a fresh box,
@@ -337,7 +341,7 @@ The opt-in test uses unique temporary image tags and removes only those tags.
 - An SSH agent, such as 1Password, for the optional SSH-agent Span
 
 Tact v0.6.3 and Pi are bundled coding agents. Tact reports its idle/working
-lifecycle and session identity directly to the bundled Herdr v0.8.0 agent panel;
+lifecycle and session identity directly to the bundled Herdr v0.8.2 agent panel;
 Herdr derives the current branch from the Git checkout assigned to the Space.
 In Herdr panes, devc2 also reports the mounted checkout's live branch beside
 the agent name in the Agent panel. Each pane follows its own checkout, including

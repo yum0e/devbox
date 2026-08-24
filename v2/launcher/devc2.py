@@ -157,24 +157,69 @@ def atomic_write(path,data,mode=0o600):
         temp.unlink(missing_ok=True)
         raise
 
+def _make_tree_removable(path):
+    if not path.exists():
+        return
+
+    for directory, _dirs, _files in os.walk(
+        path, topdown=False, followlinks=False
+    ):
+        try:
+            Path(directory).chmod(0o700)
+        except FileNotFoundError:
+            pass
+
+
+def _remove_launch_directory(path):
+    deadline = time.monotonic() + 5
+
+    while True:
+        try:
+            _make_tree_removable(path)
+            shutil.rmtree(path)
+            return
+
+        except FileNotFoundError:
+            return
+
+        except OSError as error:
+            if error.errno not in {errno.EBUSY, errno.ENOTEMPTY}:
+                raise RuntimeError(
+                    f"could not remove the temporary launch directory: {error}"
+                ) from error
+
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "Docker did not release the temporary launch directory after teardown"
+                ) from error
+
+            time.sleep(0.05)
+
+
+def _report_launch_cleanup_failure(launch_error, cleanup_error):
+    note = f"temporary launch directory cleanup also failed: {cleanup_error}"
+    add_note = getattr(launch_error, "add_note", None)
+    if callable(add_note):
+        add_note(note)
+    else:
+        print(f"devc2: warning: {note}", file=sys.stderr)
+
+
 @contextlib.contextmanager
 def launch_directory():
-    path=Path(tempfile.mkdtemp(prefix="devc2-")); path.chmod(0o700)
-    try: yield path
-    finally:
-        deadline=time.monotonic()+5
-        while True:
-            try:
-                shutil.rmtree(path)
-                break
-            except FileNotFoundError:
-                break
-            except OSError as error:
-                if error.errno not in {errno.EBUSY,errno.ENOTEMPTY}:
-                    raise RuntimeError("could not remove the temporary launch directory") from error
-                if time.monotonic()>=deadline:
-                    raise RuntimeError("Docker did not release the temporary launch directory after teardown") from error
-                time.sleep(0.05)
+    path = Path(tempfile.mkdtemp(prefix="devc2-"))
+    path.chmod(0o700)
+
+    try:
+        yield path
+    except BaseException as launch_error:
+        try:
+            _remove_launch_directory(path)
+        except Exception as cleanup_error:
+            _report_launch_cleanup_failure(launch_error, cleanup_error)
+        raise
+    else:
+        _remove_launch_directory(path)
 
 def source_version(source):
     import re
@@ -1342,7 +1387,7 @@ def start(repo,runtime_doctor=False,span_names=()):
 
 def _reset_unlocked(repo,yes):
     if not yes:
-        try: answer=input(f"Remove v2 state for {repo}? [y/N] ")
+        try: answer=input(f"Permanently remove the persistent home volume and all v2 state for {repo}? [y/N] ")
         except EOFError: answer=''
         if answer.lower() not in {'y','yes'}: print('cancelled'); return 0
     digest,project=identity(repo)
@@ -1661,7 +1706,10 @@ def parse_cli(argv):
         args=parser.parse_args(argv[1:])
         return "doctor-runtime" if args.runtime else "doctor", None, False, ()
     if argv[0] == "reset":
-        parser = argparse.ArgumentParser(prog="devc2 reset")
+        parser = argparse.ArgumentParser(
+            prog="devc2 reset",
+            description="permanently remove a checkout's persistent home volume and all v2 Docker state",
+        )
         parser.add_argument("repo")
         parser.add_argument("--yes", action="store_true")
         args = parser.parse_args(argv[1:])

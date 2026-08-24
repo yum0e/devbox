@@ -55,6 +55,52 @@ class CliTests(unittest.TestCase):
             self.assertEqual(remove.call_count,2)
             sleep.assert_called_once_with(0.05)
 
+    def test_launch_directory_removes_read_only_projection(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "launch"
+            path.mkdir()
+
+            with mock.patch.object(
+                D.tempfile, "mkdtemp", return_value=str(path)
+            ):
+                with D.launch_directory() as created:
+                    readonly = created / "public" / "agent-skills" / "snapshot"
+                    readonly.mkdir(parents=True)
+                    skill = readonly / "SKILL.md"
+                    skill.write_text("test\n")
+
+                    skill.chmod(0o444)
+                    readonly.chmod(0o555)
+
+            self.assertFalse(path.exists())
+
+    def test_launch_directory_cleanup_does_not_mask_launch_error(self):
+        launch_error = RuntimeError("launch failed")
+        cleanup_error = RuntimeError("cleanup failed")
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "launch"
+            path.mkdir()
+            with mock.patch.object(
+                D.tempfile, "mkdtemp", return_value=str(path)
+            ), mock.patch.object(
+                D, "_remove_launch_directory", side_effect=cleanup_error
+            ), self.assertRaisesRegex(RuntimeError, "launch failed") as raised:
+                with D.launch_directory():
+                    raise launch_error
+
+        self.assertIs(raised.exception, launch_error)
+        self.assertIn("cleanup also failed", raised.exception.__notes__[0])
+
+    def test_launch_cleanup_diagnostic_supports_python_without_add_note(self):
+        class LegacyError:
+            pass
+
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            D._report_launch_cleanup_failure(LegacyError(), RuntimeError("cleanup failed"))
+        self.assertIn("cleanup also failed: cleanup failed", output.getvalue())
+
     def test_linked_worktree_projects_only_its_pointer_and_common_git_metadata(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); main=root/"main repo"; checkout=root/"linked tree"
@@ -472,11 +518,11 @@ class CliTests(unittest.TestCase):
         herdr_config = (PATH.parents[1] / "devbox" / "herdr-config.toml").read_text()
         git_metadata = (root / "devbox" / "herdr-git-metadata").read_text()
         zsh_integration = (root / "devbox" / "herdr-zsh-integration.zsh").read_text()
-        self.assertIn("ARG HERDR_VERSION=0.8.0", dockerfile)
+        self.assertIn("ARG HERDR_VERSION=0.8.2", dockerfile)
         self.assertIn('herdr_asset="herdr-linux-x86_64"', dockerfile)
         self.assertIn('herdr_asset="herdr-linux-aarch64"', dockerfile)
-        self.assertIn("b872ea7e40fa2cb17e857ac9b62b1bf26db7b403c622f5d2f3f5b35f6e9acd28", dockerfile)
-        self.assertIn("f647ac66468d9efbc642fe534fb284468f0aea60641606fc008dfc0d82a3ca87", dockerfile)
+        self.assertIn("976150a14d490c94b243ea2e1a7eb2dfb67f12e36b182db90936f6728e6aecf4", dockerfile)
+        self.assertIn("f55610658e1c2e0d2aaef730b4b2ab885f7f8ba00285ab372bfb14f2e3d5b40d", dockerfile)
         self.assertIn("install -m 0755 /tmp/herdr /usr/local/bin/herdr", dockerfile)
         self.assertIn("herdr --skill >/tmp/herdr-skill.actual",dockerfile)
         self.assertIn("cmp /tmp/herdr-skill.expected /tmp/herdr-skill.actual",dockerfile)
@@ -487,6 +533,18 @@ class CliTests(unittest.TestCase):
             "COPY --chown=devbox:devbox --chmod=0600 devbox/herdr-config.toml "
             "/home/devbox/.config/herdr/config.toml",
             dockerfile,
+        )
+        directory_seed = (
+            "install -d -m 0700 -o devbox -g devbox \\\n"
+            "      /home/devbox/.config /home/devbox/.config/herdr"
+        )
+        self.assertIn(directory_seed, dockerfile)
+        self.assertLess(
+            dockerfile.index(directory_seed),
+            dockerfile.index(
+                "COPY --chown=devbox:devbox --chmod=0600 "
+                "devbox/herdr-config.toml /home/devbox/.config/herdr/config.toml"
+            ),
         )
         self.assertIn('[terminal]\ndefault_shell = "/usr/bin/zsh"', herdr_config)
         self.assertIn('[ui.sidebar.agents]', herdr_config)
@@ -648,6 +706,30 @@ class CliTests(unittest.TestCase):
             custom_environment = {**environment, "HERDR_CONFIG_PATH": str(custom)}
             subprocess.run([str(configure)], env=custom_environment, check=True)
             self.assertEqual(custom.read_text(), '[ui.sidebar.agents]\nrows = [["agent"]]\n')
+
+    def test_herdr_config_repairs_legacy_untraversable_seed_directories(self):
+        root = PATH.parents[1]
+        configure = root / "devbox" / "configure-herdr.sh"
+        managed = root / "devbox" / "herdr-config.toml"
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"
+            herdr = home / ".config" / "herdr"
+            herdr.mkdir(parents=True)
+            config = herdr / "config.toml"
+            config.write_text(managed.read_text())
+            herdr.chmod(0o600)
+            herdr.parent.chmod(0o600)
+            environment = {
+                **os.environ,
+                "HOME": str(home),
+                "DEVC2_HERDR_MANAGED_CONFIG": str(managed),
+            }
+
+            subprocess.run([str(configure)], env=environment, check=True)
+
+            self.assertEqual(stat.S_IMODE(herdr.parent.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(herdr.stat().st_mode), 0o700)
+            self.assertEqual(config.read_text(), managed.read_text())
 
     def test_runtime_doctor_is_disposable_and_exercises_live_boundaries(self):
         source = PATH.read_text()
