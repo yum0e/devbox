@@ -2,242 +2,34 @@
 set -euo pipefail
 
 usage() {
-  cat <<'USAGE' >&2
-devcontainer helper for this template.
+  cat <<'EOF'
+Usage: ./install.sh
 
-usage:
-  devc <repo>            install template, devcontainer up, then attach
-  devc install <repo>    install template only
-  devc rebuild <repo>    clear build cache, then up + attach
-  devc exec <repo> -- <cmd>
-  devc self-install      install devc + template into ~/.local
-
-notes:
-  - Herdr is the default multiplexer
-  - set DEVC_MULTIPLEXER=tmux to use tmux instead
-  - install and default run overwrite .devcontainer in the target repo
-  - rebuild keeps named volumes (history, auth) intact
-  - if devcontainer cli is missing, we suggest how to install it
-  - set DEVC_TEMPLATE_DIR to override the template source
-USAGE
-}
-
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-TEMPLATE_FILES=(Dockerfile devcontainer.json post_install.py entrypoint.sh)
-
-# Dockerfile uses BuildKit-only syntax such as:
-#   RUN --mount=type=cache,...
-# so devcontainer builds need BuildKit/Buildx.
-export DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-1}"
-
-die() {
-  echo "error: $*" >&2
-  exit 1
-}
-
-ensure_repo() {
-  local repo_path="$1"
-  [[ -d "$repo_path" ]] || die "repo path does not exist or is not a directory: $repo_path"
-}
-
-find_template_dir() {
-  if [[ -n "${DEVC_TEMPLATE_DIR:-}" && -d "$DEVC_TEMPLATE_DIR" ]]; then
-    echo "$DEVC_TEMPLATE_DIR"
-    return
-  fi
-
-  if [[ -f "$SCRIPT_DIR/Dockerfile" && -f "$SCRIPT_DIR/devcontainer.json" ]]; then
-    echo "$SCRIPT_DIR"
-    return
-  fi
-
-  if [[ -d "$HOME/.local/share/devc/template" ]]; then
-    echo "$HOME/.local/share/devc/template"
-    return
-  fi
-
-  die "template dir not found (set DEVC_TEMPLATE_DIR or run devc self-install)"
-}
-
-copy_template() {
-  local repo_path="$1"
-  local src_dir="$2"
-  local dest_dir="$repo_path/.devcontainer"
-
-  mkdir -p "$dest_dir"
-
-  for f in "${TEMPLATE_FILES[@]}"; do
-    [[ -f "$src_dir/$f" ]] || die "missing template file: $src_dir/$f"
-    cp -f "$src_dir/$f" "$dest_dir/$f"
-  done
-
-  local global_ignore=""
-  if command -v git >/dev/null 2>&1; then
-    global_ignore="$(git config --global --path core.excludesfile 2>/dev/null || true)"
-  fi
-
-  if [[ -z "$global_ignore" ]]; then
-    if [[ -n "${XDG_CONFIG_HOME:-}" && -f "$XDG_CONFIG_HOME/git/ignore" ]]; then
-      global_ignore="$XDG_CONFIG_HOME/git/ignore"
-    elif [[ -f "$HOME/.config/git/ignore" ]]; then
-      global_ignore="$HOME/.config/git/ignore"
-    elif [[ -f "$HOME/.gitignore_global" ]]; then
-      global_ignore="$HOME/.gitignore_global"
-    fi
-  fi
-
-  if [[ -n "$global_ignore" && -f "$global_ignore" ]]; then
-    cp -f "$global_ignore" "$dest_dir/.gitignore_global"
-    echo "  copied global gitignore from $global_ignore" >&2
-  fi
-
-  echo "✓ devcontainer installed to: $dest_dir" >&2
-}
-
-require_devcontainer_cli() {
-  if ! command -v devcontainer >/dev/null 2>&1; then
-    echo "error: devcontainer cli not found" >&2
-    echo "hint: npm install -g @devcontainers/cli" >&2
-    exit 1
-  fi
-}
-
-require_docker_buildx() {
-  if ! command -v docker >/dev/null 2>&1; then
-    echo "error: docker is not installed or not in PATH" >&2
-    exit 1
-  fi
-
-  if ! docker buildx version >/dev/null 2>&1; then
-    cat >&2 <<'EOF'
-error: docker buildx is not available
-
-This devbox template requires Docker BuildKit/Buildx because the Dockerfile
-uses BuildKit-only syntax such as:
-
-  RUN --mount=type=cache,...
-
-Please install or enable Docker Buildx for your Docker installation, then retry.
-
-Verify with:
-
-  docker buildx version
+Installs devc2 to ~/.local/bin/devc2 and its runtime assets to
+~/.local/share/devc2. It does not modify target repositories.
 EOF
-    exit 1
-  fi
 }
 
-validate_multiplexer() {
-  case "${DEVC_MULTIPLEXER:-herdr}" in
-    tmux|herdr)
-      ;;
-    *)
-      die "unsupported multiplexer: ${DEVC_MULTIPLEXER} (expected tmux or herdr)"
-      ;;
-  esac
-}
-
-attach_multiplexer() {
-  local repo_path="$1"
-
-  case "${DEVC_MULTIPLEXER:-herdr}" in
-    tmux)
-      devcontainer exec --workspace-folder "$repo_path" tmux new -As agent
-      ;;
-    herdr)
-      devcontainer exec --workspace-folder "$repo_path" herdr
-      ;;
-  esac
-}
-
-self_install() {
-  local bin_dir="$HOME/.local/bin"
-  local share_dir="$HOME/.local/share/devc/template"
-  local template_src
-
-  template_src="$(find_template_dir)"
-
-  mkdir -p "$bin_dir" "$share_dir"
-
-  cp -f "$SCRIPT_DIR/$(basename -- "$0")" "$bin_dir/devc"
-  chmod +x "$bin_dir/devc"
-
-  rm -rf "$share_dir"
-  mkdir -p "$share_dir"
-  for f in "${TEMPLATE_FILES[@]}"; do
-    [[ -f "$template_src/$f" ]] || die "missing template file: $template_src/$f"
-    cp -f "$template_src/$f" "$share_dir/$f"
-  done
-
-  echo "✓ installed devc to $bin_dir/devc" >&2
-  echo "✓ installed template to $share_dir" >&2
-  echo "note: ensure $bin_dir is on your PATH" >&2
-}
-
-if [[ $# -lt 1 ]]; then
-  usage
-  exit 1
-fi
-
-cmd="$1"
-shift
-
-case "$cmd" in
-  help|-h|--help)
-    usage
-    exit 0
-    ;;
-  self-install)
-    self_install
-    exit 0
-    ;;
-  install|rebuild|exec)
-    ;;
-  *)
-    set -- "$cmd" "$@"
-    cmd="up"
-    ;;
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  "") ;;
+  *) echo "install.sh: unknown argument: $1" >&2; usage >&2; exit 2 ;;
 esac
 
-if [[ $# -lt 1 ]]; then
-  usage
-  exit 1
-fi
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+command -v python3 >/dev/null 2>&1 || { echo "install.sh: Python 3 is required on the host" >&2; exit 1; }
+[[ -x /usr/bin/openssl ]] || { echo "install.sh: /usr/bin/openssl is required on the host" >&2; exit 1; }
+bin_dir="${DEVC2_BIN_DIR:-$HOME/.local/bin}"
+share_dir="${DEVC2_SHARE_DIR:-$HOME/.local/share/devc2}"
+arguments=(
+  _install-assets
+  --source "$script_dir"
+  --bin-dir "$bin_dir"
+  --share-dir "$share_dir"
+)
+if [[ "${DEVC2_INSTALL_RELEASE:-0}" == 1 ]]; then arguments+=(--release); fi
 
-REPO_PATH="$1"
-shift
-
-ensure_repo "$REPO_PATH"
-TEMPLATE_DIR="$(find_template_dir)"
-
-case "$cmd" in
-  install)
-    copy_template "$REPO_PATH" "$TEMPLATE_DIR"
-    exit 0
-    ;;
-  rebuild)
-    validate_multiplexer
-    copy_template "$REPO_PATH" "$TEMPLATE_DIR"
-    require_devcontainer_cli
-    require_docker_buildx
-    devcontainer up --workspace-folder "$REPO_PATH" --remove-existing-container
-    attach_multiplexer "$REPO_PATH"
-    ;;
-  up)
-    validate_multiplexer
-    copy_template "$REPO_PATH" "$TEMPLATE_DIR"
-    require_devcontainer_cli
-    require_docker_buildx
-    devcontainer up --workspace-folder "$REPO_PATH"
-    attach_multiplexer "$REPO_PATH"
-    ;;
-  exec)
-    copy_template "$REPO_PATH" "$TEMPLATE_DIR"
-    require_devcontainer_cli
-    if [[ $# -gt 0 && "$1" == "--" ]]; then
-      shift
-    fi
-    [[ $# -gt 0 ]] || die "exec requires a command"
-    devcontainer exec --workspace-folder "$REPO_PATH" "$@"
-    ;;
-esac
+# The Python installer holds the permanent exclusive control lock, validates and
+# stages immutable assets, then atomically switches the installed runtime pointer.
+# It never reads or writes shell startup files, configuration, auth, or repo state.
+exec python3 "$script_dir/launcher/devc2.py" "${arguments[@]}"

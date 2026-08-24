@@ -40,8 +40,9 @@ class CliTests(unittest.TestCase):
         self.assertEqual(exit.exception.code,0); run.assert_not_called()
     def test_identity_is_stable_and_namespaced(self):
         repo=Path("/tmp/repo")
-        self.assertEqual(D.identity(repo),D.identity(repo))
-        self.assertTrue(D.identity(repo)[1].startswith("devc2-"))
+        self.assertEqual(D.identity(repo),("b6fe87a9b936bea6","devc2-b6fe87a9b936bea6"))
+        self.assertIn("source: state-v2",(PATH.parents[1]/"compose.yaml").read_text())
+        self.assertEqual(f"{D.identity(repo)[1]}_state-v2","devc2-b6fe87a9b936bea6_state-v2")
 
     def test_launch_directory_retries_delayed_docker_desktop_unmount(self):
         with tempfile.TemporaryDirectory() as td:
@@ -360,7 +361,7 @@ class CliTests(unittest.TestCase):
         )
         self.assertIsNotNone(scoped)
 
-    def test_compose_hardening_and_v1_namespace(self):
+    def test_compose_hardening_and_generation_namespace(self):
         raw = (PATH.parents[1] / "compose.yaml").read_text()
         services = raw.split("services:\n", 1)[1].split("\nvolumes:\n", 1)[0]
         self.assertEqual(re.findall(r"^  ([a-z][a-z0-9-]*):$", services, re.MULTILINE), ["devbox", "span-proxy"])
@@ -461,7 +462,7 @@ class CliTests(unittest.TestCase):
             self.assertIn(source, proxy_dockerfile)
         self.assertNotIn("ssh_agent_proxy.py", proxy_dockerfile)
 
-    def test_v1_developer_tools_postgres_17_and_pnpm_managed_node(self):
+    def test_developer_tools_postgres_17_and_pnpm_managed_node(self):
         dockerfile = (PATH.parents[1] / "Dockerfile").read_text()
         entrypoint = (PATH.parents[1] / "devbox" / "entrypoint.sh").read_text()
         for package in (
@@ -753,11 +754,11 @@ class CliTests(unittest.TestCase):
         self.assertIn("tact config show", entrypoint)
         self.assertNotIn("set -x", entrypoint)
 
-    def test_active_v1_is_refused(self):
+    def test_active_legacy_devcontainer_is_refused(self):
         result = subprocess.CompletedProcess([], 0, "container-id\n", "")
         with mock.patch.object(D, "run", return_value=result):
-            with self.assertRaisesRegex(RuntimeError, "v1 is already running"):
-                D.ensure_v1_not_running(Path("/tmp/repo"))
+            with self.assertRaisesRegex(RuntimeError, "legacy devcontainer is already running"):
+                D.ensure_legacy_devcontainer_not_running(Path("/tmp/repo"))
 
     def test_runtime_doctor_uses_a_temporary_repo_and_checks_teardown(self):
         seen=[]
@@ -1045,8 +1046,8 @@ class ImageIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,"could not remove"), mock.patch.object(D,"run",side_effect=[removed,removed]):
             D.remove_span_volume(name)
 
-class CoexistenceTests(unittest.TestCase):
-    def test_reset_project_is_v2_only(self):
+class ProjectIsolationTests(unittest.TestCase):
+    def test_reset_is_scoped_to_one_devc2_project(self):
         with tempfile.TemporaryDirectory() as td:
             repo=Path(td); calls=[]
             state=repo/"state"

@@ -13,9 +13,9 @@ from pathlib import Path
 from launcher import devc2, span_runtime
 
 
-V2_ROOT = Path(__file__).parents[1]
-WORLD = V2_ROOT / "spans" / "diagnostics" / "world"
-COMMAND_LINK = V2_ROOT / "launcher" / "command_projection.py"
+ROOT = Path(__file__).parents[1]
+WORLD = ROOT / "spans" / "diagnostics" / "world"
+COMMAND_LINK = ROOT / "launcher" / "command_projection.py"
 HEADER = struct.Struct("!I")
 
 
@@ -40,7 +40,7 @@ class DiagnosticsWorldTests(unittest.TestCase):
                 root / "workspace",
                 root / "snapshot" / "links",
                 root / "snapshot" / "worlds",
-                V2_ROOT / "spans",
+                ROOT / "spans",
                 command_projection=COMMAND_LINK,
             )[0]
             self.assertEqual(item.provider.read_bytes(), WORLD.read_bytes())

@@ -7,6 +7,7 @@ import socket
 import ssl
 import threading
 import time
+from collections.abc import Callable
 
 
 # This is a per-direction cap. Independent 256-worker HTTP and Span budgets
@@ -16,6 +17,35 @@ KEEPALIVE_IDLE_SECONDS = 30
 KEEPALIVE_INTERVAL_SECONDS = 10
 KEEPALIVE_PROBES = 3
 RESUME_GAP_SECONDS = 15
+
+
+def serve_connections(
+    server: socket.socket,
+    stopping: threading.Event,
+    slots: threading.Semaphore,
+    snapshot_epoch: Callable[[], int],
+    poll_resume: Callable[[tuple[float, float]], object],
+    start_worker: Callable[[socket.socket, int], None],
+) -> None:
+    """Accept clients and admit workers while polling for host resume gaps."""
+    while not stopping.is_set():
+        epoch = snapshot_epoch()
+        client = None
+        try:
+            client, _address = server.accept()
+        except socket.timeout:
+            pass
+        poll_resume(transport_clocks())
+        if client is None:
+            continue
+        while not stopping.is_set():
+            if slots.acquire(timeout=0.5):
+                break
+            poll_resume(transport_clocks())
+        else:
+            client.close()
+            continue
+        start_worker(client, epoch)
 
 
 def transport_clocks() -> tuple[float, float]:

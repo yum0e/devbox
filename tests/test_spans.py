@@ -24,8 +24,8 @@ from launcher import devc2
 from launcher import span_runtime
 
 
-V2_ROOT = Path(__file__).parents[1]
-COMMAND_PROJECTION = V2_ROOT / "launcher" / "command_projection.py"
+ROOT = Path(__file__).parents[1]
+COMMAND_PROJECTION = ROOT / "launcher" / "command_projection.py"
 
 
 class BrokenSendSocket:
@@ -175,13 +175,13 @@ class SpanCatalogTests(unittest.TestCase):
             root=Path(raw); destination=root/"snapshot"; destination.mkdir()
             items=span_runtime.load_catalog(
                 root/"missing.json",("github","openai"),root/"workspace",destination/"links",destination/"worlds",
-                V2_ROOT/"spans",
+                ROOT/"spans",
             )
             for item in items:
                 self.assertEqual(item.provider.name, item.name)
                 self.assertEqual(
                     item.provider.read_bytes(),
-                    (V2_ROOT/"spans"/"http-credential-world").read_bytes(),
+                    (ROOT/"spans"/"http-credential-world").read_bytes(),
                 )
                 self.assertIsNone(item.client)
                 self.assertTrue(item.http_attachment)
@@ -192,11 +192,11 @@ class SpanCatalogTests(unittest.TestCase):
             root=Path(raw); destination=root/"snapshot"; destination.mkdir()
             item=span_runtime.load_catalog(
                 root/"missing.json",("ssh-agent",),root/"workspace",
-                destination/"links",destination/"worlds",V2_ROOT/"spans",
+                destination/"links",destination/"worlds",ROOT/"spans",
             )[0]
             self.assertEqual(
                 item.provider.read_bytes(),
-                (V2_ROOT/"spans"/"ssh-agent"/"world").read_bytes(),
+                (ROOT/"spans"/"ssh-agent"/"world").read_bytes(),
             )
             self.assertIsNone(item.client)
             self.assertEqual(list((destination/"links").iterdir()), [])
@@ -394,7 +394,7 @@ class ProviderLifecycleTests(unittest.TestCase):
                 f"pathlib.Path({str(ready_file)!r}).write_text('ready')\n"
                 "time.sleep(60)\n"
             )
-            process = subprocess.Popen([sys.executable, "-c", helper], cwd=Path(__file__).parents[2])
+            process = subprocess.Popen([sys.executable, "-c", helper], cwd=ROOT)
             provider_pid = None
             provider_gone = False
             try:
@@ -688,7 +688,7 @@ class BridgeConfigTests(unittest.TestCase):
                 ), mock.patch.object(
                     span_bridge, "enable_tcp_keepalive"
                 ) as keepalive, mock.patch.object(span_bridge, "duplex_stream"):
-                    bridge._connection(client)
+                    bridge._connection(client, bridge.resume_epoch)
                 keepalive.assert_called_once_with(raw_connection)
                 remote.do_handshake.assert_called_once_with()
             finally:
@@ -711,7 +711,7 @@ class BridgeConfigTests(unittest.TestCase):
                 with mock.patch.object(span_bridge.socket,"create_connection",return_value=raw_context), \
                      mock.patch.object(span_bridge,"duplex_stream") as relay, \
                      mock.patch.object(bridge,"_report_failure") as failure:
-                    bridge._connection(client)
+                    bridge._connection(client, bridge.resume_epoch)
                 remote.close.assert_called()
                 relay.assert_not_called()
                 failure.assert_not_called()
@@ -824,6 +824,13 @@ class BridgeConfigTests(unittest.TestCase):
             self.assertEqual(span_bridge.load_config(path), [("tool", 49152)])
             path.write_text('[{"name":"tool","port":49152,"methods":["spawn"]}]')
             with self.assertRaisesRegex(RuntimeError, "invalid Span bridge entry"):
+                span_bridge.load_config(path)
+
+    def test_bridge_config_read_is_bounded(self):
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "spans.json"
+            path.write_bytes(b"[]" + b" " * span_bridge.MAX_CONFIG)
+            with self.assertRaisesRegex(RuntimeError, "Span bridge config is too large"):
                 span_bridge.load_config(path)
 
     def test_readiness_uses_a_per_launch_token(self):
@@ -952,7 +959,7 @@ class LauncherGrantTests(unittest.TestCase):
         span = span_runtime.Span("tool", client, root / "tool-span")
         completed = mock.Mock(returncode=0)
         with mock.patch.object(devc2, "require_docker"), \
-             mock.patch.object(devc2, "ensure_v1_not_running"), \
+             mock.patch.object(devc2, "ensure_legacy_devcontainer_not_running"), \
              mock.patch.object(devc2, "ensure_tact_config"), \
              mock.patch.object(devc2, "repository_lock", return_value=contextlib.nullcontext()), \
              mock.patch.object(devc2, "prepare", return_value=public), \

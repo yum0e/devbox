@@ -1,20 +1,18 @@
 """One bounded HTTP CONNECT projection for launch-lifetime World attachments."""
 from __future__ import annotations
 
-import json
 from pathlib import Path
 import re
 import socket
 import threading
 
-from .stream_relay import RESUME_GAP_SECONDS, duplex_stream, enable_tcp_keepalive, transport_clocks, transport_gap
+from .stream_relay import RESUME_GAP_SECONDS, duplex_stream, enable_tcp_keepalive, serve_connections, transport_clocks, transport_gap
+from .config import MAX_CONFIG, NAME, read_json, valid_span_name
 
 
-MAX_CONFIG = 64 * 1024
 MAX_HEADERS = 16 * 1024
 MAX_CONNECTIONS = 256
 LISTEN_BACKLOG = 1024
-NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
 
@@ -23,9 +21,7 @@ class ProjectionError(RuntimeError):
 
 
 def load_routes(path: Path, allowed_names: set[str]) -> dict[str, str]:
-    if path.stat().st_size > MAX_CONFIG:
-        raise ProjectionError("HTTP attachment config is too large")
-    document = json.loads(path.read_text(encoding="utf-8"))
+    document = read_json(path, ProjectionError("HTTP attachment config is too large"))
     if (not isinstance(document, dict) or set(document) != {"v", "routes"}
             or type(document["v"]) is not int or document["v"] != 1):
         raise ProjectionError("invalid HTTP attachment config")
@@ -36,7 +32,7 @@ def load_routes(path: Path, allowed_names: set[str]) -> dict[str, str]:
     for authority, name in routes.items():
         if (not isinstance(authority, str) or not authority.endswith(":443")
                 or not valid_dns(authority[:-4]) or authority != authority.lower()
-                or not isinstance(name, str) or not NAME.fullmatch(name)
+                or not valid_span_name(name)
                 or name not in allowed_names):
             raise ProjectionError("invalid HTTP attachment route")
         result[authority] = name
@@ -73,6 +69,7 @@ class HttpProjection:
         self.lock = threading.Lock()
         self.connections: set[socket.socket] = set()
         self.threads: set[threading.Thread] = set()
+        self.resume_epoch = 0
         self.last_observed_time = transport_clocks()
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -86,6 +83,7 @@ class HttpProjection:
 
     def _retire_connections(self) -> int:
         with self.lock:
+            self.resume_epoch += 1
             connections = tuple(self.connections)
         for connection in connections:
             try:
@@ -98,9 +96,17 @@ class HttpProjection:
                 pass
         return len(connections)
 
-    def _remember(self, *connections: socket.socket) -> None:
+    def _snapshot_epoch(self) -> int:
         with self.lock:
-            self.connections.update(connections)
+            return self.resume_epoch
+
+    def _remember(self, epoch: int, *connections: socket.socket) -> bool:
+        with self.lock:
+            current=epoch==self.resume_epoch
+            if current: self.connections.update(connections)
+        if not current:
+            for connection in connections: connection.close()
+        return current
 
     def _forget(self, *connections: socket.socket) -> None:
         with self.lock:
@@ -119,32 +125,10 @@ class HttpProjection:
 
     def _serve(self) -> None:
         try:
-            while not self.stopping.is_set():
-                client = None
-                try:
-                    client, _address = self.server.accept()
-                except socket.timeout:
-                    pass
-                self._retire_after_resume(transport_clocks())
-                if client is None:
-                    continue
-                while not self.stopping.is_set():
-                    if self.slots.acquire(timeout=0.5):
-                        break
-                    self._retire_after_resume(transport_clocks())
-                else:
-                    client.close()
-                    continue
-                thread = threading.Thread(target=self._handle, args=(client,), daemon=True)
-                with self.lock:
-                    self.threads.add(thread)
-                try:
-                    thread.start()
-                except RuntimeError:
-                    with self.lock:
-                        self.threads.discard(thread)
-                    client.close()
-                    self.slots.release()
+            serve_connections(
+                self.server, self.stopping, self.slots,
+                self._snapshot_epoch, self._retire_after_resume, self._start_worker,
+            )
         except Exception as error:
             if not self.stopping.is_set():
                 print(
@@ -154,9 +138,23 @@ class HttpProjection:
                 self.failed.set()
                 self.stopping.set()
 
-    def _handle(self, client: socket.socket) -> None:
+    def _start_worker(self, client: socket.socket, epoch: int) -> None:
+        thread = threading.Thread(target=self._handle, args=(client,epoch), daemon=True)
+        with self.lock:
+            self.threads.add(thread)
+        try:
+            thread.start()
+        except RuntimeError:
+            with self.lock:
+                self.threads.discard(thread)
+            client.close()
+            self.slots.release()
+
+    def _handle(self, client: socket.socket, epoch: int) -> None:
         upstream = None
-        self._remember(client)
+        if not self._remember(epoch,client):
+            self.slots.release()
+            return
         try:
             client.settimeout(10)
             initial = bytearray()
@@ -177,14 +175,15 @@ class HttpProjection:
                 upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 upstream.settimeout(30)
                 upstream.connect(str(self.socket_dir / f"{route}.sock"))
+                if not self._remember(epoch,upstream): return
                 upstream.sendall(b"T" + initial)
             else:
                 upstream = socket.create_connection((host, 443), timeout=10)
+                if not self._remember(epoch,upstream): return
                 enable_tcp_keepalive(upstream)
                 client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 if len(initial) > header_end:
                     upstream.sendall(initial[header_end:])
-            self._remember(upstream)
             client.settimeout(None)
             upstream.settimeout(None)
             duplex_stream(client, upstream, self.stopping)

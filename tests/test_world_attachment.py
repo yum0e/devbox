@@ -191,6 +191,7 @@ class HttpProjectionTests(unittest.TestCase):
         projection.lock = threading.Lock()
         projection.connections = set()
         projection.threads = set()
+        projection.resume_epoch = 0
         return projection
 
     def test_route_config_is_exact_and_restricted_to_granted_worlds(self):
@@ -215,6 +216,15 @@ class HttpProjectionTests(unittest.TestCase):
                     with self.assertRaises(http_projection.ProjectionError):
                         http_projection.load_routes(path, {"alpha"})
 
+    def test_route_config_read_is_bounded(self):
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "routes.json"
+            path.write_bytes(b'{' + b' ' * http_projection.MAX_CONFIG)
+            with self.assertRaisesRegex(
+                http_projection.ProjectionError, "HTTP attachment config is too large",
+            ):
+                http_projection.load_routes(path, set())
+
     def test_connect_target_requires_the_worlds_canonical_lowercase_authority(self):
         self.assertEqual(
             http_projection.connect_target(b"CONNECT api.example.com:443 HTTP/1.1"),
@@ -233,7 +243,7 @@ class HttpProjectionTests(unittest.TestCase):
                  mock.patch.object(http_projection.socket, "create_connection") as direct, \
                  mock.patch.object(http_projection, "duplex_stream"):
                 peer.sendall(b"CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com\r\n\r\nopaque")
-                projection._handle(client)
+                projection._handle(client,projection.resume_epoch)
             upstream.connect.assert_called_once_with(str(Path(raw) / "alpha.sock"))
             upstream.sendall.assert_called_once_with(
                 b"TCONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com\r\n\r\nopaque"
@@ -245,7 +255,7 @@ class HttpProjectionTests(unittest.TestCase):
             projection=self.projection({},Path(raw))
             projection.last_observed_time=(100,1000)
             proxy,client=socket.socketpair()
-            projection._remember(proxy)
+            projection._remember(projection.resume_epoch,proxy)
             try:
                 with mock.patch("builtins.print") as output:
                     self.assertTrue(projection._retire_after_resume((101,1020)))
@@ -256,6 +266,23 @@ class HttpProjectionTests(unittest.TestCase):
             finally:
                 projection._retire_connections(); proxy.close(); client.close()
 
+    def test_http_projection_rejects_a_pre_resume_epoch_before_upstream_use(self):
+        with tempfile.TemporaryDirectory() as raw:
+            slots=threading.BoundedSemaphore(1)
+            self.assertTrue(slots.acquire(blocking=False))
+            projection=http_projection.HttpProjection({},Path(raw),port=0,slots=slots)
+            projection.resume_epoch=1
+            client,peer=socket.socketpair()
+            try:
+                with mock.patch.object(http_projection.socket,"create_connection") as connect:
+                    projection._handle(client,0)
+                connect.assert_not_called()
+                peer.settimeout(1)
+                self.assertEqual(peer.recv(1),b"")
+                self.assertTrue(slots.acquire(blocking=False))
+            finally:
+                client.close(); peer.close(); projection.server.close()
+
     def test_saturated_http_projection_backpressures_until_capacity_is_available(self):
         with tempfile.TemporaryDirectory() as raw:
             slots = threading.BoundedSemaphore(1)
@@ -265,7 +292,8 @@ class HttpProjectionTests(unittest.TestCase):
             )
             handled = threading.Event()
 
-            def handle(client):
+            def handle(client,epoch):
+                self.assertEqual(epoch,projection.resume_epoch)
                 with client:
                     client.sendall(b"accepted")
                 slots.release()
@@ -295,7 +323,7 @@ class HttpProjectionTests(unittest.TestCase):
                  mock.patch.object(http_projection, "enable_tcp_keepalive") as keepalive, \
                  mock.patch.object(http_projection, "duplex_stream"):
                 peer.sendall(b"CONNECT public.example:443 HTTP/1.1\r\nHost: public.example\r\n\r\ntls")
-                projection._handle(client)
+                projection._handle(client,projection.resume_epoch)
                 response = peer.recv(4096)
             direct.assert_called_once_with(("public.example", 443), timeout=10)
             keepalive.assert_called_once_with(upstream)

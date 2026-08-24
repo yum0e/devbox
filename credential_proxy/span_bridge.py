@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import re
 import signal
@@ -14,7 +13,6 @@ import threading
 from pathlib import Path
 
 
-NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 READY_TOKEN = re.compile(r"^[a-f0-9]{32}$")
 # HTTP tunnels pass through both the HTTP projection and a named Span bridge,
 # so the two layers need independent worker budgets. Sharing one budget makes
@@ -23,7 +21,8 @@ MAX_CONNECTIONS = 256
 LISTEN_BACKLOG = 1024
 MAX_SPANS = 16
 from .http_projection import MAX_CONNECTIONS as MAX_HTTP_CONNECTIONS, HttpProjection, load_routes
-from .stream_relay import RESUME_GAP_SECONDS, duplex_stream, enable_tcp_keepalive, transport_clocks, transport_gap
+from .config import MAX_CONFIG, NAME, read_json, valid_span_name
+from .stream_relay import RESUME_GAP_SECONDS, duplex_stream, enable_tcp_keepalive, serve_connections, transport_clocks, transport_gap
 
 
 class Bridge:
@@ -73,30 +72,10 @@ class Bridge:
 
     def _serve(self) -> None:
         try:
-            while not self.stopping.is_set():
-                client = None
-                try:
-                    client, _address = self.server.accept()
-                except socket.timeout:
-                    pass
-                self._retire_after_resume(transport_clocks())
-                if client is None:
-                    continue
-                while not self.stopping.is_set():
-                    if self.slots.acquire(timeout=0.5):
-                        break
-                    self._retire_after_resume(transport_clocks())
-                else:
-                    client.close()
-                    continue
-                with self.connections_lock:
-                    epoch=self.resume_epoch
-                thread = threading.Thread(target=self._connection, args=(client,epoch), daemon=True)
-                try:
-                    thread.start()
-                except RuntimeError:
-                    client.close()
-                    self.slots.release()
+            serve_connections(
+                self.server, self.stopping, self.slots,
+                self._snapshot_epoch, self._retire_after_resume, self._start_worker,
+            )
         except Exception as error:
             if not self.stopping.is_set():
                 print(
@@ -105,6 +84,20 @@ class Bridge:
                 )
                 self.failed.set()
                 self.stopping.set()
+
+    def _snapshot_epoch(self) -> int:
+        with self.connections_lock:
+            return self.resume_epoch
+
+    def _start_worker(self, client: socket.socket, epoch: int) -> None:
+        thread = threading.Thread(
+            target=self._connection, args=(client, epoch), daemon=True,
+        )
+        try:
+            thread.start()
+        except RuntimeError:
+            client.close()
+            self.slots.release()
 
     def _retire_after_resume(self, observed_time: tuple[float, float]) -> bool:
         gap = transport_gap(self.last_observed_time, observed_time)
@@ -142,11 +135,9 @@ class Bridge:
             connection.close()
         return current
 
-    def _connection(self, client: socket.socket, epoch: int | None = None) -> None:
+    def _connection(self, client: socket.socket, epoch: int) -> None:
         tracked: list[socket.socket] = [client]
         stage = "host connection"
-        if epoch is None:
-            with self.connections_lock: epoch=self.resume_epoch
         if not self._remember(client,epoch):
             self.slots.release()
             return
@@ -192,9 +183,7 @@ class Bridge:
 
 
 def load_config(path: Path) -> list[tuple[str, int]]:
-    if path.stat().st_size > 64 * 1024:
-        raise RuntimeError("Span bridge config is too large")
-    document = json.loads(path.read_text(encoding="utf-8"))
+    document = read_json(path, RuntimeError("Span bridge config is too large"))
     if not isinstance(document, list):
         raise RuntimeError("Span bridge config must be a list")
     if len(document)>MAX_SPANS:
@@ -205,7 +194,7 @@ def load_config(path: Path) -> list[tuple[str, int]]:
         if not isinstance(item, dict) or set(item) != {"name", "port"}:
             raise RuntimeError("invalid Span bridge entry")
         name, port = item["name"], item["port"]
-        if not isinstance(name, str) or not NAME.fullmatch(name) or name in names:
+        if not valid_span_name(name) or name in names:
             raise RuntimeError("invalid or duplicate Span bridge name")
         if not isinstance(port, int) or not 1 <= port <= 65535:
             raise RuntimeError("invalid Span bridge port")

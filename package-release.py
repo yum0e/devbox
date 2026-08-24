@@ -7,16 +7,14 @@ import os
 import shutil
 import tarfile
 from pathlib import Path
+from launcher.asset_contract import ASSET_ROOTS, EXECUTABLE_ASSETS, validate_required_assets
 
 ROOT=Path(__file__).resolve().parent
-REPO=ROOT.parent
-DIST=REPO/"dist"
-INCLUDE=("Dockerfile","compose.yaml","README.md","install.sh","devbox","credential_proxy","launcher","spans")
-EXECUTABLE={"install.sh","devbox/entrypoint.sh","devbox/configure-pi.sh","devbox/configure-signing.sh","devbox/configure-herdr.sh","devbox/herdr-git-metadata","launcher/devc2.py","launcher/dispatcher.py","launcher/command_projection.py","spans/http-credential-world","spans/ssh-agent/world","spans/diagnostics/world"}
+DIST=ROOT/"dist"
 
 def files():
     result=[]
-    for name in INCLUDE:
+    for name in ASSET_ROOTS:
         path=ROOT/name
         if path.is_symlink(): raise RuntimeError(f"refusing to package symlink: {path}")
         if path.is_dir():
@@ -27,6 +25,7 @@ def files():
     return sorted(result,key=lambda p:str(p.relative_to(ROOT)))
 
 def main():
+    validate_required_assets(ROOT)
     DIST.mkdir(exist_ok=True)
     archive=DIST/"devc2.tar.gz"
     with archive.open("wb") as raw:
@@ -41,7 +40,7 @@ def main():
                     info=tarfile.TarInfo(str(directory)+"/"); info.type=tarfile.DIRTYPE; info.mode=0o755; info.uid=info.gid=0; info.uname=info.gname=""; info.mtime=0
                     package.addfile(info)
                 for path in files():
-                    relative=path.relative_to(ROOT); data=path.read_bytes(); info=tarfile.TarInfo(str(Path("devc2")/relative)); info.size=len(data); info.mode=0o755 if str(relative) in EXECUTABLE else 0o644; info.uid=info.gid=0; info.uname=info.gname=""; info.mtime=0
+                    relative=path.relative_to(ROOT); data=path.read_bytes(); info=tarfile.TarInfo(str(Path("devc2")/relative)); info.size=len(data); info.mode=0o755 if str(relative) in EXECUTABLE_ASSETS else 0o644; info.uid=info.gid=0; info.uname=info.gname=""; info.mtime=0
                     package.addfile(info,io.BytesIO(data))
     digest=hashlib.sha256(archive.read_bytes()).hexdigest()
     (DIST/"devc2.tar.gz.sha256").write_text(f"{digest}  devc2.tar.gz\n",encoding="ascii")

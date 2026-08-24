@@ -5,6 +5,7 @@ readonly workspace="${TACT_WORKSPACE:-/workspace}"
 mkdir -p "$TACT_HOME"
 /usr/local/libexec/devc2/configure-pi
 /usr/local/libexec/devc2/configure-herdr
+/usr/local/libexec/devc2/configure-gh-stack
 
 report_span_diagnostics() {
   if command -v diagnostics >/dev/null 2>&1; then

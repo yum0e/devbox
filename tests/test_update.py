@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -25,20 +26,11 @@ class UpdateTests(unittest.TestCase):
         D.STATE=root/"state"; D.INSTALL_LOCK=D.STATE/"install.lock"; D.UPDATE_LOCK=D.STATE/"update.lock"; D.INSTALL_STATE=D.STATE/"installation.json"
 
     def test_current_tree_satisfies_bridge_updater_asset_contract(self):
-        bridge_required=(
-            "Dockerfile", "compose.yaml", "devbox/entrypoint.sh", "devbox/configure-pi.sh",
-            "devbox/configure-signing.sh", "devbox/configure-herdr.sh",
-            "devbox/herdr-git-metadata",
-            "devbox/herdr-zsh-integration.zsh",
-            "launcher/devc2.py", "launcher/span_runtime.py", "launcher/span_supervisor.py",
-            "launcher/dispatcher.py", "launcher/command_projection.py",
-            "launcher/world_attachment.py",
-            "credential_proxy/span_bridge.py", "credential_proxy/stream_relay.py",
-            "credential_proxy/http_projection.py", "spans/http-credential-world",
-            "spans/ssh-agent/world", "spans/diagnostics/world",
-        )
-        for relative in bridge_required:
+        for relative in D.REQUIRED_ASSETS:
             self.assertTrue((ROOT/relative).is_file(),relative)
+        self.assertIn("launcher/asset_contract.py",D.REQUIRED_ASSETS)
+        self.assertIn("credential_proxy/config.py",D.REQUIRED_ASSETS)
+        self.assertIn("devbox/configure-gh-stack.sh",D.REQUIRED_ASSETS)
         for relative in (
             "devbox/herdr-wrapper.py", "devbox/tact-wrapper.sh", "devbox/pi-wrapper.sh",
             "launcher/scoped_exec_projection.py",
@@ -82,7 +74,7 @@ class UpdateTests(unittest.TestCase):
                 environment={**os.environ,"DEVC2_DATA_DIR":str(share),"XDG_STATE_HOME":str(root/"dispatcher-state")}
                 version=subprocess.run([str(bin_dir/"devc2"),"--version"],env=environment,text=True,capture_output=True)
                 self.assertEqual(version.stdout.strip(),f"devc2 {second_version}")
-                completed=subprocess.run([sys.executable,str(share/"bootstrap"/"dispatcher.py"),"rollback"],env=environment,text=True,capture_output=True)
+                completed=subprocess.run([str(bin_dir/"devc2"),"rollback"],env=environment,text=True,capture_output=True)
                 self.assertEqual(completed.returncode,0,completed.stderr)
                 self.assertIn(f"rolled back devc2 to {first_version}",completed.stdout)
                 version=subprocess.run([str(bin_dir/"devc2"),"--version"],env=environment,text=True,capture_output=True)
@@ -96,7 +88,7 @@ class UpdateTests(unittest.TestCase):
             self.assertEqual(sentinel.read_bytes(),b"unchanged\x00config")
             self.assertEqual(state_sentinel.read_bytes(),b"unchanged state")
             self.assertFalse((root/".zshrc").exists())
-            self.assertIn("bootstrap/dispatcher.py",(bin_dir/"devc2").read_text())
+            self.assertIn("launcher/dispatcher.py",(bin_dir/"devc2").read_text())
 
     def test_install_refuses_while_shared_session_lock_is_held(self):
         with tempfile.TemporaryDirectory() as td:
@@ -236,12 +228,34 @@ class UpdateTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,"checkout source is unavailable"):
                 D.update_installation()
 
+    def test_checkout_update_explains_former_v2_layout_migration(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); self.runtime(root); D.STATE.mkdir()
+            source=root/"source"; shutil.copytree(ROOT,source,ignore=shutil.ignore_patterns("__pycache__"))
+            old_source=source/"v2"
+            D.atomic_write(D.INSTALL_STATE,json.dumps({"schema":1,"install_kind":"checkout","source_dir":str(old_source)})+"\n")
+            with self.assertRaisesRegex(RuntimeError,rf"run {re.escape(str(source/'install.sh'))} once"):
+                D.update_installation()
+
     def test_updates_are_serialized_separately_from_session_lifecycle(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); self.runtime(root); D.STATE.mkdir()
             with D.forward_update_lock():
                 with self.assertRaisesRegex(RuntimeError,"another devc2 update"):
                     with D.forward_update_lock(): pass
+
+    def test_inherited_control_fd_must_really_hold_the_claimed_lock(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); self.runtime(root); D.STATE.mkdir()
+            D.INSTALL_LOCK.touch()
+            with D.INSTALL_LOCK.open("a+") as active, D.INSTALL_LOCK.open("a+") as forged:
+                fcntl.flock(active,fcntl.LOCK_SH|fcntl.LOCK_NB)
+                environment={
+                    "DEVC2_CONTROL_LOCK_FD":str(forged.fileno()),
+                    "DEVC2_CONTROL_LOCK_MODE":"exclusive",
+                }
+                with mock.patch.dict(os.environ,environment,clear=False), self.assertRaisesRegex(RuntimeError,"not held"):
+                    with D.lifecycle_lock(True): pass
 
     def test_checkout_snapshot_rejects_source_changes_during_copy(self):
         with tempfile.TemporaryDirectory() as td:
@@ -254,6 +268,44 @@ class UpdateTests(unittest.TestCase):
             with mock.patch.object(D,"copy_release_assets",side_effect=changing_copy), self.assertRaisesRegex(RuntimeError,"changed while"):
                 D.install_from_directory(source,root/"bin",root/"share")
             self.assertFalse((root/"share"/"current").exists())
+
+    def test_wrapper_dispatcher_comes_from_verified_snapshot(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); self.runtime(root)
+            source=root/"source"; shutil.copytree(ROOT,source,ignore=shutil.ignore_patterns("__pycache__"))
+            original=(source/"launcher"/"dispatcher.py").read_bytes()
+            real_freeze=D.freeze_asset_tree
+            def mutate_source_after_freeze(staging):
+                real_freeze(staging)
+                (source/"launcher"/"dispatcher.py").write_text("raise SystemExit('mutated')\n")
+            share=root/"share"
+            with mock.patch.object(D,"freeze_asset_tree",side_effect=mutate_source_after_freeze), contextlib.redirect_stdout(io.StringIO()):
+                D.install_from_directory(source,root/"bin",share)
+            current=(share/"current").resolve()
+            wrapper=(root/"bin"/"devc2").read_text()
+            self.assertIn(str(current/"launcher"/"dispatcher.py"),wrapper)
+            self.assertEqual((current/"launcher"/"dispatcher.py").read_bytes(),original)
+
+    def test_exclusive_install_prunes_only_unreferenced_verified_generations(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); self.runtime(root); bin_dir=root/"bin"; share=root/"share"
+            sources=[]
+            for index in range(3):
+                source=root/f"source-{index}"; shutil.copytree(ROOT,source,ignore=shutil.ignore_patterns("__pycache__"))
+                (source/"README.md").write_text((source/"README.md").read_text()+f"\ngeneration {index}\n")
+                sources.append(source)
+            with contextlib.redirect_stdout(io.StringIO()):
+                D.install_from_directory(sources[0],bin_dir,share)
+                first=(share/"current").resolve()
+                D.install_from_directory(sources[1],bin_dir,share)
+                second=(share/"current").resolve()
+                unknown=share/"versions"/"user-data"; unknown.mkdir(); (unknown/"keep").write_text("keep")
+                D.install_from_directory(sources[2],bin_dir,share)
+            third=(share/"current").resolve()
+            self.assertFalse(first.exists())
+            self.assertEqual((share/"previous").resolve(),second)
+            self.assertEqual(third,(share/"current").resolve())
+            self.assertTrue((unknown/"keep").is_file())
 
     def test_update_uses_invoked_wrapper_paths_not_global_metadata(self):
         with tempfile.TemporaryDirectory() as td:
@@ -275,6 +327,7 @@ class UpdateTests(unittest.TestCase):
             with mock.patch.dict(os.environ,{"DEVC2_BIN_DIR":str(bin_dir),"DEVC2_DATA_DIR":str(share)},clear=False), contextlib.redirect_stdout(io.StringIO()):
                 D.install_from_directory(source1,bin_dir,share)
                 before=(share/"installation.json").read_bytes(); old=json.loads(before)["current"]
+                wrapper_before=(bin_dir/"devc2").read_bytes()
                 real_replace=D.os.replace
                 def fail_record(source,destination):
                     if Path(destination)==share/"installation.json": raise OSError("injected record failure")
@@ -282,6 +335,7 @@ class UpdateTests(unittest.TestCase):
                 with mock.patch.object(D.os,"replace",side_effect=fail_record), self.assertRaisesRegex(OSError,"record failure"):
                     D.install_from_directory(source2,bin_dir,share)
             self.assertEqual((share/"installation.json").read_bytes(),before)
+            self.assertEqual((bin_dir/"devc2").read_bytes(),wrapper_before)
             self.assertEqual(str((share/"current").resolve()),old)
 
     def test_first_record_failure_leaves_legacy_wrapper_usable(self):
@@ -299,6 +353,54 @@ class UpdateTests(unittest.TestCase):
                 D.install_from_directory(ROOT,bin_dir,share)
             self.assertEqual(wrapper.read_text(),original)
             self.assertFalse((share/"installation.json").exists())
+
+    def test_interruption_after_record_commit_leaves_prior_wrapper_usable(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); self.runtime(root); source1=root/"source1"; source2=root/"source2"
+            shutil.copytree(ROOT,source1,ignore=shutil.ignore_patterns("__pycache__"))
+            shutil.copytree(ROOT,source2,ignore=shutil.ignore_patterns("__pycache__"))
+            (source2/"README.md").write_text((source2/"README.md").read_text()+"\nnew generation\n")
+            bin_dir=root/"bin"; share=root/"share"
+            with mock.patch.dict(os.environ,{"DEVC2_BIN_DIR":str(bin_dir),"DEVC2_DATA_DIR":str(share)},clear=False), contextlib.redirect_stdout(io.StringIO()):
+                D.install_from_directory(source1,bin_dir,share)
+                wrapper_before=(bin_dir/"devc2").read_bytes()
+                current_before=json.loads((share/"installation.json").read_text())["current"]
+                real_atomic_write=D.atomic_write
+                def interrupt_wrapper(path,*args,**kwargs):
+                    if Path(path)==bin_dir/"devc2": raise KeyboardInterrupt("injected interruption")
+                    return real_atomic_write(path,*args,**kwargs)
+                with mock.patch.object(D,"atomic_write",side_effect=interrupt_wrapper), self.assertRaises(KeyboardInterrupt):
+                    D.install_from_directory(source2,bin_dir,share)
+            self.assertEqual((bin_dir/"devc2").read_bytes(),wrapper_before)
+            current=json.loads((share/"installation.json").read_text())["current"]
+            self.assertNotEqual(current,current_before)
+            completed=subprocess.run([str(bin_dir/"devc2"),"--help"],env={**os.environ,"DEVC2_DATA_DIR":str(share),"DEVC2_BIN_DIR":str(bin_dir)},text=True,capture_output=True)
+            self.assertEqual(completed.returncode,0,completed.stderr)
+
+    def test_rollback_preserves_wrapper_generation_after_repeated_interruptions(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); self.runtime(root); bin_dir=root/"bin"; share=root/"share"; sources=[]
+            for index in range(3):
+                source=root/f"source-{index}"
+                shutil.copytree(ROOT,source,ignore=shutil.ignore_patterns("__pycache__"))
+                (source/"README.md").write_text((source/"README.md").read_text()+f"\ngeneration {index}\n")
+                sources.append(source)
+            environment={"DEVC2_BIN_DIR":str(bin_dir),"DEVC2_DATA_DIR":str(share)}
+            with mock.patch.dict(os.environ,environment,clear=False), contextlib.redirect_stdout(io.StringIO()):
+                D.install_from_directory(sources[0],bin_dir,share)
+                wrapper_generation=D.wrapper_root(bin_dir/"devc2")
+                real_atomic_write=D.atomic_write
+                def interrupt_wrapper(path,*args,**kwargs):
+                    if Path(path)==bin_dir/"devc2": raise KeyboardInterrupt("injected interruption")
+                    return real_atomic_write(path,*args,**kwargs)
+                for source in sources[1:]:
+                    with mock.patch.object(D,"atomic_write",side_effect=interrupt_wrapper), self.assertRaises(KeyboardInterrupt):
+                        D.install_from_directory(source,bin_dir,share)
+                D.rollback_installation()
+            self.assertTrue(wrapper_generation.is_dir())
+            self.assertEqual(D.wrapper_root(bin_dir/"devc2"),wrapper_generation)
+            completed=subprocess.run([str(bin_dir/"devc2"),"--help"],env={**os.environ,**environment},text=True,capture_output=True)
+            self.assertEqual(completed.returncode,0,completed.stderr)
 
     def test_legacy_metadata_and_pointer_migrate_when_record_is_absent(self):
         with tempfile.TemporaryDirectory() as td:
@@ -404,7 +506,7 @@ class UpdateTests(unittest.TestCase):
         self.assertNotIn("sudo",text)
         for name in (".zshrc",".bashrc",".profile",".zprofile"): self.assertNotIn(name,text)
         self.assertNotIn("--force",text)
-        workflow=(ROOT.parent/".github"/"workflows"/"devc2-release.yml").read_text()
+        workflow=(ROOT/".github"/"workflows"/"devc2-release.yml").read_text()
         self.assertIn("github.ref_protected",workflow)
         self.assertIn("merge-base --is-ancestor",workflow)
         self.assertIn("environment: devc2-release",workflow)

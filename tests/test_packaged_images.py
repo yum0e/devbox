@@ -21,6 +21,7 @@ EXPECTED_EXECUTABLES = {
     "install.sh", "devbox/entrypoint.sh", "devbox/configure-pi.sh",
     "devbox/configure-signing.sh",
     "devbox/configure-herdr.sh",
+    "devbox/configure-gh-stack.sh",
     "devbox/herdr-git-metadata",
     "launcher/devc2.py", "launcher/dispatcher.py",
     "launcher/command_projection.py", "spans/http-credential-world",
@@ -64,7 +65,7 @@ class PackagedImageTests(unittest.TestCase):
             self.assertIn("devc2/spans/http-credential-world", members)
             self.assertNotIn("devc2/spans/openai/world", members)
             self.assertNotIn("devc2/spans/github/world", members)
-            self.assertEqual(PACKAGER.EXECUTABLE, EXPECTED_EXECUTABLES)
+            self.assertEqual(PACKAGER.EXECUTABLE_ASSETS, EXPECTED_EXECUTABLES)
             for relative in EXPECTED_EXECUTABLES:
                 member = members["devc2/" + relative]
                 self.assertTrue(member.isfile(), relative)
@@ -88,6 +89,17 @@ class PackagedImageTests(unittest.TestCase):
                     for relative in local:
                         self.assertTrue((package_root / relative).exists(),
                                         f"{dockerfile.relative_to(package_root)} requires {relative}")
+
+    def test_packager_rejects_an_incomplete_runtime_before_writing(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root=Path(raw); previous_root=PACKAGER.ROOT; previous_dist=PACKAGER.DIST
+            PACKAGER.ROOT=root; PACKAGER.DIST=root/"dist"
+            try:
+                with self.assertRaisesRegex(RuntimeError,"lacks required asset"):
+                    PACKAGER.main()
+                self.assertFalse(PACKAGER.DIST.exists())
+            finally:
+                PACKAGER.ROOT=previous_root; PACKAGER.DIST=previous_dist
 
     @unittest.skipUnless(os.environ.get("DEVC2_TEST_PACKAGED_IMAGES") == "1",
                          "set DEVC2_TEST_PACKAGED_IMAGES=1 on a Docker host")

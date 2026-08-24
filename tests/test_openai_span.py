@@ -19,7 +19,6 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXAMPLE = ROOT / "examples" / "openai-span"
 WORLD_PATH = ROOT / "spans" / "http-credential-world"
 
 

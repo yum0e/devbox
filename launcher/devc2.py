@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Trusted macOS launcher for devbox v2."""
+"""Trusted macOS launcher for devbox."""
 from __future__ import annotations
 import argparse, base64, contextlib, errno, fcntl, gzip, hashlib, json, os, platform, re, secrets, shlex, shutil, signal, stat, subprocess, sys, tarfile, tempfile, time, unicodedata, urllib.error, urllib.parse, urllib.request
 from pathlib import Path, PurePosixPath
@@ -8,6 +8,7 @@ from typing import NamedTuple
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 import span_runtime
+from asset_contract import ASSET_ROOTS, EXECUTABLE_ASSETS, REQUIRED_ASSETS, validate_required_assets
 
 VERSION="0.2.0"
 SOURCE_ROOT=Path(__file__).resolve().parents[1]
@@ -16,7 +17,7 @@ ROOT=INSTALLED_ROOT if (INSTALLED_ROOT/"compose.yaml").is_file() else SOURCE_ROO
 BUILTIN_AGENT_SKILLS=ROOT/"devbox"/"agent-skills"
 
 def asset_digest(source):
-    digest=hashlib.sha256(); runtime_roots={"Dockerfile","compose.yaml","README.md","devbox","credential_proxy","launcher","spans"}
+    digest=hashlib.sha256(); runtime_roots=set(ASSET_ROOTS)
     for path in sorted(p for p in source.rglob("*") if p.is_file()):
         relative=path.relative_to(source)
         if relative.parts[0] not in runtime_roots or "tests" in relative.parts or "__pycache__" in relative.parts: continue
@@ -69,7 +70,11 @@ def lifecycle_lock(exclusive):
         except (ValueError,OSError,FileNotFoundError) as error:
             raise RuntimeError("invalid inherited installation lock") from error
         mode=os.environ.get("DEVC2_CONTROL_LOCK_MODE")
+        if mode not in {"shared","exclusive"}: raise RuntimeError("invalid inherited installation lock")
         if exclusive and mode!="exclusive": raise RuntimeError("management command requires the exclusive installation lock")
+        operation=fcntl.LOCK_EX if mode=="exclusive" else fcntl.LOCK_SH
+        try: fcntl.flock(descriptor,operation|fcntl.LOCK_NB)
+        except BlockingIOError as error: raise RuntimeError("inherited installation lock is not held") from error
         yield
         return
     STATE.mkdir(parents=True,exist_ok=True,mode=0o700)
@@ -83,19 +88,25 @@ def lifecycle_lock(exclusive):
         finally: fcntl.flock(lock,fcntl.LOCK_UN)
 
 @contextlib.contextmanager
-def forward_update_lock():
-    STATE.mkdir(parents=True,exist_ok=True,mode=0o700)
-    with UPDATE_LOCK.open("a+") as lock:
+def exclusive_lock(path,busy_message):
+    path.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+    with path.open("a+") as lock:
         try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        except BlockingIOError as error: raise RuntimeError("another devc2 update is already active") from error
+        except BlockingIOError as error: raise RuntimeError(busy_message) from error
         try: yield
         finally: fcntl.flock(lock,fcntl.LOCK_UN)
 
 @contextlib.contextmanager
+def forward_update_lock():
+    with exclusive_lock(UPDATE_LOCK,"another devc2 update is already active"):
+        yield
+
+@contextlib.contextmanager
 def repository_lock(repo):
     locks=STATE/"locks"; locks.mkdir(parents=True,exist_ok=True,mode=0o700)
-    legacy_directory=STATE/identity(repo)[0]; legacy_directory.mkdir(parents=True,exist_ok=True,mode=0o700)
-    with (locks/f"{identity(repo)[0]}.lock").open("a+") as lock, (legacy_directory/"launch.lock").open("a+") as legacy:
+    digest=identity(repo)[0]
+    legacy_directory=STATE/digest; legacy_directory.mkdir(parents=True,exist_ok=True,mode=0o700)
+    with (locks/f"{digest}.lock").open("a+") as lock, (legacy_directory/"launch.lock").open("a+") as legacy:
         acquired=[]
         try:
             for candidate in (lock,legacy):
@@ -107,21 +118,15 @@ def repository_lock(repo):
 
 @contextlib.contextmanager
 def repair_lock(repo):
-    locks=STATE/"repairs"; locks.mkdir(parents=True,exist_ok=True,mode=0o700)
-    with (locks/f"{identity(repo)[0]}.lock").open("a+") as lock:
-        try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        except BlockingIOError as error: raise RuntimeError("another repair is already active for this checkout") from error
-        try: yield
-        finally: fcntl.flock(lock,fcntl.LOCK_UN)
+    path=STATE/"repairs"/f"{identity(repo)[0]}.lock"
+    with exclusive_lock(path,"another repair is already active for this checkout"):
+        yield
 
 @contextlib.contextmanager
 def skills_refresh_lock(repo):
-    locks=STATE/"skill-refresh"; locks.mkdir(parents=True,exist_ok=True,mode=0o700)
-    with (locks/f"{identity(repo)[0]}.lock").open("a+") as lock:
-        try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        except BlockingIOError as error: raise RuntimeError("another skill refresh is already active for this checkout") from error
-        try: yield
-        finally: fcntl.flock(lock,fcntl.LOCK_UN)
+    path=STATE/"skill-refresh"/f"{identity(repo)[0]}.lock"
+    with exclusive_lock(path,"another skill refresh is already active for this checkout"):
+        yield
 
 def active_legacy_sessions():
     active=[]
@@ -231,9 +236,8 @@ def source_version(source):
     return match.group(1)
 
 def validate_asset_tree(source,strict=False):
-    required=("Dockerfile","compose.yaml","devbox/entrypoint.sh","devbox/configure-pi.sh","devbox/configure-signing.sh","devbox/configure-herdr.sh","devbox/herdr-git-metadata","devbox/herdr-zsh-integration.zsh","launcher/devc2.py","launcher/span_runtime.py","launcher/span_supervisor.py","launcher/dispatcher.py","launcher/command_projection.py","launcher/world_attachment.py","credential_proxy/span_bridge.py","credential_proxy/stream_relay.py","credential_proxy/http_projection.py","spans/http-credential-world","spans/ssh-agent/world","spans/diagnostics/world")
     if not source.is_dir() or source.is_symlink(): raise RuntimeError("release asset root must be a directory")
-    total=0; count=0; allowed={"Dockerfile","compose.yaml","README.md","install.sh","devbox","credential_proxy","launcher","spans"}
+    total=0; count=0; allowed=set(ASSET_ROOTS)
     for path in source.rglob("*"):
         relative=path.relative_to(source)
         unexpected=not relative.parts or relative.parts[0] not in allowed or "__pycache__" in relative.parts or "tests" in relative.parts
@@ -249,9 +253,7 @@ def validate_asset_tree(source,strict=False):
             total+=metadata.st_size
             if metadata.st_size>MAX_RELEASE_BYTES or total>MAX_RELEASE_BYTES:
                 raise RuntimeError("release assets exceed the size limit")
-    for name in required:
-        path=source/name
-        if not path.is_file() or path.is_symlink(): raise RuntimeError(f"release lacks required asset: {name}")
+    validate_required_assets(source)
     return source_version(source)
 
 def installation_record(data_root=None):
@@ -322,7 +324,7 @@ def wrapper_root(wrapper):
     import re
     try: text=wrapper.read_text(encoding="utf-8")
     except OSError: return None
-    match=re.search(r"^export (DEVC2_SHARE_DIR|DEVC2_DATA_DIR)=(.+)$",text,re.MULTILINE)
+    match=re.search(r"^export (DEVC2_WRAPPER_ROOT|DEVC2_SHARE_DIR|DEVC2_DATA_DIR)=(.+)$",text,re.MULTILINE)
     if not match: return None
     try:
         fields=shlex.split(match.group(2))
@@ -331,13 +333,13 @@ def wrapper_root(wrapper):
         return root.resolve() if len(fields)==1 else None
     except ValueError: return None
 
-def install_wrapper_text(data_root,bin_dir):
-    return "#!/usr/bin/env bash\n"+f"export DEVC2_DATA_DIR={shlex.quote(str(data_root))}\n"+f"export DEVC2_BIN_DIR={shlex.quote(str(bin_dir))}\n"+'exec python3 "$DEVC2_DATA_DIR/bootstrap/dispatcher.py" "$@"\n'
+def install_wrapper_text(data_root,bin_dir,runtime_root):
+    dispatcher=runtime_root/"launcher"/"dispatcher.py"
+    return "#!/usr/bin/env bash\n"+f"export DEVC2_WRAPPER_ROOT={shlex.quote(str(runtime_root))}\n"+f"export DEVC2_DATA_DIR={shlex.quote(str(data_root))}\n"+f"export DEVC2_BIN_DIR={shlex.quote(str(bin_dir))}\n"+f"exec python3 {shlex.quote(str(dispatcher))} \"$@\"\n"
 
 def copy_release_assets(source,destination):
-    allowed=("Dockerfile","compose.yaml","README.md","devbox","credential_proxy","launcher","spans")
     destination.mkdir(mode=0o700)
-    for name in allowed:
+    for name in ASSET_ROOTS:
         origin=source/name
         if not origin.exists(): continue
         target=destination/name
@@ -346,14 +348,14 @@ def copy_release_assets(source,destination):
     for path in destination.rglob("*"):
         if path.is_dir(): path.chmod(0o755)
         elif path.is_file(): path.chmod(0o644)
-    for relative in ("launcher/devc2.py","launcher/dispatcher.py","launcher/command_projection.py","devbox/entrypoint.sh","devbox/configure-pi.sh","devbox/configure-signing.sh","devbox/configure-herdr.sh","devbox/herdr-git-metadata","spans/http-credential-world","spans/ssh-agent/world","spans/diagnostics/world"):
+    for relative in EXECUTABLE_ASSETS:
         (destination/relative).chmod(0o755)
 
 def freeze_asset_tree(destination):
     for path in destination.rglob("*"):
         if path.is_dir(): path.chmod(0o555)
         elif path.is_file(): path.chmod(0o444)
-    for relative in ("launcher/devc2.py","launcher/dispatcher.py","launcher/command_projection.py","devbox/entrypoint.sh","devbox/configure-pi.sh","devbox/configure-signing.sh","devbox/configure-herdr.sh","devbox/herdr-git-metadata","spans/http-credential-world","spans/ssh-agent/world","spans/diagnostics/world"):
+    for relative in EXECUTABLE_ASSETS:
         (destination/relative).chmod(0o555)
     destination.chmod(0o555)
 
@@ -390,6 +392,33 @@ def installed_version(root):
         if root.name in {base,local}: return root.name
     return base
 
+def prune_unreferenced_versions(share_dir):
+    """Remove verified generations not named by the committed schema-2 record."""
+    state=read_installation_state(share_dir)
+    if state.get("schema")!=2: return
+    referenced={Path(state[name]) for name in ("current","previous","manager") if state.get(name)}
+    versions=share_dir/"versions"
+    # The wrapper replacement deliberately follows the record commit. Preserve
+    # its immutable dispatcher generation across interrupted activations until
+    # a later successful activation advances the wrapper.
+    wrapper=wrapper_root(Path(state["bin_dir"])/"devc2")
+    if wrapper and wrapper.parent==versions:
+        try: validate_asset_tree(wrapper,True)
+        except (OSError,RuntimeError): pass
+        else: referenced.add(wrapper)
+    try: candidates=tuple(versions.iterdir())
+    except FileNotFoundError: return
+    for candidate in candidates:
+        if candidate in referenced: continue
+        try:
+            metadata=candidate.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode): continue
+            base=validate_asset_tree(candidate,True)
+            local=f"{base}+local.{asset_digest(candidate)[:12]}"
+            if candidate.name not in {base,local}: continue
+        except (OSError,RuntimeError): continue
+        remove_staging(candidate)
+
 def _activate_assets(source,bin_dir,share_dir,release=False):
     version=validate_asset_tree(source)
     bin_dir=bin_dir.expanduser().absolute(); share_dir=share_dir.expanduser().absolute()
@@ -418,13 +447,10 @@ def _activate_assets(source,bin_dir,share_dir,release=False):
             raise
     elif validate_asset_tree(target,True)!=version or asset_digest(target)!=digest:
         raise RuntimeError(f"existing installation target failed immutable content validation: {target}")
-    # Everything a newly committed record can name must exist before that single
-    # atomic commit. Existing launchers keep their already-resolved root.
-    bootstrap=share_dir/"bootstrap"; bootstrap.mkdir(exist_ok=True)
-    ensure_owned_directory(bootstrap)
-    dispatcher_source=source/"launcher"/"dispatcher.py"
-    atomic_write(bootstrap/"dispatcher.py",dispatcher_source.read_bytes(),0o555)
-    expected_wrapper=install_wrapper_text(share_dir,bin_dir)
+    # The wrapper names an immutable dispatcher. Commit the record first: an old
+    # wrapper can read the new schema, and a new wrapper can read the old schema,
+    # so interruption on either side of the commit always leaves a usable pair.
+    expected_wrapper=install_wrapper_text(share_dir,bin_dir,target)
     if old_root==target:
         raw_previous=existing_state.get("previous")
         if raw_previous: previous_root=Path(raw_previous)
@@ -446,15 +472,15 @@ def _activate_assets(source,bin_dir,share_dir,release=False):
         previous_install_kind=None; previous_source_dir=None
     metadata={"schema":2,"version":install_id,"current":str(target),"previous":str(previous_root) if previous_root else None,"manager":str(target),"previous_version":previous_version,"bin_dir":str(bin_dir),"share_dir":str(share_dir),"install_kind":"release" if release else "checkout","source_dir":None if release else str(source.resolve()),"previous_install_kind":previous_install_kind,"previous_source_dir":previous_source_dir,"installed_at":int(time.time())}
     write_installation_record(share_dir,metadata)
-    # A legacy wrapper remains usable until the record commit. Once committed,
-    # the prepared dispatcher can route entirely from that record.
+    # A legacy or prior-generation wrapper remains usable after the record
+    # commit. Replacing it now only advances the immutable dispatcher it uses.
     if not launcher_path.exists() or launcher_path.read_text(encoding="utf-8")!=expected_wrapper:
         atomic_write(launcher_path,expected_wrapper,0o555)
     mirror_symlink(share_dir/"manager",target)
     mirror_symlink(previous_link,previous_root)
     mirror_symlink(current_link,target)
     print(f"installed devc2 {install_id}: {launcher_path}")
-    print(f"installed v2 assets: {target}")
+    print(f"installed devc2 assets: {target}")
     if previous_root: print(f"rollback preserved: {previous_root}")
     if str(bin_dir) not in os.environ.get("PATH","").split(os.pathsep): print(f"note: add {bin_dir} to PATH")
     return 0
@@ -463,7 +489,9 @@ def install_from_directory(source,bin_dir,share_dir,release=False):
     with lifecycle_lock(True):
         active=active_legacy_sessions()
         if active: raise RuntimeError("cannot install while a devc2 session is active")
-        return _activate_assets(source.resolve(),bin_dir,share_dir,release)
+        result=_activate_assets(source.resolve(),bin_dir,share_dir,release)
+        prune_unreferenced_versions(share_dir.expanduser().absolute())
+        return result
 
 def parse_release_version(tag):
     import re
@@ -584,6 +612,15 @@ def extract_release(archive,destination):
     validate_asset_tree(source,True)
     return source
 
+def promoted_checkout_hint(source):
+    if source.name!="v2": return ""
+    candidate=source.parent
+    try:
+        candidate=candidate.resolve(strict=True)
+        validate_asset_tree(candidate)
+    except (OSError,RuntimeError): return ""
+    return f"; repository layout changed: run {candidate/'install.sh'} once"
+
 def update_installation():
     with lifecycle_lock(False), forward_update_lock():
         data_root=Path(os.environ.get("DEVC2_DATA_DIR",Path.home()/".local/share/devc2"))
@@ -591,11 +628,17 @@ def update_installation():
         if state.get("install_kind")=="checkout":
             raw_source=state.get("source_dir")
             if not isinstance(raw_source,str) or not raw_source:
-                raise RuntimeError("checkout installation metadata lacks its source directory; rerun v2/install.sh once")
+                raise RuntimeError("checkout installation metadata lacks its source directory; rerun ./install.sh once")
             source=Path(raw_source).expanduser()
             try: source=source.resolve(strict=True)
-            except OSError as error: raise RuntimeError(f"installed checkout source is unavailable: {source}") from error
-            validate_asset_tree(source)
+            except OSError as error:
+                hint=promoted_checkout_hint(source)
+                raise RuntimeError(f"installed checkout source is unavailable: {source}{hint}") from error
+            try: validate_asset_tree(source)
+            except RuntimeError as error:
+                hint=promoted_checkout_hint(source)
+                if hint: raise RuntimeError(f"installed checkout source is invalid: {source}{hint}") from error
+                raise
             bin_dir=Path(os.environ.get("DEVC2_BIN_DIR",state.get("bin_dir",Path.home()/".local/bin")))
             share_dir=Path(os.environ.get("DEVC2_DATA_DIR",state.get("share_dir",Path.home()/".local/share/devc2")))
             return _activate_assets(source,bin_dir,share_dir,False)
@@ -644,6 +687,7 @@ def rollback_installation():
         mirror_symlink(current_link,previous)
         mirror_symlink(previous_link,current)
         mirror_symlink(share_dir/"manager",manager)
+        prune_unreferenced_versions(share_dir)
         print(f"rolled back devc2 to {metadata['version']}")
         return 0
 
@@ -1291,15 +1335,15 @@ def remove_span_volume(name):
     if run(["docker","volume","inspect",name],check=False,timeout=15).returncode==0:
         raise RuntimeError("could not remove the previous Span socket volume")
 
-def ensure_v1_not_running(repo):
+def ensure_legacy_devcontainer_not_running(repo):
     result = run(["docker", "ps", "--filter", f"label=devcontainer.local_folder={repo}", "--format", "{{.ID}}"], timeout=15)
     if result.stdout.strip():
-        raise RuntimeError("v1 is already running for this checkout; stop it before starting devc2")
+        raise RuntimeError("a legacy devcontainer is already running for this checkout; stop it before starting devc2")
 
 
 def _start_unlocked(repo, runtime_doctor=False, span_names=()):
     require_docker()
-    ensure_v1_not_running(repo)
+    ensure_legacy_devcontainer_not_running(repo)
     ensure_tact_config()
     worktree=linked_worktree(repo)
     digest, _project = identity(repo)
@@ -1387,7 +1431,7 @@ def start(repo,runtime_doctor=False,span_names=()):
 
 def _reset_unlocked(repo,yes):
     if not yes:
-        try: answer=input(f"Permanently remove the persistent home volume and all v2 state for {repo}? [y/N] ")
+        try: answer=input(f"Permanently remove the persistent home volume and all devc2 state for {repo}? [y/N] ")
         except EOFError: answer=''
         if answer.lower() not in {'y','yes'}: print('cancelled'); return 0
     digest,project=identity(repo)
@@ -1708,7 +1752,7 @@ def parse_cli(argv):
     if argv[0] == "reset":
         parser = argparse.ArgumentParser(
             prog="devc2 reset",
-            description="permanently remove a checkout's persistent home volume and all v2 Docker state",
+            description="permanently remove a checkout's persistent home volume and all devc2 Docker state",
         )
         parser.add_argument("repo")
         parser.add_argument("--yes", action="store_true")

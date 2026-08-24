@@ -24,7 +24,7 @@ jobs:
           set -euo pipefail
           version="$(python3 - <<'PY'
           import re
-          text=open('v2/launcher/devc2.py').read()
+          text=open('launcher/devc2.py').read()
           print(re.search(r'^VERSION="([0-9]+\.[0-9]+\.[0-9]+)"$',text,re.M).group(1))
           PY
           )"
@@ -33,26 +33,25 @@ jobs:
           test "${{ vars.DEVC2_RELEASE_APPROVED }}" = "true"
           git fetch --no-tags origin main
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main
-          PYTHONPATH=v2 python3 -m unittest discover -s v2/tests -v
-          PYTHONPATH=v2 python3 -m unittest discover -s v2/credential_proxy/tests -v
-          bash -n v2/install.sh v2/install-release.sh v2/devbox/entrypoint.sh v2/devbox/configure-pi.sh v2/devbox/configure-signing.sh
-          bash tests/test_devc_multiplexer.sh
+          PYTHONPATH=. python3 -m unittest discover -s tests -v
+          bash -n install.sh install-release.sh devbox/entrypoint.sh devbox/configure-pi.sh devbox/configure-signing.sh devbox/configure-herdr.sh devbox/configure-gh-stack.sh devbox/herdr-git-metadata
       - name: Build deterministic assets
-        run: python3 v2/package-release.py
+        run: python3 package-release.py
       - name: Build and smoke-test packaged images
         timeout-minutes: 90
         env:
           DEVC2_TEST_PACKAGED_IMAGES: "1"
-        run: PYTHONPATH=v2 python3 -m unittest -v v2.tests.test_packaged_images
+        run: PYTHONPATH=. python3 -m unittest -v tests.test_packaged_images
       - name: Verify reproducibility and clean install
         shell: bash
         run: |
           set -euo pipefail
           first="$(sha256sum dist/devc2.tar.gz)"
-          python3 v2/package-release.py
+          python3 package-release.py
           test "$first" = "$(sha256sum dist/devc2.tar.gz)"
           temp="$(mktemp -d)"
-          trap 'rm -rf "$temp"' EXIT
+          cleanup() { chmod -R u+w "$temp" 2>/dev/null || true; rm -rf "$temp"; }
+          trap cleanup EXIT
           tar -xzf dist/devc2.tar.gz -C "$temp"
           HOME="$temp/home" DEVC2_BIN_DIR="$temp/bin" DEVC2_SHARE_DIR="$temp/share" "$temp/devc2/install.sh"
           "$temp/bin/devc2" --version
