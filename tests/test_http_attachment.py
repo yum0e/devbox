@@ -9,8 +9,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from credential_proxy import http_projection
-from launcher import world_attachment
+from span_gateway import http_connect_proxy
+from launcher import http_attachment
 
 
 PUBLIC_CERTIFICATE = (
@@ -34,8 +34,8 @@ def manifest(**changes) -> bytes:
 
 class WorldAttachmentValidationTests(unittest.TestCase):
     def validate(self, payload: bytes):
-        with mock.patch.object(world_attachment.ssl, "create_default_context"):
-            return world_attachment.validate_manifest(payload)
+        with mock.patch.object(http_attachment.ssl, "create_default_context"):
+            return http_attachment.validate_manifest(payload)
 
     def test_manifest_validation_accepts_bounded_public_material(self):
         payload = manifest(
@@ -70,12 +70,12 @@ class WorldAttachmentValidationTests(unittest.TestCase):
             json.dumps({"v": 1}).encode(),
         )
         for payload in invalid:
-            with self.subTest(payload=payload), self.assertRaises(world_attachment.AttachmentError):
+            with self.subTest(payload=payload), self.assertRaises(http_attachment.AttachmentError):
                 self.validate(payload)
 
     def test_unresolved_environment_placeholder_is_rejected(self):
-        with self.assertRaisesRegex(world_attachment.AttachmentError, "unresolved"):
-            world_attachment.expand_environment({"VALUE": "${UNKNOWN}"}, "alpha")
+        with self.assertRaisesRegex(http_attachment.AttachmentError, "unresolved"):
+            http_attachment.expand_environment({"VALUE": "${UNKNOWN}"}, "alpha")
 
 
 class WorldAttachmentCompositionTests(unittest.TestCase):
@@ -113,21 +113,21 @@ class WorldAttachmentCompositionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             public = Path(raw) / "public"
             public.mkdir()
-            with mock.patch.object(world_attachment, "bootstrap", side_effect=lambda address: bootstraps[address]):
-                environment = world_attachment.materialize(public, [
+            with mock.patch.object(http_attachment, "bootstrap", side_effect=lambda address: bootstraps[address]):
+                environment = http_attachment.materialize(public, [
                     ("openai", ("127.0.0.1", 4101)),
                     ("github", ("127.0.0.1", 4102)),
                 ])
 
-            self.assertEqual(environment["HTTPS_PROXY"], world_attachment.ISLAND_PROXY)
-            self.assertEqual(environment["SSL_CERT_FILE"], world_attachment.ISLAND_CA)
+            self.assertEqual(environment["HTTPS_PROXY"], http_attachment.BOX_PROXY)
+            self.assertEqual(environment["SSL_CERT_FILE"], http_attachment.BOX_CA)
             self.assertEqual(
                 environment["TACT_AUTH_FILE"],
-                world_attachment.ISLAND_ROOT + "/openai/config/auth.json",
+                http_attachment.BOX_ROOT + "/openai/config/auth.json",
             )
             self.assertEqual(
                 environment["GH_CONFIG_DIR"],
-                world_attachment.ISLAND_ROOT + "/github/config",
+                http_attachment.BOX_ROOT + "/github/config",
             )
             self.assertEqual(
                 (public / "http-attachments/openai/config/auth.json").read_bytes(),
@@ -159,9 +159,9 @@ class WorldAttachmentCompositionTests(unittest.TestCase):
             (PUBLIC_CERTIFICATE, [], {"SHARED": "two"}, []),
         ))
         with tempfile.TemporaryDirectory() as raw, \
-             mock.patch.object(world_attachment, "bootstrap", side_effect=lambda _address: next(responses)), \
-             self.assertRaisesRegex(world_attachment.AttachmentError, "environment variable: SHARED"):
-            world_attachment.materialize(Path(raw), [
+             mock.patch.object(http_attachment, "bootstrap", side_effect=lambda _address: next(responses)), \
+             self.assertRaisesRegex(http_attachment.AttachmentError, "environment variable: SHARED"):
+            http_attachment.materialize(Path(raw), [
                 ("alpha", ("127.0.0.1", 1)),
                 ("beta", ("127.0.0.1", 2)),
             ])
@@ -172,9 +172,9 @@ class WorldAttachmentCompositionTests(unittest.TestCase):
             (PUBLIC_CERTIFICATE, [], {}, ["api.example.com:443"]),
         ))
         with tempfile.TemporaryDirectory() as raw, \
-             mock.patch.object(world_attachment, "bootstrap", side_effect=lambda _address: next(responses)), \
-             self.assertRaisesRegex(world_attachment.AttachmentError, "HTTPS route"):
-            world_attachment.materialize(Path(raw), [
+             mock.patch.object(http_attachment, "bootstrap", side_effect=lambda _address: next(responses)), \
+             self.assertRaisesRegex(http_attachment.AttachmentError, "HTTPS route"):
+            http_attachment.materialize(Path(raw), [
                 ("alpha", ("127.0.0.1", 1)),
                 ("beta", ("127.0.0.1", 2)),
             ])
@@ -182,7 +182,7 @@ class WorldAttachmentCompositionTests(unittest.TestCase):
 
 class HttpProjectionTests(unittest.TestCase):
     def projection(self, routes: dict[str, str], socket_dir: Path):
-        projection = object.__new__(http_projection.HttpProjection)
+        projection = object.__new__(http_connect_proxy.HttpConnectProxy)
         projection.routes = routes
         projection.socket_dir = socket_dir
         projection.stopping = threading.Event()
@@ -202,7 +202,7 @@ class HttpProjectionTests(unittest.TestCase):
                 "routes": {"api.example.com:443": "alpha"},
             }))
             self.assertEqual(
-                http_projection.load_routes(path, {"alpha"}),
+                http_connect_proxy.load_routes(path, {"alpha"}),
                 {"api.example.com:443": "alpha"},
             )
             for document in (
@@ -213,25 +213,25 @@ class HttpProjectionTests(unittest.TestCase):
             ):
                 with self.subTest(document=document):
                     path.write_text(json.dumps(document))
-                    with self.assertRaises(http_projection.ProjectionError):
-                        http_projection.load_routes(path, {"alpha"})
+                    with self.assertRaises(http_connect_proxy.ConnectProxyError):
+                        http_connect_proxy.load_routes(path, {"alpha"})
 
     def test_route_config_read_is_bounded(self):
         with tempfile.TemporaryDirectory() as raw:
             path = Path(raw) / "routes.json"
-            path.write_bytes(b'{' + b' ' * http_projection.MAX_CONFIG)
+            path.write_bytes(b'{' + b' ' * http_connect_proxy.MAX_CONFIG)
             with self.assertRaisesRegex(
-                http_projection.ProjectionError, "HTTP attachment config is too large",
+                http_connect_proxy.ConnectProxyError, "HTTP attachment config is too large",
             ):
-                http_projection.load_routes(path, set())
+                http_connect_proxy.load_routes(path, set())
 
     def test_connect_target_requires_the_worlds_canonical_lowercase_authority(self):
         self.assertEqual(
-            http_projection.connect_target(b"CONNECT api.example.com:443 HTTP/1.1"),
+            http_connect_proxy.connect_target(b"CONNECT api.example.com:443 HTTP/1.1"),
             ("api.example.com", "api.example.com:443"),
         )
-        with self.assertRaises(http_projection.ProjectionError):
-            http_projection.connect_target(b"CONNECT API.example.com:443 HTTP/1.1")
+        with self.assertRaises(http_connect_proxy.ConnectProxyError):
+            http_connect_proxy.connect_target(b"CONNECT API.example.com:443 HTTP/1.1")
 
     def test_declared_route_uses_named_unix_world_socket(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -239,9 +239,9 @@ class HttpProjectionTests(unittest.TestCase):
             client, peer = socket.socketpair()
             upstream = mock.MagicMock()
             with client, peer, \
-                 mock.patch.object(http_projection.socket, "socket", return_value=upstream), \
-                 mock.patch.object(http_projection.socket, "create_connection") as direct, \
-                 mock.patch.object(http_projection, "duplex_stream"):
+                 mock.patch.object(http_connect_proxy.socket, "socket", return_value=upstream), \
+                 mock.patch.object(http_connect_proxy.socket, "create_connection") as direct, \
+                 mock.patch.object(http_connect_proxy, "duplex_stream"):
                 peer.sendall(b"CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com\r\n\r\nopaque")
                 projection._handle(client,projection.resume_epoch)
             upstream.connect.assert_called_once_with(str(Path(raw) / "alpha.sock"))
@@ -250,7 +250,7 @@ class HttpProjectionTests(unittest.TestCase):
             )
             direct.assert_not_called()
 
-    def test_http_projection_retires_pre_resume_tunnels_on_a_wall_clock_gap(self):
+    def test_http_connect_proxy_retires_pre_resume_tunnels_on_a_wall_clock_gap(self):
         with tempfile.TemporaryDirectory() as raw:
             projection=self.projection({},Path(raw))
             projection.last_observed_time=(100,1000)
@@ -260,21 +260,21 @@ class HttpProjectionTests(unittest.TestCase):
                 with mock.patch("builtins.print") as output:
                     self.assertTrue(projection._retire_after_resume((101,1020)))
                 output.assert_called_once_with(
-                    "span-bridge: HTTP projection retired pre-resume transport",flush=True,
+                    "span-gateway: HTTP proxy retired pre-resume transport",flush=True,
                 )
                 client.settimeout(1); self.assertEqual(client.recv(1),b"")
             finally:
                 projection._retire_connections(); proxy.close(); client.close()
 
-    def test_http_projection_rejects_a_pre_resume_epoch_before_upstream_use(self):
+    def test_http_connect_proxy_rejects_a_pre_resume_epoch_before_upstream_use(self):
         with tempfile.TemporaryDirectory() as raw:
             slots=threading.BoundedSemaphore(1)
             self.assertTrue(slots.acquire(blocking=False))
-            projection=http_projection.HttpProjection({},Path(raw),port=0,slots=slots)
+            projection=http_connect_proxy.HttpConnectProxy({},Path(raw),port=0,slots=slots)
             projection.resume_epoch=1
             client,peer=socket.socketpair()
             try:
-                with mock.patch.object(http_projection.socket,"create_connection") as connect:
+                with mock.patch.object(http_connect_proxy.socket,"create_connection") as connect:
                     projection._handle(client,0)
                 connect.assert_not_called()
                 peer.settimeout(1)
@@ -283,11 +283,11 @@ class HttpProjectionTests(unittest.TestCase):
             finally:
                 client.close(); peer.close(); projection.server.close()
 
-    def test_saturated_http_projection_backpressures_until_capacity_is_available(self):
+    def test_saturated_http_connect_proxy_backpressures_until_capacity_is_available(self):
         with tempfile.TemporaryDirectory() as raw:
             slots = threading.BoundedSemaphore(1)
             self.assertTrue(slots.acquire(blocking=False))
-            projection = http_projection.HttpProjection(
+            projection = http_connect_proxy.HttpConnectProxy(
                 {}, Path(raw), port=0, slots=slots,
             )
             handled = threading.Event()
@@ -319,9 +319,9 @@ class HttpProjectionTests(unittest.TestCase):
             client, peer = socket.socketpair()
             upstream = mock.MagicMock()
             with client, peer, \
-                 mock.patch.object(http_projection.socket, "create_connection", return_value=upstream) as direct, \
-                 mock.patch.object(http_projection, "enable_tcp_keepalive") as keepalive, \
-                 mock.patch.object(http_projection, "duplex_stream"):
+                 mock.patch.object(http_connect_proxy.socket, "create_connection", return_value=upstream) as direct, \
+                 mock.patch.object(http_connect_proxy, "enable_tcp_keepalive") as keepalive, \
+                 mock.patch.object(http_connect_proxy, "duplex_stream"):
                 peer.sendall(b"CONNECT public.example:443 HTTP/1.1\r\nHost: public.example\r\n\r\ntls")
                 projection._handle(client,projection.resume_epoch)
                 response = peer.recv(4096)
@@ -333,8 +333,8 @@ class HttpProjectionTests(unittest.TestCase):
     def test_fatal_http_listener_failure_stops_the_sidecar(self):
         stopping = threading.Event()
         failed = threading.Event()
-        slots = threading.BoundedSemaphore(http_projection.MAX_CONNECTIONS)
-        projection = http_projection.HttpProjection(
+        slots = threading.BoundedSemaphore(http_connect_proxy.MAX_CONNECTIONS)
+        projection = http_connect_proxy.HttpConnectProxy(
             {}, Path("/unused"), port=0, slots=slots, stopping=stopping, failed=failed,
         )
         self.assertIs(projection.slots, slots)

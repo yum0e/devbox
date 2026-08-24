@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Project one registered command affordance through its private Link."""
+"""Expose one command Span through its private World connection."""
 from __future__ import annotations
 
 import base64

@@ -25,9 +25,9 @@ ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 ENV_VALUE = re.compile(r"^[A-Za-z0-9_./,:@+\[\]-]*$")
 DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 PLACEHOLDER = re.compile(r"\$\{[^}]*\}")
-ISLAND_ROOT = "/tmp/devc2-http-attachments"
-ISLAND_CA = "/tmp/devc2-http-ca.pem"
-ISLAND_PROXY = "http://span-proxy:3128"
+BOX_ROOT = "/tmp/devc2-http-attachments"
+BOX_CA = "/tmp/devc2-http-ca.pem"
+BOX_PROXY = "http://span-proxy:3128"
 
 
 class AttachmentError(RuntimeError):
@@ -168,9 +168,9 @@ def private_write(path: Path, contents: bytes, mode: int = 0o444) -> None:
 
 def expand_environment(raw: dict, name: str) -> dict[str, str]:
     replacements = {
-        "${ROOT}": f"{ISLAND_ROOT}/{name}",
-        "${CA}": ISLAND_CA,
-        "${PROXY}": ISLAND_PROXY,
+        "${ROOT}": f"{BOX_ROOT}/{name}",
+        "${CA}": BOX_CA,
+        "${PROXY}": BOX_PROXY,
     }
     result = {}
     for key, raw_value in raw.items():

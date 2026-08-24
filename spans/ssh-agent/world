@@ -292,12 +292,12 @@ class World:
                         request = read_packet(connection, self.agent_filter.config.max_message)
                     except OSError as error:
                         LOG.warning(
-                            "Link request failed (%s)",
+                            "Span request failed (%s)",
                             type(error).__name__,
                         )
                         return
                     except ProtocolError:
-                        LOG.warning("Link sent an invalid SSH-agent packet")
+                        LOG.warning("Span gateway sent an invalid SSH-agent packet")
                         return
                     if request is None:
                         return
@@ -305,7 +305,7 @@ class World:
                         write_packet(connection, self.agent_filter.handle(request))
                     except OSError as error:
                         LOG.warning(
-                            "Link response failed (%s)",
+                            "Span response failed (%s)",
                             type(error).__name__,
                         )
                         return

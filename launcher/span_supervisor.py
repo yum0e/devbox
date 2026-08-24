@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tie one Span provider process group to its devc2 launcher's lifetime."""
+"""Tie one Span World process group to its devc2 launcher's lifetime."""
 from __future__ import annotations
 
 import argparse
@@ -38,7 +38,7 @@ def stop_group(process: subprocess.Popen) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--provider", required=True)
+    parser.add_argument("--world", required=True)
     parser.add_argument("--listener-fd", required=True, type=int)
     parser.add_argument("--lifetime-fd", required=True, type=int)
     parser.add_argument("--started-fd", required=True, type=int)
@@ -56,8 +56,8 @@ def main(argv: list[str] | None = None) -> int:
     pass_fds = [args.listener_fd]
     if args.recovery_fd is not None:
         pass_fds.append(args.recovery_fd)
-    provider = subprocess.Popen(
-        [args.provider],
+    world = subprocess.Popen(
+        [args.world],
         stdin=subprocess.DEVNULL,
         pass_fds=tuple(pass_fds),
         start_new_session=True,
@@ -67,25 +67,25 @@ def main(argv: list[str] | None = None) -> int:
         os.close(args.recovery_fd)
     try:
         deadline = time.monotonic() + 0.1
-        while time.monotonic() < deadline and provider.poll() is None and not stopping:
+        while time.monotonic() < deadline and world.poll() is None and not stopping:
             time.sleep(0.01)
-        if provider.poll() is not None:
-            return provider.returncode
+        if world.poll() is not None:
+            return world.returncode
         if stopping:
-            stop_group(provider)
+            stop_group(world)
             return 0
         # This is deliberately structural: the child exec succeeded and did not
-        # exit immediately. Semantic readiness belongs to the World and its Link.
+        # exit immediately. Semantic readiness belongs to the World protocol.
         os.write(args.started_fd, b"1")
         os.close(args.started_fd)
         while not stopping:
-            status = provider.poll()
+            status = world.poll()
             if status is not None:
                 return status
             readable, _writable, _errors = select.select([args.lifetime_fd], [], [], 0.1)
             if readable and not os.read(args.lifetime_fd, 1):
                 break
-        stop_group(provider)
+        stop_group(world)
         return 0
     finally:
         try:
@@ -93,7 +93,7 @@ def main(argv: list[str] | None = None) -> int:
         except OSError:
             pass
         os.close(args.lifetime_fd)
-        stop_group(provider)
+        stop_group(world)
 
 
 if __name__ == "__main__":

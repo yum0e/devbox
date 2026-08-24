@@ -87,14 +87,14 @@ class WorldTests(unittest.TestCase):
 
             auth.chmod(0o620)
             with mock.patch.dict(P.os.environ, {"DEVC2_OPENAI_AUTH_FILE": str(auth)}, clear=True), \
-                 self.assertRaisesRegex(P.ProviderError, "regular file"):
+                 self.assertRaisesRegex(P.WorldError, "regular file"):
                 P.read_auth()
 
             auth.chmod(0o600)
             link = Path(raw) / "link.json"
             link.symlink_to(auth)
             with mock.patch.dict(P.os.environ, {"DEVC2_OPENAI_AUTH_FILE": str(link)}, clear=True), \
-                 self.assertRaises(P.ProviderError):
+                 self.assertRaises(P.WorldError):
                 P.read_auth()
 
     def test_auth_rejects_near_expiry_and_malformed_values(self):
@@ -109,7 +109,7 @@ class WorldTests(unittest.TestCase):
                 auth.write_text(json.dumps(document))
                 auth.chmod(0o600)
                 with mock.patch.dict(P.os.environ, {"DEVC2_OPENAI_AUTH_FILE": str(auth)}, clear=True), \
-                     self.assertRaises(P.ProviderError):
+                     self.assertRaises(P.WorldError):
                     P.read_auth()
 
     def test_docker_subprocess_environment_excludes_host_credentials(self):
@@ -140,7 +140,7 @@ class WorldTests(unittest.TestCase):
         process.communicate.return_value = ("", "")
         with mock.patch.object(P, "docker_executable", return_value="/usr/bin/docker"), \
              mock.patch.object(P.subprocess, "Popen", return_value=process), \
-             self.assertRaisesRegex(P.ProviderError, "stopped"):
+             self.assertRaisesRegex(P.WorldError, "stopped"):
             P.run_docker(["version"], stopping=stopping)
         process.terminate.assert_called_once_with()
         process.communicate.assert_called_once_with(timeout=1)
@@ -150,9 +150,9 @@ class WorldTests(unittest.TestCase):
             root = Path(raw)
             manager = P.ProxyManager()
             with mock.patch.object(P, "read_auth", return_value=("access", "account")), \
-                 mock.patch.object(P, "run_docker", side_effect=P.ProviderError("failed")), \
+                 mock.patch.object(P, "run_docker", side_effect=P.WorldError("failed")), \
                  mock.patch.object(P, "remove_named_container", return_value=True) as remove, \
-                 self.assertRaisesRegex(P.ProviderError, "failed"):
+                 self.assertRaisesRegex(P.WorldError, "failed"):
                 manager._launch(root, "workspace-tag")
         remove.assert_called_once()
         self.assertRegex(
@@ -189,7 +189,7 @@ class WorldTests(unittest.TestCase):
                 left, right = socket.socketpair()
                 with left, right:
                     right.sendall(payload)
-                    with self.assertRaises(P.ProviderError):
+                    with self.assertRaises(P.WorldError):
                         P.read_connect(left)
 
     def test_invalid_tunnel_returns_a_bounded_proxy_error(self):
@@ -264,7 +264,7 @@ class WorldTests(unittest.TestCase):
             (root / "access-token").write_text("secret")
             proxy = P.Proxy(root, "e" * 64, 1234, b"certificate")
             with mock.patch.object(P, "remove_container", return_value=False), \
-                 self.assertRaisesRegex(P.ProviderError, "cleanup"):
+                 self.assertRaisesRegex(P.WorldError, "cleanup"):
                 proxy.stop()
             self.assertTrue(root.is_dir())
             self.assertEqual(proxy.container, "e" * 64)
@@ -276,7 +276,7 @@ class WorldTests(unittest.TestCase):
             proxy = P.Proxy(root, "e" * 64, 1234, b"certificate")
             with mock.patch.object(P, "remove_container", return_value=True), \
                  mock.patch.object(P.shutil, "rmtree", side_effect=OSError("busy")), \
-                 self.assertRaisesRegex(P.ProviderError, "credential cleanup"):
+                 self.assertRaisesRegex(P.WorldError, "credential cleanup"):
                 proxy.stop()
             self.assertTrue(root.is_dir())
 
@@ -284,7 +284,7 @@ class WorldTests(unittest.TestCase):
         manager = P.ProxyManager()
         failed = subprocess.CompletedProcess([], 1, "", "no")
         with mock.patch.object(P, "run_docker", return_value=failed), \
-             self.assertRaisesRegex(P.ProviderError, "inspect stale"):
+             self.assertRaisesRegex(P.WorldError, "inspect stale"):
             manager._remove_stale("a" * 16)
 
     def test_container_removal_requires_a_successful_absence_query(self):
@@ -376,13 +376,13 @@ class WorldTests(unittest.TestCase):
         manager.proxy = P.Proxy(Path("/unused"), "a" * 64, 1234, b"certificate")
         failed = subprocess.CompletedProcess([], 1, "", "daemon unavailable")
         with mock.patch.object(P, "run_docker", side_effect=[failed, failed]), \
-             self.assertRaisesRegex(P.ProviderError, "verify"):
+             self.assertRaisesRegex(P.WorldError, "verify"):
             manager.recover(manager.proxy, manager.proxy.container)
 
         with mock.patch.object(manager, "_state", return_value="exited"), \
              mock.patch.object(P, "remove_container", return_value=False), \
              mock.patch.object(manager, "_launch") as launch, \
-             self.assertRaisesRegex(P.ProviderError, "cleanup"):
+             self.assertRaisesRegex(P.WorldError, "cleanup"):
             manager.recover(manager.proxy, manager.proxy.container)
         launch.assert_not_called()
 
@@ -412,7 +412,7 @@ class WorldTests(unittest.TestCase):
              mock.patch.object(P, "remove_container", return_value=False), \
              mock.patch.object(manager, "_launch") as launch, \
              mock.patch.object(P, "recovery_event") as event, \
-             self.assertRaisesRegex(P.ProviderError, "cleanup"):
+             self.assertRaisesRegex(P.WorldError, "cleanup"):
             manager.recover(proxy, proxy.container)
         launch.assert_not_called()
         self.assertEqual([call.args[0] for call in event.call_args_list], [b"S", b"F"])
@@ -420,7 +420,7 @@ class WorldTests(unittest.TestCase):
         with mock.patch.object(manager, "_state", return_value="exited"), \
              mock.patch.object(P.time, "monotonic", return_value=11.0), \
              mock.patch.object(P, "remove_container") as remove, \
-             self.assertRaisesRegex(P.ProviderError, "cooling down"):
+             self.assertRaisesRegex(P.WorldError, "cooling down"):
             manager.recover(proxy, proxy.container)
         remove.assert_not_called()
 
@@ -431,7 +431,7 @@ class WorldTests(unittest.TestCase):
         manager.stopping.set()
         with mock.patch.object(P, "remove_container") as remove, \
              mock.patch.object(manager, "_launch") as launch, \
-             self.assertRaisesRegex(P.ProviderError, "stopping"):
+             self.assertRaisesRegex(P.WorldError, "stopping"):
             manager.recover(proxy, proxy.container)
         remove.assert_not_called()
         launch.assert_not_called()
@@ -451,7 +451,7 @@ class WorldTests(unittest.TestCase):
              mock.patch.object(P, "remove_container", return_value=True) as remove, \
              mock.patch.object(manager, "_launch", side_effect=launch), \
              mock.patch.object(manager, "workspace_tag", return_value="tag"), \
-             self.assertRaisesRegex(P.ProviderError, "stopping"):
+             self.assertRaisesRegex(P.WorldError, "stopping"):
             manager.recover(proxy, original)
         self.assertEqual(remove.call_args_list, [mock.call(original), mock.call(replacement)])
         self.assertEqual((proxy.container, proxy.port), (original, 1111))

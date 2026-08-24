@@ -1,8 +1,8 @@
-# devbox
+# devc2
 
-`devc2` runs coding agents in a non-root Docker Desktop Island. Host credentials
-managed by `devc2` stay outside it and are delegated through explicitly granted
-capabilities called **Spans**. The checkout remains read/write.
+`devc2` runs coding agents in a non-root Docker Desktop development container.
+Host credentials managed by `devc2` stay outside it. The checkout remains
+read/write.
 
 ## Start
 
@@ -13,18 +13,32 @@ Requirements: macOS, Docker Desktop with Compose v2, Python 3, and
 ./install.sh
 devc2 auth
 devc2 doctor --runtime
-devc2 run /path/to/repo --span openai --span github --span ssh-agent
+devc2 run /path/to/checkout --span openai --span github --span ssh-agent
 ```
 
 Without `--span`, `devc2` provides no host credentials:
 
 ```sh
-devc2 /path/to/repo
+devc2 /path/to/checkout
 ```
 
-Inside the Island, run `tact`, `pi`, `gh`, `gh stack`, or `herdr`. GitHub
+Inside the Box, run `tact`, `pi`, `gh`, `gh stack`, or `herdr`. GitHub
 currently labels stacked PRs a private preview; enabled repositories are
 required. Herdr opens Tact in new panes by default, but is never automatic.
+
+## Vocabulary
+
+```text
+devc2          host CLI and lifecycle manager
+Box            per-checkout development container
+Span           named capability granted for one Box launch
+World          host process implementing one Span
+Span gateway   sidecar exposing granted Worlds inside the Box
+```
+
+A Span is the contract and grant; a World is its host-side implementation. The
+gateway only adapts transport: named streams become Unix sockets, while
+declared HTTPS authorities become CONNECT routes.
 
 ## Setup
 
@@ -33,18 +47,18 @@ macOS host
 +------------------------------------------------------------------+
 | checkout ------------------------ read/write ------------------+  |
 |                                                              |  |
-| auth files --> OpenAI/GitHub World --> exact HTTPS routes     |  |
+| auth files --> OpenAI/GitHub Worlds -> exact HTTPS routes     |  |
 | SSH agent  --> SSH World -----------> one selected identity   |  |
 |                         |                                    |  |
-|                         | per-launch Link + mTLS              |  |
+|                         | launch-scoped mTLS streams          |  |
 +-------------------------|------------------------------------|--+
                           v
 Docker Desktop
 +------------------------------------------------------------------+
-| opaque Span tunnels + HTTP CONNECT router                       |
+| Span gateway: stream adapters + HTTP CONNECT proxy              |
 |                         |                                        |
 |                         v                                        |
-| Island                                                           |
+| Box                                                              |
 |   /workspace       selected checkout, read/write                 |
 |   /home/devbox     persistent, per checkout path                 |
 |   stock tools      no raw credentials mounted/provided by devc2  |
@@ -57,8 +71,8 @@ host-controlled World, which adds the real credential only to declared routes.
 The SSH World exposes identity queries and signing for one selected key; other
 agent operations and keys are rejected.
 
-Installing a World does not grant it. A World and its transport exist only for
-the lifetime of an Island launched with the matching `--span`.
+Registering a World does not grant its Span. The World process and gateway
+endpoints exist only for a Box launch with the matching `--span`.
 
 ## What this protects
 
@@ -98,7 +112,7 @@ prevent source-code or command-output exfiltration.
 - The agent can read, modify, or delete the selected checkout and its Git
   metadata. Review and back up work as you would with any autonomous tool.
 - Outbound networking is unrestricted. Spans isolate credentials, not data.
-- Secrets already in the checkout or persistent Island home remain visible, and
+- Secrets already in the checkout or persistent Box home remain visible, and
   tools can acquire new credentials through interactive network login.
 - A granted Span prevents extraction of the raw secret, not use of its
   authority. An agent can call the allowed API and export the response.
@@ -107,7 +121,7 @@ prevent source-code or command-output exfiltration.
   it is not a VM-grade defense against a Docker/kernel escape.
 - First-party HTTP Spans currently cover OpenAI and GitHub. Git repository
   transport is SSH-only. Other registries, clouds, and APIs need a custom World.
-- The host-side Worlds, bridge, mTLS, fake config, and recovery logic are more
+- The host-side Worlds, gateway, mTLS, fake config, and recovery logic are more
   complex than mounting a token. `diagnostics` exists because that complexity
   can fail.
 - This implementation supports macOS and Docker Desktop only.
@@ -121,11 +135,11 @@ canonical checkout path
 devc2-<path-hash>_state-v2  -->  /home/devbox
 ```
 
-The volume holds Tact sessions, tool settings, and the Island home. Normal exit,
+The volume holds Tact sessions, tool settings, and the Box home. Normal exit,
 host restart, reinstall, update, and rollback preserve it. Moving a checkout to
 a new canonical path creates a new identity and leaves the old volume orphaned.
 
-`devc2 reset /path/to/repo` permanently deletes that checkout's volume. It is
+`devc2 reset /path/to/checkout` permanently deletes that checkout's volume. It is
 not a repair command.
 
 ## Commands
@@ -134,12 +148,12 @@ not a repair command.
 devc2 auth                         host login and SSH-key selection
 devc2 doctor                       host prerequisite checks
 devc2 doctor --runtime             disposable end-to-end credential checks
-devc2 run REPO [--span NAME ...]   launch an Island
-devc2 repair REPO                  reconnect a running Island's Spans
-devc2 skills refresh REPO          refresh host Agent Skills
-devc2 update                       atomically import the next runtime
-devc2 rollback                     activate the retained previous runtime
-devc2 reset REPO                   destroy that checkout's devc2 state
+devc2 run CHECKOUT [--span NAME]   launch a Box
+devc2 repair CHECKOUT              restart and verify its Span gateway
+devc2 skills refresh CHECKOUT      refresh host Agent Skills
+devc2 update                       import the next installed runtime bundle
+devc2 rollback                     activate the previous runtime bundle
+devc2 reset CHECKOUT               remove its home and Docker resources
 ```
 
 First-party Spans are `openai`, `github`, `ssh-agent`, and `diagnostics`.
@@ -154,15 +168,26 @@ modify target repositories. A checkout install updates from the checkout;
 release installs update from GitHub's public release path. Activation
 is atomic and one previous runtime is retained for rollback.
 
-Upgrading a checkout installation from the former `v2/` layout requires one
-root-level `./install.sh`; this changes installer metadata, not Island volumes.
+The source-layout rename (`devbox/` → `box/` and `credential_proxy/` →
+`span_gateway/`) changes the immutable asset contract. An installation using the
+former layout cannot cross it with `devc2 update`: run root-level `./install.sh`
+for a checkout install, or rerun a freshly downloaded `install-devc2.sh` for a
+release install. This replaces installed runtime assets and metadata, not Box
+volumes.
 
 ```sh
 ./test.sh
 DEVC2_TEST_PACKAGED_IMAGES=1 ./test.sh   # also build and smoke-test images
 ```
 
+```text
+launcher/       host lifecycle and Span orchestration
+spans/          first-party host World implementations
+span_gateway/   Box-side gateway and transport adapters
+box/            Box image entrypoint and tool configuration
+```
+
 Custom command Worlds are registered by absolute executable path in
 `~/.config/devc2/spans.json`. See the small first-party examples under
-[`spans/`](spans/) and the bridge notes in
-[`credential_proxy/README.md`](credential_proxy/README.md).
+[`spans/`](spans/) and the gateway notes in
+[`span_gateway/README.md`](span_gateway/README.md).

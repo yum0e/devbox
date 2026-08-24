@@ -35,7 +35,7 @@ class GitHubPolicyTests(unittest.TestCase):
         self.assertIs(W.select_policy("/snapshot/openai"), W.POLICIES["openai"])
         self.assertIs(W.select_policy("/snapshot/github"), GITHUB)
         for name in ("http-credential-world", "GitHub", "github.py", "github "):
-            with self.subTest(name=name), self.assertRaises(W.ProviderError):
+            with self.subTest(name=name), self.assertRaises(W.WorldError):
                 W.select_policy(name)
 
     def test_connect_scope_is_exact(self):
@@ -49,7 +49,7 @@ class GitHubPolicyTests(unittest.TestCase):
             b"CONNECT api.github.com:443 HTTP/1.1\r\nHost: uploads.github.com:443\r\n\r\n",
             b"CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\nHost: api.github.com:443\r\n\r\n",
         ):
-            with self.subTest(request=request), self.assertRaises(W.ProviderError):
+            with self.subTest(request=request), self.assertRaises(W.WorldError):
                 connect(request)
 
     def test_routes_methods_paths_and_header_transform_are_explicit(self):
@@ -94,10 +94,10 @@ class GitHubPolicyTests(unittest.TestCase):
                 self.assertEqual(W.read_github_auth(), ("real-token_1", ""))
             with mock.patch.object(W, "auth_directory", return_value=directory), \
                  mock.patch.object(W.os, "read", return_value=b"x" * (W.MAX_AUTH + 1)), \
-                 self.assertRaisesRegex(W.ProviderError, "bounded private file"):
+                 self.assertRaisesRegex(W.WorldError, "bounded private file"):
                 W.read_github_auth()
             hosts.chmod(0o622)
-            with mock.patch.object(W, "auth_directory", return_value=directory), self.assertRaises(W.ProviderError):
+            with mock.patch.object(W, "auth_directory", return_value=directory), self.assertRaises(W.WorldError):
                 W.read_github_auth()
 
     def test_exited_helper_refreshes_github_token_without_changing_manifest(self):

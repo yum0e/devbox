@@ -1,4 +1,4 @@
-"""One bounded HTTP CONNECT projection for launch-lifetime World attachments."""
+"""Bounded HTTP CONNECT proxy for launch-scoped Span routes."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -16,25 +16,25 @@ LISTEN_BACKLOG = 1024
 DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
 
-class ProjectionError(RuntimeError):
+class ConnectProxyError(RuntimeError):
     pass
 
 
 def load_routes(path: Path, allowed_names: set[str]) -> dict[str, str]:
-    document = read_json(path, ProjectionError("HTTP attachment config is too large"))
+    document = read_json(path, ConnectProxyError("HTTP attachment config is too large"))
     if (not isinstance(document, dict) or set(document) != {"v", "routes"}
             or type(document["v"]) is not int or document["v"] != 1):
-        raise ProjectionError("invalid HTTP attachment config")
+        raise ConnectProxyError("invalid HTTP attachment config")
     routes = document["routes"]
     if not isinstance(routes, dict) or len(routes) > 256:
-        raise ProjectionError("invalid HTTP attachment routes")
+        raise ConnectProxyError("invalid HTTP attachment routes")
     result = {}
     for authority, name in routes.items():
         if (not isinstance(authority, str) or not authority.endswith(":443")
                 or not valid_dns(authority[:-4]) or authority != authority.lower()
                 or not valid_span_name(name)
                 or name not in allowed_names):
-            raise ProjectionError("invalid HTTP attachment route")
+            raise ConnectProxyError("invalid HTTP attachment route")
         result[authority] = name
     return result
 
@@ -48,18 +48,18 @@ def valid_dns(host: str) -> bool:
 def connect_target(first_line: bytes) -> tuple[str, str]:
     fields = first_line.split(b" ")
     if len(fields) != 3 or fields[0] != b"CONNECT" or fields[2] not in (b"HTTP/1.0", b"HTTP/1.1"):
-        raise ProjectionError("unsupported proxy request")
+        raise ConnectProxyError("unsupported proxy request")
     try:
         authority = fields[1].decode("ascii")
     except UnicodeError as error:
-        raise ProjectionError("invalid proxy target") from error
+        raise ConnectProxyError("invalid proxy target") from error
     if (authority != authority.lower() or not authority.endswith(":443")
             or not valid_dns(authority[:-4])):
-        raise ProjectionError("invalid proxy target")
+        raise ConnectProxyError("invalid proxy target")
     return authority[:-4], authority
 
 
-class HttpProjection:
+class HttpConnectProxy:
     def __init__(self, routes: dict[str, str], socket_dir: Path, port: int = 3128, slots=None, stopping=None, failed=None):
         self.routes = routes
         self.socket_dir = socket_dir
@@ -76,7 +76,7 @@ class HttpProjection:
         self.server.bind(("0.0.0.0", port))
         self.server.listen(LISTEN_BACKLOG)
         self.server.settimeout(0.5)
-        self.thread = threading.Thread(target=self._serve, name="http-world-projection", daemon=True)
+        self.thread = threading.Thread(target=self._serve, name="http-span-proxy", daemon=True)
 
     def start(self) -> None:
         self.thread.start()
@@ -120,7 +120,7 @@ class HttpProjection:
             return False
         retired=self._retire_connections()
         if retired:
-            print("span-bridge: HTTP projection retired pre-resume transport",flush=True)
+            print("span-gateway: HTTP proxy retired pre-resume transport",flush=True)
         return True
 
     def _serve(self) -> None:
@@ -132,7 +132,7 @@ class HttpProjection:
         except Exception as error:
             if not self.stopping.is_set():
                 print(
-                    f"span-bridge: HTTP listener failed ({type(error).__name__})",
+                    f"span-gateway: HTTP listener failed ({type(error).__name__})",
                     flush=True,
                 )
                 self.failed.set()
@@ -161,10 +161,10 @@ class HttpProjection:
             marker = -1
             while marker < 0:
                 if len(initial) >= MAX_HEADERS:
-                    raise ProjectionError("proxy headers exceed 16 KiB")
+                    raise ConnectProxyError("proxy headers exceed 16 KiB")
                 block = client.recv(min(4096, MAX_HEADERS - len(initial)))
                 if not block:
-                    raise ProjectionError("proxy request ended early")
+                    raise ConnectProxyError("proxy request ended early")
                 initial.extend(block)
                 marker = initial.find(b"\r\n\r\n")
             header_end = marker + 4
@@ -187,7 +187,7 @@ class HttpProjection:
             client.settimeout(None)
             upstream.settimeout(None)
             duplex_stream(client, upstream, self.stopping)
-        except (OSError, ProjectionError):
+        except (OSError, ConnectProxyError):
             pass
         finally:
             if upstream is not None:

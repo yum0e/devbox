@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from credential_proxy import span_bridge
+from span_gateway import gateway
 from launcher import devc2
 from launcher import span_runtime
 
@@ -173,7 +173,7 @@ class WorldTests(unittest.TestCase):
                 with socket.create_connection(listener.getsockname(), timeout=2) as connection:
                     P.write_packet(connection, bytes([P.SSH2_AGENTC_REQUEST_IDENTITIES]))
                     self.assertEqual(P.parse_identities(P.read_packet(connection)), [(allowed, b"selected")])
-                    # Link idleness is not an upstream-agent operation and must
+                    # Gateway idleness is not an upstream-agent operation and must
                     # not inherit the much shorter upstream request timeout.
                     time.sleep(0.15)
                     sign = (bytes([P.SSH2_AGENTC_SIGN_REQUEST]) + P.pack_string(allowed)
@@ -222,7 +222,7 @@ class WorldTests(unittest.TestCase):
             context.load_cert_chain(client_tls / "client.crt", client_tls / "client.key")
             socket_dir = root / "projected"
             socket_dir.mkdir()
-            bridge = span_bridge.Bridge(
+            bridge = gateway.SpanBridge(
                 "ssh-agent", relay.port, socket_dir, "127.0.0.1", context,
             )
             bridge.start()
@@ -354,12 +354,12 @@ class WorldTests(unittest.TestCase):
             selected = key_blob(b"selected")
             (config / "ssh-key.pub").write_text(public_line(selected))
             agent = FakeAgent(root / "agent.sock", []).start()
-            span = span_runtime.Span("ssh-agent", None, ROOT / "spans" / "ssh-agent" / "world")
+            span = span_runtime.SpanGrant("ssh-agent", None, ROOT / "spans" / "ssh-agent" / "world")
             with mock.patch.dict(os.environ, {
                 "HOME": str(root),
                 "SSH_AUTH_SOCK": str(agent.path),
             }, clear=False):
-                provider = span_runtime.Provider(span, root, "island-one")
+                provider = span_runtime.WorldProcess(span, root, "box-one")
             try:
                 provider.check_started()
                 time.sleep(0.25)

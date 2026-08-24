@@ -18,13 +18,13 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_EXECUTABLES = {
-    "install.sh", "devbox/entrypoint.sh", "devbox/configure-pi.sh",
-    "devbox/configure-signing.sh",
-    "devbox/configure-herdr.sh",
-    "devbox/configure-gh-stack.sh",
-    "devbox/herdr-git-metadata",
+    "install.sh", "box/entrypoint.sh", "box/configure-pi.sh",
+    "box/configure-signing.sh",
+    "box/configure-herdr.sh",
+    "box/configure-gh-stack.sh",
+    "box/herdr-git-metadata",
     "launcher/devc2.py", "launcher/dispatcher.py",
-    "launcher/command_projection.py", "spans/http-credential-world",
+    "launcher/command_adapter.py", "spans/http-credential-world",
     "spans/ssh-agent/world", "spans/diagnostics/world",
 }
 
@@ -70,14 +70,14 @@ class PackagedImageTests(unittest.TestCase):
                 member = members["devc2/" + relative]
                 self.assertTrue(member.isfile(), relative)
                 self.assertEqual(stat.S_IMODE(member.mode), 0o755, relative)
-            for relative in ("Dockerfile", "compose.yaml", "credential_proxy/span_bridge.py"):
+            for relative in ("Dockerfile", "compose.yaml", "span_gateway/gateway.py"):
                 self.assertEqual(stat.S_IMODE(members["devc2/" + relative].mode), 0o644,
                                  relative)
-            for relative in ("devc2", "devc2/spans", "devc2/credential_proxy"):
+            for relative in ("devc2", "devc2/spans", "devc2/span_gateway"):
                 self.assertTrue(members[relative].isdir(), relative)
                 self.assertEqual(stat.S_IMODE(members[relative].mode), 0o755, relative)
 
-            for dockerfile in (package_root / "Dockerfile", package_root / "credential_proxy" / "Dockerfile"):
+            for dockerfile in (package_root / "Dockerfile", package_root / "span_gateway" / "Dockerfile"):
                 source = dockerfile.read_text(encoding="utf-8").replace("\\\n", " ")
                 for line in source.splitlines():
                     if not line.lstrip().upper().startswith("COPY "):
@@ -130,7 +130,7 @@ class PackagedImageTests(unittest.TestCase):
                                     "--label", label, "--tag", tags[target], str(package_root)],
                                    check=True, timeout=3600)
                 subprocess.run([docker, "build", "--pull", "--file",
-                                str(package_root / "credential_proxy" / "Dockerfile"),
+                                str(package_root / "span_gateway" / "Dockerfile"),
                                 "--label", label, "--tag", tags["proxy"], str(package_root)],
                                check=True, timeout=1800)
 
@@ -155,7 +155,7 @@ class PackagedImageTests(unittest.TestCase):
                 subprocess.run([docker, "run", "--rm", "--name", containers["proxy"],
                                 "--pull=never", "--entrypoint", "python",
                                 tags["proxy"], "-c",
-                                "import credential_proxy.span_bridge,credential_proxy.http_projection"],
+                                "import span_gateway.gateway,span_gateway.http_connect_proxy"],
                                check=True, timeout=60)
             finally:
                 for name in reversed(tuple(containers.values())):

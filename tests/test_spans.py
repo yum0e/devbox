@@ -19,13 +19,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from credential_proxy import http_projection, span_bridge, stream_relay
+from span_gateway import http_connect_proxy, gateway, stream_relay
 from launcher import devc2
 from launcher import span_runtime
 
 
 ROOT = Path(__file__).parents[1]
-COMMAND_PROJECTION = ROOT / "launcher" / "command_projection.py"
+COMMAND_PROJECTION = ROOT / "launcher" / "command_adapter.py"
 
 
 class BrokenSendSocket:
@@ -60,9 +60,9 @@ class SpanCatalogTests(unittest.TestCase):
         snapshot=Path(tempfile.mkdtemp(prefix="span-snapshot-"))
         self.addCleanup(shutil.rmtree,snapshot,True)
         forbidden=workspace or catalog.parent/"unrelated-workspace"
-        return span_runtime.load_catalog(
+        return span_runtime.prepare_span_grants(
             catalog,names,forbidden,snapshot/"clients",snapshot/"providers",
-            command_projection=COMMAND_PROJECTION,
+            command_adapter=COMMAND_PROJECTION,
         )
 
     def world(self, root: Path) -> Path:
@@ -86,14 +86,14 @@ class SpanCatalogTests(unittest.TestCase):
             catalog=self.catalog(root,{"echo":str(world)})
             span = self.load(catalog,("echo",))[0]
             self.assertEqual(span.name,"echo")
-            self.assertEqual(span.client.read_bytes(),COMMAND_PROJECTION.read_bytes())
-            self.assertEqual(span.provider.read_bytes(),world.read_bytes())
+            self.assertEqual(span.adapter_executable.read_bytes(),COMMAND_PROJECTION.read_bytes())
+            self.assertEqual(span.world_executable.read_bytes(),world.read_bytes())
             self.assertFalse(sentinel.exists())
-            snapshotted_world=span.provider.read_bytes()
+            snapshotted_world=span.world_executable.read_bytes()
             world.write_text("#!/bin/sh\nexit 99\n")
-            self.assertEqual(span.provider.read_bytes(),snapshotted_world)
-            self.assertEqual(stat.S_IMODE(span.client.stat().st_mode),0o555)
-            self.assertEqual(stat.S_IMODE(span.client.parent.stat().st_mode),0o555)
+            self.assertEqual(span.world_executable.read_bytes(),snapshotted_world)
+            self.assertEqual(stat.S_IMODE(span.adapter_executable.stat().st_mode),0o555)
+            self.assertEqual(stat.S_IMODE(span.adapter_executable.parent.stat().st_mode),0o555)
 
     def test_no_grant_does_not_require_or_read_a_catalog(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -148,7 +148,7 @@ class SpanCatalogTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,"must not have hard links"):
                 self.load(catalog,("echo",),workspace)
 
-    def test_names_cannot_escape_the_projection(self):
+    def test_names_cannot_escape_the_adapter(self):
         with tempfile.TemporaryDirectory() as raw:
             catalog=self.catalog(Path(raw),{})
             for name in ("../echo", "Echo", "echo/span", "-echo", "echo-"):
@@ -160,60 +160,60 @@ class SpanCatalogTests(unittest.TestCase):
             root=Path(raw); builtin=root/"builtins"; builtin.mkdir(parents=True)
             world=builtin/"http-credential-world"; world.write_text("#!/bin/sh\nexit 0\n"); world.chmod(0o555)
             destination=root/"snapshot"; destination.mkdir()
-            spans=span_runtime.load_catalog(
+            spans=span_runtime.prepare_span_grants(
                 root/"missing.json",("openai",),root/"workspace",destination/"clients",destination/"worlds",
                 root/"builtins",
             )
-            self.assertEqual([(item.name,item.provider.read_bytes()) for item in spans],[('openai',world.read_bytes())])
-            self.assertIsNone(spans[0].client)
+            self.assertEqual([(item.name,item.world_executable.read_bytes()) for item in spans],[('openai',world.read_bytes())])
+            self.assertIsNone(spans[0].adapter_executable)
             self.assertTrue(spans[0].http_attachment)
-            self.assertEqual(stat.S_IMODE(spans[0].provider.stat().st_mode),0o555)
+            self.assertEqual(stat.S_IMODE(spans[0].world_executable.stat().st_mode),0o555)
             self.assertEqual(list((destination/"clients").iterdir()),[])
 
     def test_http_worlds_are_lifetime_attachments_without_commands(self):
         with tempfile.TemporaryDirectory() as raw:
             root=Path(raw); destination=root/"snapshot"; destination.mkdir()
-            items=span_runtime.load_catalog(
+            items=span_runtime.prepare_span_grants(
                 root/"missing.json",("github","openai"),root/"workspace",destination/"links",destination/"worlds",
                 ROOT/"spans",
             )
             for item in items:
-                self.assertEqual(item.provider.name, item.name)
+                self.assertEqual(item.world_executable.name, item.name)
                 self.assertEqual(
-                    item.provider.read_bytes(),
+                    item.world_executable.read_bytes(),
                     (ROOT/"spans"/"http-credential-world").read_bytes(),
                 )
-                self.assertIsNone(item.client)
+                self.assertIsNone(item.adapter_executable)
                 self.assertTrue(item.http_attachment)
             self.assertEqual(list((destination/"links").iterdir()),[])
 
     def test_ssh_world_uses_only_the_generic_stream_link(self):
         with tempfile.TemporaryDirectory() as raw:
             root=Path(raw); destination=root/"snapshot"; destination.mkdir()
-            item=span_runtime.load_catalog(
+            item=span_runtime.prepare_span_grants(
                 root/"missing.json",("ssh-agent",),root/"workspace",
                 destination/"links",destination/"worlds",ROOT/"spans",
             )[0]
             self.assertEqual(
-                item.provider.read_bytes(),
+                item.world_executable.read_bytes(),
                 (ROOT/"spans"/"ssh-agent"/"world").read_bytes(),
             )
-            self.assertIsNone(item.client)
+            self.assertIsNone(item.adapter_executable)
             self.assertEqual(list((destination/"links").iterdir()), [])
 
-    def test_command_link_snapshots_one_world_and_the_generic_projection(self):
+    def test_command_adapter_snapshots_one_world_and_the_generic_command_adapter(self):
         with tempfile.TemporaryDirectory() as raw:
             root=Path(raw); world=root/"tool-world"
             world.write_text("#!/bin/sh\nexit 0\n"); world.chmod(0o755)
             catalog=self.catalog(root,{"tool":str(world)})
             destination=root/"snapshot"; destination.mkdir()
-            item=span_runtime.load_catalog(
+            item=span_runtime.prepare_span_grants(
                 catalog,("tool",),root/"workspace",destination/"clients",destination/"worlds",
-                command_projection=COMMAND_PROJECTION,
+                command_adapter=COMMAND_PROJECTION,
             )[0]
-            self.assertEqual(item.provider.read_bytes(),world.read_bytes())
-            self.assertEqual(item.client.read_bytes(),COMMAND_PROJECTION.read_bytes())
-            self.assertEqual(item.client.name,"tool")
+            self.assertEqual(item.world_executable.read_bytes(),world.read_bytes())
+            self.assertEqual(item.adapter_executable.read_bytes(),COMMAND_PROJECTION.read_bytes())
+            self.assertEqual(item.adapter_executable.name,"tool")
             self.assertNotIn(b"tool",COMMAND_PROJECTION.read_bytes().lower())
 
     def test_structured_world_entry_fails_closed(self):
@@ -237,7 +237,7 @@ class SpanCatalogTests(unittest.TestCase):
 
 
 class CommandProjectionTests(unittest.TestCase):
-    def test_generic_projection_preserves_argv_stdin_outputs_and_status(self):
+    def test_generic_command_adapter_preserves_argv_stdin_outputs_and_status(self):
         with tempfile.TemporaryDirectory() as raw:
             root=Path(raw); socket_dir=root/"sockets"; socket_dir.mkdir()
             projected=root/"tool"; projected.symlink_to(COMMAND_PROJECTION)
@@ -285,7 +285,7 @@ class ProviderLifecycleTests(unittest.TestCase):
                 "#!/usr/bin/env python3\n"
                 "import os,socket,sys\n"
                 "assert sys.argv==[sys.argv[0]]\n"
-                "assert os.environ['DEVC2_ISLAND_ID']=='island-one'\n"
+                "assert os.environ['DEVC2_ISLAND_ID']=='box-one'\n"
                 f"assert os.environ['DEVC2_WORKSPACE']=={str(root)!r}\n"
                 "server=socket.socket(fileno=int(os.environ['DEVC2_SPAN_SOCKET_FD']))\n"
                 "connection,_=server.accept()\n"
@@ -293,8 +293,8 @@ class ProviderLifecycleTests(unittest.TestCase):
                 "    connection.sendall(connection.recv(4096))\n"
             )
             provider_path.chmod(0o755)
-            span = span_runtime.Span("echo", client, provider_path)
-            provider = span_runtime.Provider(span, root, "island-one")
+            span = span_runtime.SpanGrant("echo", client, provider_path)
+            provider = span_runtime.WorldProcess(span, root, "box-one")
             try:
                 with socket.create_connection(provider.address, timeout=2) as connection:
                     connection.sendall(b"opaque bytes")
@@ -312,8 +312,8 @@ class ProviderLifecycleTests(unittest.TestCase):
             provider_path = root / "exit-span"
             provider_path.write_text("#!/bin/sh\nexit 23\n")
             provider_path.chmod(0o755)
-            span = span_runtime.Span("exit", client, provider_path)
-            provider = span_runtime.Provider(span, root, "island-one")
+            span = span_runtime.SpanGrant("exit", client, provider_path)
+            provider = span_runtime.WorldProcess(span, root, "box-one")
             address = provider.address
             try:
                 with self.assertRaisesRegex(RuntimeError, "status 23"):
@@ -331,8 +331,8 @@ class ProviderLifecycleTests(unittest.TestCase):
             provider_path = root / "delayed-exit-span"
             provider_path.write_text("#!/bin/sh\nsleep 0.25\nexit 23\n")
             provider_path.chmod(0o755)
-            span = span_runtime.Span("delayed", client, provider_path)
-            provider = span_runtime.Provider(span, root, "island-one")
+            span = span_runtime.SpanGrant("delayed", client, provider_path)
+            provider = span_runtime.WorldProcess(span, root, "box-one")
             try:
                 provider.check_started()
                 self.assertEqual(provider.process.wait(timeout=2), 23)
@@ -353,8 +353,8 @@ class ProviderLifecycleTests(unittest.TestCase):
                 "exit 0\n"
             )
             provider_path.chmod(0o755)
-            span = span_runtime.Span("daemon", client, provider_path)
-            provider = span_runtime.Provider(span, root, "island-one")
+            span = span_runtime.SpanGrant("daemon", client, provider_path)
+            provider = span_runtime.WorldProcess(span, root, "box-one")
             child_pid = None
             try:
                 with self.assertRaisesRegex(RuntimeError, "status 0"):
@@ -388,8 +388,8 @@ class ProviderLifecycleTests(unittest.TestCase):
                 "import pathlib,time\n"
                 "from launcher import span_runtime\n"
                 f"root=pathlib.Path({str(root)!r})\n"
-                "d=span_runtime.Span('wait',root/'client',root/'wait-span')\n"
-                "p=span_runtime.Provider(d,root,'island-crash')\n"
+                "d=span_runtime.SpanGrant('wait',root/'client',root/'wait-span')\n"
+                "p=span_runtime.WorldProcess(d,root,'box-crash')\n"
                 "p.check_started()\n"
                 f"pathlib.Path({str(ready_file)!r}).write_text('ready')\n"
                 "time.sleep(60)\n"
@@ -441,8 +441,8 @@ class ProviderLifecycleTests(unittest.TestCase):
             )
             provider_path.chmod(0o755)
             server_tls, client_tls = devc2.generate_relay_pki(root / "pki")
-            span = span_runtime.Span("echo", client, provider_path)
-            provider = span_runtime.Provider(span, root, "island-one")
+            span = span_runtime.SpanGrant("echo", client, provider_path)
+            provider = span_runtime.WorldProcess(span, root, "box-one")
             relay = span_runtime.OpaqueRelay(provider.address, server_tls)
             try:
                 context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=str(client_tls / "ca.crt"))
@@ -466,50 +466,50 @@ class ProviderLifecycleTests(unittest.TestCase):
                 provider.stop()
 
     def test_duplex_relay_propagates_delayed_half_closes(self):
-        island, relay_left = socket.socketpair()
+        box, relay_left = socket.socketpair()
         relay_right, world = socket.socketpair()
         stopping = threading.Event()
         thread = threading.Thread(
-            target=span_bridge.duplex_stream,
+            target=gateway.duplex_stream,
             args=(relay_left, relay_right, stopping),
             daemon=True,
         )
         thread.start()
         try:
-            island.sendall(b"request")
+            box.sendall(b"request")
             self.assertEqual(world.recv(7), b"request")
-            island.shutdown(socket.SHUT_WR)
+            box.shutdown(socket.SHUT_WR)
             world.settimeout(2)
             self.assertEqual(world.recv(1), b"")
             world.sendall(b"response")
             world.shutdown(socket.SHUT_WR)
-            island.settimeout(2)
-            self.assertEqual(island.recv(8), b"response")
-            self.assertEqual(island.recv(1), b"")
+            box.settimeout(2)
+            self.assertEqual(box.recv(8), b"response")
+            self.assertEqual(box.recv(1), b"")
             thread.join(2)
             self.assertFalse(thread.is_alive())
         finally:
             stopping.set()
-            for connection in (island, relay_left, relay_right, world):
+            for connection in (box, relay_left, relay_right, world):
                 connection.close()
             thread.join(2)
 
     def test_duplex_relay_treats_peer_cancellation_as_stream_completion(self):
-        island, relay_left = socket.socketpair()
+        box, relay_left = socket.socketpair()
         relay_right, world = socket.socketpair()
         stopping = threading.Event()
         errors = []
 
         def relay():
             try:
-                span_bridge.duplex_stream(relay_left, relay_right, stopping)
+                gateway.duplex_stream(relay_left, relay_right, stopping)
             except Exception as error:
                 errors.append(error)
 
         thread = threading.Thread(target=relay, daemon=True)
         thread.start()
         try:
-            island.close()
+            box.close()
             world.sendall(b"response after client cancellation")
             world.shutdown(socket.SHUT_WR)
             thread.join(2)
@@ -522,7 +522,7 @@ class ProviderLifecycleTests(unittest.TestCase):
             thread.join(2)
 
     def test_duplex_relay_preserves_reverse_stream_after_broken_write(self):
-        island, raw_relay_left = socket.socketpair()
+        box, raw_relay_left = socket.socketpair()
         relay_right, world = socket.socketpair()
         stopping = threading.Event()
         write_failed = threading.Event()
@@ -532,7 +532,7 @@ class ProviderLifecycleTests(unittest.TestCase):
 
         def relay():
             try:
-                span_bridge.duplex_stream(relay_left, relay_right, stopping)
+                gateway.duplex_stream(relay_left, relay_right, stopping)
             except Exception as error:
                 errors.append(error)
 
@@ -541,22 +541,22 @@ class ProviderLifecycleTests(unittest.TestCase):
         try:
             world.sendall(b"undeliverable")
             self.assertTrue(write_failed.wait(2))
-            island.sendall(b"reverse survives")
+            box.sendall(b"reverse survives")
             world.settimeout(2)
             self.assertEqual(world.recv(16), b"reverse survives")
-            island.shutdown(socket.SHUT_WR)
+            box.shutdown(socket.SHUT_WR)
             world.shutdown(socket.SHUT_WR)
             thread.join(2)
             self.assertFalse(thread.is_alive())
             self.assertEqual(errors, [])
         finally:
             stopping.set()
-            for connection in (island, relay_left, relay_right, world):
+            for connection in (box, relay_left, relay_right, world):
                 connection.close()
             thread.join(2)
 
     def test_duplex_relay_fully_retires_a_failed_tls_stream(self):
-        island, raw_relay_left = socket.socketpair()
+        box, raw_relay_left = socket.socketpair()
         relay_right, world = socket.socketpair()
         stopping = threading.Event()
         write_failed = threading.Event()
@@ -565,8 +565,8 @@ class ProviderLifecycleTests(unittest.TestCase):
 
         def relay():
             try:
-                with mock.patch.object(span_bridge.ssl, "SSLSocket", BrokenSendSocket):
-                    span_bridge.duplex_stream(relay_left, relay_right, stopping)
+                with mock.patch.object(gateway.ssl, "SSLSocket", BrokenSendSocket):
+                    gateway.duplex_stream(relay_left, relay_right, stopping)
             except Exception as error:
                 errors.append(error)
 
@@ -580,7 +580,7 @@ class ProviderLifecycleTests(unittest.TestCase):
             self.assertEqual(errors, [])
         finally:
             stopping.set()
-            for connection in (island, relay_left, relay_right, world):
+            for connection in (box, relay_left, relay_right, world):
                 connection.close()
             thread.join(2)
 
@@ -593,9 +593,9 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(stream_relay.transport_gap((100,1000),(101,float("nan"))),float("inf"))
 
     def test_duplex_relay_drops_first_post_resume_bytes_before_forwarding(self):
-        island,relay_left=socket.socketpair(); relay_right,world=socket.socketpair()
+        box,relay_left=socket.socketpair(); relay_right,world=socket.socketpair()
         try:
-            island.sendall(b"must not be replayed")
+            box.sendall(b"must not be replayed")
             with mock.patch.object(
                 stream_relay,"transport_clocks",side_effect=[(100,1000),(101,1020)],
             ):
@@ -603,18 +603,18 @@ class BridgeConfigTests(unittest.TestCase):
             world.setblocking(False)
             with self.assertRaises(BlockingIOError): world.recv(1)
         finally:
-            for connection in (island,relay_left,relay_right,world): connection.close()
+            for connection in (box,relay_left,relay_right,world): connection.close()
 
     def test_bridge_retires_existing_streams_after_a_suspend_gap(self):
         with tempfile.TemporaryDirectory() as raw:
-            bridge = span_bridge.Bridge("openai", 1, Path(raw), "127.0.0.1", mock.Mock())
+            bridge = gateway.SpanBridge("openai", 1, Path(raw), "127.0.0.1", mock.Mock())
             bridge.last_observed_time = (100,1000)
             bridge_side, island_side = socket.socketpair()
             with bridge.connections_lock:
                 bridge.connections.add(bridge_side)
             try:
                 self.assertFalse(
-                    bridge._retire_after_resume((100 + span_bridge.RESUME_GAP_SECONDS,1001))
+                    bridge._retire_after_resume((100 + gateway.RESUME_GAP_SECONDS,1001))
                 )
                 island_side.sendall(b"still connected")
                 self.assertEqual(bridge_side.recv(15), b"still connected")
@@ -622,12 +622,12 @@ class BridgeConfigTests(unittest.TestCase):
                 with mock.patch("builtins.print") as output:
                     self.assertTrue(
                         bridge._retire_after_resume((
-                            100 + span_bridge.RESUME_GAP_SECONDS,
-                            1000 + 2 * span_bridge.RESUME_GAP_SECONDS + 1,
+                            100 + gateway.RESUME_GAP_SECONDS,
+                            1000 + 2 * gateway.RESUME_GAP_SECONDS + 1,
                         ))
                     )
                 output.assert_called_once_with(
-                    "span-bridge: Span 'openai' retired pre-resume transport",flush=True,
+                    "span-gateway: Span 'openai' retired pre-resume transport",flush=True,
                 )
                 island_side.settimeout(1)
                 self.assertEqual(island_side.recv(1), b"")
@@ -639,12 +639,12 @@ class BridgeConfigTests(unittest.TestCase):
 
     def test_bridge_poll_retires_stale_streams_after_resume(self):
         with tempfile.TemporaryDirectory() as raw:
-            bridge = span_bridge.Bridge("openai", 1, Path(raw), "127.0.0.1", mock.Mock())
+            bridge = gateway.SpanBridge("openai", 1, Path(raw), "127.0.0.1", mock.Mock())
             bridge_side, island_side = socket.socketpair()
             with bridge.connections_lock:
                 bridge.connections.add(bridge_side)
-            observed=span_bridge.transport_clocks()
-            bridge.last_observed_time=(observed[0],observed[1]-span_bridge.RESUME_GAP_SECONDS-1)
+            observed=gateway.transport_clocks()
+            bridge.last_observed_time=(observed[0],observed[1]-gateway.RESUME_GAP_SECONDS-1)
             bridge.start()
             try:
                 island_side.settimeout(2)
@@ -656,7 +656,7 @@ class BridgeConfigTests(unittest.TestCase):
 
     def test_bridge_tracks_tcp_during_tls_handshake_and_enables_keepalive(self):
         with tempfile.TemporaryDirectory() as raw:
-            bridge = span_bridge.Bridge("openai", 1, Path(raw), "127.0.0.1", mock.Mock())
+            bridge = gateway.SpanBridge("openai", 1, Path(raw), "127.0.0.1", mock.Mock())
             client = mock.MagicMock(spec=socket.socket)
             raw_connection = mock.MagicMock(spec=socket.socket)
             raw_context = mock.MagicMock()
@@ -682,12 +682,12 @@ class BridgeConfigTests(unittest.TestCase):
             self.assertTrue(bridge.slots.acquire(blocking=False))
             try:
                 with mock.patch.object(
-                    span_bridge.socket,
+                    gateway.socket,
                     "create_connection",
                     return_value=raw_context,
                 ), mock.patch.object(
-                    span_bridge, "enable_tcp_keepalive"
-                ) as keepalive, mock.patch.object(span_bridge, "duplex_stream"):
+                    gateway, "enable_tcp_keepalive"
+                ) as keepalive, mock.patch.object(gateway, "duplex_stream"):
                     bridge._connection(client, bridge.resume_epoch)
                 keepalive.assert_called_once_with(raw_connection)
                 remote.do_handshake.assert_called_once_with()
@@ -697,7 +697,7 @@ class BridgeConfigTests(unittest.TestCase):
 
     def test_resume_retirement_can_interrupt_an_in_progress_tls_handshake(self):
         with tempfile.TemporaryDirectory() as raw:
-            bridge=span_bridge.Bridge("openai",1,Path(raw),"127.0.0.1",mock.Mock())
+            bridge=gateway.SpanBridge("openai",1,Path(raw),"127.0.0.1",mock.Mock())
             client=mock.MagicMock(spec=socket.socket); raw_connection=mock.MagicMock(spec=socket.socket)
             raw_context=mock.MagicMock(); raw_context.__enter__.return_value=raw_connection
             remote=mock.MagicMock(spec=ssl.SSLSocket); remote_context=mock.MagicMock(); remote_context.__enter__.return_value=remote
@@ -708,8 +708,8 @@ class BridgeConfigTests(unittest.TestCase):
             remote.do_handshake.side_effect=interrupted
             self.assertTrue(bridge.slots.acquire(blocking=False))
             try:
-                with mock.patch.object(span_bridge.socket,"create_connection",return_value=raw_context), \
-                     mock.patch.object(span_bridge,"duplex_stream") as relay, \
+                with mock.patch.object(gateway.socket,"create_connection",return_value=raw_context), \
+                     mock.patch.object(gateway,"duplex_stream") as relay, \
                      mock.patch.object(bridge,"_report_failure") as failure:
                     bridge._connection(client, bridge.resume_epoch)
                 remote.close.assert_called()
@@ -727,7 +727,7 @@ class BridgeConfigTests(unittest.TestCase):
         client = socket.create_connection(listener.getsockname(), timeout=1)
         server, _address = listener.accept()
         try:
-            span_bridge.enable_tcp_keepalive(client)
+            gateway.enable_tcp_keepalive(client)
             self.assertEqual(
                 client.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE), 1
             )
@@ -738,13 +738,13 @@ class BridgeConfigTests(unittest.TestCase):
 
     def test_repeated_bridge_failure_emits_one_bounded_diagnostic(self):
         with tempfile.TemporaryDirectory() as raw:
-            bridge = span_bridge.Bridge("ssh-agent", 1, Path(raw), "127.0.0.1", mock.Mock())
+            bridge = gateway.SpanBridge("ssh-agent", 1, Path(raw), "127.0.0.1", mock.Mock())
             try:
                 with mock.patch("builtins.print") as output:
                     for _attempt in range(10):
                         bridge._report_failure("host connection", ConnectionRefusedError())
                 output.assert_called_once_with(
-                    "span-bridge: Span 'ssh-agent' failed during host connection (ConnectionRefusedError)",
+                    "span-gateway: Span 'ssh-agent' failed during host connection (ConnectionRefusedError)",
                     flush=True,
                 )
             finally:
@@ -821,28 +821,28 @@ class BridgeConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             path = Path(raw) / "spans.json"
             path.write_text('[{"name":"tool","port":49152}]')
-            self.assertEqual(span_bridge.load_config(path), [("tool", 49152)])
+            self.assertEqual(gateway.load_config(path), [("tool", 49152)])
             path.write_text('[{"name":"tool","port":49152,"methods":["spawn"]}]')
-            with self.assertRaisesRegex(RuntimeError, "invalid Span bridge entry"):
-                span_bridge.load_config(path)
+            with self.assertRaisesRegex(RuntimeError, "invalid Span gateway entry"):
+                gateway.load_config(path)
 
     def test_bridge_config_read_is_bounded(self):
         with tempfile.TemporaryDirectory() as raw:
             path = Path(raw) / "spans.json"
-            path.write_bytes(b"[]" + b" " * span_bridge.MAX_CONFIG)
-            with self.assertRaisesRegex(RuntimeError, "Span bridge config is too large"):
-                span_bridge.load_config(path)
+            path.write_bytes(b"[]" + b" " * gateway.MAX_CONFIG)
+            with self.assertRaisesRegex(RuntimeError, "Span gateway config is too large"):
+                gateway.load_config(path)
 
     def test_readiness_uses_a_per_launch_token(self):
-        self.assertTrue(span_bridge.READY_TOKEN.fullmatch("a" * 32))
-        self.assertFalse(span_bridge.READY_TOKEN.fullmatch("stale"))
-        entrypoint = (Path(__file__).parents[1] / "devbox" / "entrypoint.sh").read_text()
+        self.assertTrue(gateway.READY_TOKEN.fullmatch("a" * 32))
+        self.assertFalse(gateway.READY_TOKEN.fullmatch("stale"))
+        entrypoint = (Path(__file__).parents[1] / "box" / "entrypoint.sh").read_text()
         self.assertIn("cmp -s /run/devc2-public/span-ready /run/devc2/spans/.ready", entrypoint)
 
     def test_saturated_bridge_backpressures_until_capacity_is_available(self):
-        with tempfile.TemporaryDirectory() as raw, mock.patch.object(span_bridge, "MAX_CONNECTIONS", 1):
+        with tempfile.TemporaryDirectory() as raw, mock.patch.object(gateway, "MAX_CONNECTIONS", 1):
             root = Path(raw)
-            bridge = span_bridge.Bridge("echo", 1, root, "127.0.0.1", mock.Mock())
+            bridge = gateway.SpanBridge("echo", 1, root, "127.0.0.1", mock.Mock())
             self.assertTrue(bridge.slots.acquire(blocking=False))
             bridge.start()
             try:
@@ -862,7 +862,7 @@ class BridgeConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             stopping = threading.Event()
             failed = threading.Event()
-            bridge = span_bridge.Bridge(
+            bridge = gateway.SpanBridge(
                 "echo", 1, Path(raw), "127.0.0.1", mock.Mock(),
                 stopping=stopping, failed=failed,
             )
@@ -878,27 +878,27 @@ class BridgeConfigTests(unittest.TestCase):
 
     def test_compose_keeps_transport_credentials_outside_the_island(self):
         compose = (Path(__file__).parents[1] / "compose.yaml").read_text()
-        island = compose.split("  devbox:\n", 1)[1].split("\n  span-proxy:\n", 1)[0]
+        box = compose.split("  devbox:\n", 1)[1].split("\n  span-proxy:\n", 1)[0]
         bridge = compose.split("  span-proxy:\n", 1)[1].split("\nvolumes:\n", 1)[0]
-        self.assertIn("target: /run/devc2/bin", island)
-        self.assertIn("target: /run/devc2/spans", island)
-        self.assertNotIn("devc2-span-tls", island)
+        self.assertIn("target: /run/devc2/bin", box)
+        self.assertIn("target: /run/devc2/spans", box)
+        self.assertNotIn("devc2-span-tls", box)
         self.assertIn("devc2-span-tls", bridge)
         self.assertIn("profiles: [spans]", bridge)
         self.assertIn('user: "0:0"', bridge)
-        self.assertIn("credential_proxy.span_bridge", bridge)
+        self.assertIn("span_gateway.gateway", bridge)
         self.assertIn('restart: "on-failure:5"',bridge)
         self.assertIn("mem_limit: 1g", bridge)
         self.assertIn("cpus: 2", bridge)
         self.assertIn("pids_limit: 1024", bridge)
-        self.assertEqual(span_bridge.MAX_CONNECTIONS, 256)
-        self.assertEqual(span_bridge.LISTEN_BACKLOG, 1024)
-        self.assertEqual(http_projection.MAX_CONNECTIONS, 256)
-        self.assertEqual(http_projection.LISTEN_BACKLOG, 1024)
+        self.assertEqual(gateway.MAX_CONNECTIONS, 256)
+        self.assertEqual(gateway.LISTEN_BACKLOG, 1024)
+        self.assertEqual(http_connect_proxy.MAX_CONNECTIONS, 256)
+        self.assertEqual(http_connect_proxy.LISTEN_BACKLOG, 1024)
         self.assertEqual(span_runtime.MAX_CONNECTIONS, 256)
         self.assertEqual(span_runtime.LISTEN_BACKLOG, 1024)
         self.assertEqual(span_runtime.MIN_OPEN_FILES, 4096)
-        span_slots, http_slots = span_bridge.worker_budgets()
+        span_slots, http_slots = gateway.worker_budgets()
         self.assertIsNot(span_slots, http_slots)
         for _connection in range(256):
             self.assertTrue(span_slots.acquire(blocking=False))
@@ -906,7 +906,7 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertFalse(span_slots.acquire(blocking=False))
         self.assertFalse(http_slots.acquire(blocking=False))
         self.assertLessEqual(
-            2 * (span_bridge.MAX_CONNECTIONS + http_projection.MAX_CONNECTIONS)
+            2 * (gateway.MAX_CONNECTIONS + http_connect_proxy.MAX_CONNECTIONS)
             * stream_relay.MAX_PENDING,
             256 * 1024 * 1024,
         )
@@ -935,10 +935,10 @@ class BridgeConfigTests(unittest.TestCase):
                 "--tls-ca", "ca", "--tls-cert", "cert", "--tls-key", "key",
                 "--ready-token-file", str(token), "--http-config", str(routes),
             ]
-            with mock.patch.object(span_bridge.ssl, "create_default_context", return_value=context), \
-                 mock.patch.object(span_bridge, "Bridge", side_effect=make_bridge), \
-                 mock.patch.object(span_bridge, "HttpProjection", return_value=http):
-                self.assertEqual(span_bridge.main(argv), 1)
+            with mock.patch.object(gateway.ssl, "create_default_context", return_value=context), \
+                 mock.patch.object(gateway, "SpanBridge", side_effect=make_bridge), \
+                 mock.patch.object(gateway, "HttpConnectProxy", return_value=http):
+                self.assertEqual(gateway.main(argv), 1)
             self.assertFalse((sockets / ".ready").exists())
             bridge.stop.assert_called_once_with()
             http.stop.assert_called_once_with()
@@ -956,30 +956,30 @@ class LauncherGrantTests(unittest.TestCase):
         client = root / "tool-client"
         client.write_text("#!/bin/sh\nexit 0\n")
         client.chmod(0o755)
-        span = span_runtime.Span("tool", client, root / "tool-span")
+        span = span_runtime.SpanGrant("tool", client, root / "tool-span")
         completed = mock.Mock(returncode=0)
         with mock.patch.object(devc2, "require_docker"), \
              mock.patch.object(devc2, "ensure_legacy_devcontainer_not_running"), \
              mock.patch.object(devc2, "ensure_tact_config"), \
-             mock.patch.object(devc2, "repository_lock", return_value=contextlib.nullcontext()), \
+             mock.patch.object(devc2, "checkout_lock", return_value=contextlib.nullcontext()), \
              mock.patch.object(devc2, "prepare", return_value=public), \
              mock.patch.object(devc2, "generate_relay_pki", return_value=(relay_server, relay_client)), \
              mock.patch.object(devc2, "remove_span_volume"), \
              mock.patch.object(devc2, "compose", side_effect=lambda *args, **kwargs: calls.append(args)), \
              mock.patch.object(devc2, "require_bound_image", side_effect=lambda image: "sha256:"+("1" if image==devc2.RUNTIME_IMAGE else "2")*64), \
              mock.patch.object(devc2.subprocess, "run", return_value=completed), \
-             mock.patch.object(devc2.span_runtime, "load_catalog", return_value=[span] if names else []) as load_catalog, \
+             mock.patch.object(devc2.span_runtime, "prepare_span_grants", return_value=[span] if names else []) as prepare_span_grants, \
              mock.patch.object(devc2.span_runtime, "SpanRuntime", return_value=runtime) as start_runtime:
             self.assertEqual(devc2._start_unlocked(root, span_names=names), 0)
-        return calls, load_catalog, start_runtime, runtime, public
+        return calls, prepare_span_grants, start_runtime, runtime, public
 
     def test_no_grant_starts_no_provider_or_span_sidecar(self):
         with tempfile.TemporaryDirectory() as raw:
-            calls, load_catalog, start_runtime, runtime, public = self.run_launcher(Path(raw), ())
-            load_catalog.assert_called_once()
-            args=load_catalog.call_args.args
+            calls, prepare_span_grants, start_runtime, runtime, public = self.run_launcher(Path(raw), ())
+            prepare_span_grants.assert_called_once()
+            args=prepare_span_grants.call_args.args
             self.assertEqual(args[:3],(devc2.SPAN_CATALOG,(),Path(raw)))
-            self.assertEqual((args[3].name,args[4].name),("span-clients","span-providers"))
+            self.assertEqual((args[3].name,args[4].name),("span-adapters","span-worlds"))
             self.assertEqual(args[5],devc2.ROOT/"spans")
             start_runtime.assert_not_called()
             runtime.stop.assert_not_called()
@@ -989,11 +989,11 @@ class LauncherGrantTests(unittest.TestCase):
 
     def test_explicit_grant_starts_and_stops_only_that_span(self):
         with tempfile.TemporaryDirectory() as raw:
-            calls, load_catalog, start_runtime, runtime, public = self.run_launcher(Path(raw), ("tool",))
-            load_catalog.assert_called_once()
-            args=load_catalog.call_args.args
+            calls, prepare_span_grants, start_runtime, runtime, public = self.run_launcher(Path(raw), ("tool",))
+            prepare_span_grants.assert_called_once()
+            args=prepare_span_grants.call_args.args
             self.assertEqual(args[:3],(devc2.SPAN_CATALOG,("tool",),Path(raw)))
-            self.assertEqual((args[3].name,args[4].name),("span-clients","span-providers"))
+            self.assertEqual((args[3].name,args[4].name),("span-adapters","span-worlds"))
             self.assertEqual(args[5],devc2.ROOT/"spans")
             start_runtime.assert_called_once()
             runtime.stop.assert_called_once()

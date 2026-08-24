@@ -14,18 +14,18 @@ from pathlib import Path
 
 
 READY_TOKEN = re.compile(r"^[a-f0-9]{32}$")
-# HTTP tunnels pass through both the HTTP projection and a named Span bridge,
+# HTTP tunnels pass through both the HTTP proxy and a named Span gateway,
 # so the two layers need independent worker budgets. Sharing one budget makes
 # every routed OpenAI/GitHub tunnel count twice and can deadlock admission.
 MAX_CONNECTIONS = 256
 LISTEN_BACKLOG = 1024
 MAX_SPANS = 16
-from .http_projection import MAX_CONNECTIONS as MAX_HTTP_CONNECTIONS, HttpProjection, load_routes
+from .http_connect_proxy import MAX_CONNECTIONS as MAX_HTTP_CONNECTIONS, HttpConnectProxy, load_routes
 from .config import MAX_CONFIG, NAME, read_json, valid_span_name
 from .stream_relay import RESUME_GAP_SECONDS, duplex_stream, enable_tcp_keepalive, serve_connections, transport_clocks, transport_gap
 
 
-class Bridge:
+class SpanBridge:
     def __init__(self, name: str, port: int, socket_dir: Path, host: str, context: ssl.SSLContext, slots=None, stopping=None, failed=None):
         self.name, self.port, self.host, self.context = name, port, host, context
         self.path = socket_dir / f"{name}.sock"
@@ -48,9 +48,9 @@ class Bridge:
             self.path.unlink()
         self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.server.bind(str(self.path))
-        # Only the Island and this bridge mount the containing volume. The
-        # root-owned directory prevents Island code from replacing endpoints;
-        # the socket itself remains connectable by the unprivileged Island UID.
+        # Only the Box and this gateway mount the containing volume. The
+        # root-owned directory prevents Box code from replacing endpoints;
+        # the socket itself remains connectable by the unprivileged Box UID.
         os.chmod(self.path, 0o666)
         self.server.listen(LISTEN_BACKLOG)
         self.server.settimeout(0.5)
@@ -66,7 +66,7 @@ class Bridge:
                 return
             self.reported_failures.add(key)
         print(
-            f"span-bridge: Span {self.name!r} failed during {stage} ({key[1]})",
+            f"span-gateway: Span {self.name!r} failed during {stage} ({key[1]})",
             flush=True,
         )
 
@@ -79,7 +79,7 @@ class Bridge:
         except Exception as error:
             if not self.stopping.is_set():
                 print(
-                    f"span-bridge: Span {self.name!r} listener failed ({type(error).__name__})",
+                    f"span-gateway: Span {self.name!r} listener failed ({type(error).__name__})",
                     flush=True,
                 )
                 self.failed.set()
@@ -106,7 +106,7 @@ class Bridge:
             return False
         retired=self._retire_connections()
         if retired:
-            print(f"span-bridge: Span {self.name!r} retired pre-resume transport",flush=True)
+            print(f"span-gateway: Span {self.name!r} retired pre-resume transport",flush=True)
         return True
 
     def _retire_connections(self) -> int:
@@ -183,21 +183,21 @@ class Bridge:
 
 
 def load_config(path: Path) -> list[tuple[str, int]]:
-    document = read_json(path, RuntimeError("Span bridge config is too large"))
+    document = read_json(path, RuntimeError("Span gateway config is too large"))
     if not isinstance(document, list):
-        raise RuntimeError("Span bridge config must be a list")
+        raise RuntimeError("Span gateway config must be a list")
     if len(document)>MAX_SPANS:
-        raise RuntimeError(f"Span bridge supports at most {MAX_SPANS} Spans")
+        raise RuntimeError(f"Span gateway supports at most {MAX_SPANS} Spans")
     result = []
     names = set()
     for item in document:
         if not isinstance(item, dict) or set(item) != {"name", "port"}:
-            raise RuntimeError("invalid Span bridge entry")
+            raise RuntimeError("invalid Span gateway entry")
         name, port = item["name"], item["port"]
         if not valid_span_name(name) or name in names:
-            raise RuntimeError("invalid or duplicate Span bridge name")
+            raise RuntimeError("invalid or duplicate Span gateway name")
         if not isinstance(port, int) or not 1 <= port <= 65535:
-            raise RuntimeError("invalid Span bridge port")
+            raise RuntimeError("invalid Span gateway port")
         names.add(name)
         result.append((name, port))
     return result
@@ -237,8 +237,8 @@ def main(argv: list[str] | None = None) -> int:
     failed = threading.Event()
     span_slots, http_slots = worker_budgets()
     entries = load_config(args.config)
-    bridges = [Bridge(name, port, args.socket_dir, args.host, context, span_slots, stopping, failed) for name, port in entries]
-    http = HttpProjection(
+    bridges = [SpanBridge(name, port, args.socket_dir, args.host, context, span_slots, stopping, failed) for name, port in entries]
+    http = HttpConnectProxy(
         load_routes(args.http_config, {name for name, _port in entries}),
         args.socket_dir,
         args.http_port,

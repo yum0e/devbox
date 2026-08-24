@@ -34,7 +34,7 @@ jobs:
           git fetch --no-tags origin main
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main
           PYTHONPATH=. python3 -m unittest discover -s tests -v
-          bash -n install.sh install-release.sh devbox/entrypoint.sh devbox/configure-pi.sh devbox/configure-signing.sh devbox/configure-herdr.sh devbox/configure-gh-stack.sh devbox/herdr-git-metadata
+          bash -n install.sh install-release.sh island/entrypoint.sh island/configure-pi.sh island/configure-signing.sh island/configure-herdr.sh island/configure-gh-stack.sh island/herdr-git-metadata
       - name: Build deterministic assets
         run: python3 package-release.py
       - name: Build and smoke-test packaged images

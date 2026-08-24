@@ -207,7 +207,7 @@ class CliTests(unittest.TestCase):
 
     def test_shared_config_is_snapshotted_but_runtime_copy_is_writable_and_per_repo(self):
         raw = (PATH.parents[1] / "compose.yaml").read_text()
-        entrypoint = (PATH.parents[1] / "devbox" / "entrypoint.sh").read_text()
+        entrypoint = (PATH.parents[1] / "box" / "entrypoint.sh").read_text()
         self.assertNotIn("source: ${DEVC2_PUBLIC_DIR:?set DEVC2_PUBLIC_DIR}/tact-config.toml", raw)
         self.assertIn("target: /run/devc2-public", raw)
         self.assertIn("shared_tact_config=/run/devc2-public/tact-config.toml", entrypoint)
@@ -218,7 +218,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("target: /home/devbox", raw)
 
     def test_tact_skill_enablement_preserves_the_canonical_effective_config(self):
-        entrypoint=(PATH.parents[1]/"devbox"/"entrypoint.sh").read_text()
+        entrypoint=(PATH.parents[1]/"box"/"entrypoint.sh").read_text()
         program=re.search(r"tact config show \| awk '\n(.*?)\n' >",entrypoint,re.DOTALL).group(1)
         original=(
             '[agent]\nmax_subagents = 7\n\n[skills]\nenabled = false\n'
@@ -352,7 +352,7 @@ class CliTests(unittest.TestCase):
             self.assertTrue((public/"agent-skills"/"current"/"herdr"/"SKILL.md").is_file())
 
     def test_http_ca_umask_is_scoped_to_attachment_creation(self):
-        entrypoint = (PATH.parents[1] / "devbox" / "entrypoint.sh").read_text()
+        entrypoint = (PATH.parents[1] / "box" / "entrypoint.sh").read_text()
         scoped = re.search(
             r'if \[\[ -s /run/devc2-public/http-ca\.pem \]\]; then\n  \(\n'
             r'    umask 077\n.*?\n  \)\nfi',
@@ -409,13 +409,13 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("pi-upstream", dockerfile)
         self.assertNotIn("tact-wrapper.sh", dockerfile)
         self.assertNotIn("pi-wrapper.sh", dockerfile)
-        self.assertFalse((root / "devbox" / "tact-wrapper.sh").exists())
-        self.assertFalse((root / "devbox" / "pi-wrapper.sh").exists())
+        self.assertFalse((root / "box" / "tact-wrapper.sh").exists())
+        self.assertFalse((root / "box" / "pi-wrapper.sh").exists())
         self.assertIn("env_file:", compose)
         self.assertIn("${DEVC2_WORLD_ENV_FILE:?set DEVC2_WORLD_ENV_FILE}", compose)
 
     def test_pi_provider_configuration_is_initialized_without_credentials(self):
-        configure = PATH.parents[1] / "devbox" / "configure-pi.sh"
+        configure = PATH.parents[1] / "box" / "configure-pi.sh"
         with tempfile.TemporaryDirectory() as td:
             agent_dir = Path(td) / ".pi" / "agent"
             agent_dir.mkdir(parents=True)
@@ -447,7 +447,7 @@ class CliTests(unittest.TestCase):
 
     def test_external_build_images_are_content_pinned(self):
         dockerfile = (PATH.parents[1] / "Dockerfile").read_text()
-        proxy_dockerfile = (PATH.parents[1] / "credential_proxy" / "Dockerfile").read_text()
+        proxy_dockerfile = (PATH.parents[1] / "span_gateway" / "Dockerfile").read_text()
         self.assertIn("docker/dockerfile:1.7@sha256:", dockerfile)
         self.assertIn("ARG TACT_VERSION=0.6.3", dockerfile)
         self.assertIn(
@@ -457,14 +457,14 @@ class CliTests(unittest.TestCase):
         )
         self.assertIn("ghcr.io/astral-sh/uv:0.9.26@sha256:", dockerfile)
         self.assertIn("python:3.12-alpine@sha256:", proxy_dockerfile)
-        self.assertNotIn("COPY credential_proxy /app/credential_proxy", proxy_dockerfile)
-        for source in ("__init__.py", "span_bridge.py", "stream_relay.py", "http_projection.py"):
+        self.assertNotIn("COPY span_gateway /app/span_gateway", proxy_dockerfile)
+        for source in ("__init__.py", "gateway.py", "stream_relay.py", "http_connect_proxy.py"):
             self.assertIn(source, proxy_dockerfile)
         self.assertNotIn("ssh_agent_proxy.py", proxy_dockerfile)
 
     def test_developer_tools_postgres_17_and_pnpm_managed_node(self):
         dockerfile = (PATH.parents[1] / "Dockerfile").read_text()
-        entrypoint = (PATH.parents[1] / "devbox" / "entrypoint.sh").read_text()
+        entrypoint = (PATH.parents[1] / "box" / "entrypoint.sh").read_text()
         for package in (
             "bubblewrap", "fd-find", "lsof", "ncurses-term", "unzip", "zoxide",
         ):
@@ -479,13 +479,13 @@ class CliTests(unittest.TestCase):
         self.assertIn("@earendil-works/pi-coding-agent@0.84.2", dockerfile)
         self.assertIn("--ignore-scripts --no-optional", dockerfile)
         self.assertNotIn("pi-upstream", dockerfile)
-        self.assertIn("COPY devbox/configure-pi.sh /usr/local/libexec/devc2/configure-pi", dockerfile)
-        self.assertIn("COPY devbox/configure-signing.sh /usr/local/libexec/devc2/configure-signing", dockerfile)
+        self.assertIn("COPY box/configure-pi.sh /usr/local/libexec/devc2/configure-pi", dockerfile)
+        self.assertIn("COPY box/configure-signing.sh /usr/local/libexec/devc2/configure-signing", dockerfile)
         self.assertIn("/usr/local/libexec/devc2/configure-pi", entrypoint)
-        island,auth=dockerfile.split("FROM island AS auth",1)
-        self.assertNotIn("@openai/codex", island)
+        box,auth=dockerfile.split("FROM box AS auth",1)
+        self.assertNotIn("@openai/codex", box)
         self.assertIn("pnpm add --global @openai/codex@0.147.0", auth)
-        self.assertIn("FROM island AS runtime",auth)
+        self.assertIn("FROM box AS runtime",auth)
         self.assertNotIn("\n && npm --version", dockerfile)
         self.assertNotIn("\n && npm install", dockerfile)
         self.assertIn("uv python install 3.14", dockerfile)
@@ -515,10 +515,10 @@ class CliTests(unittest.TestCase):
     def test_herdr_is_bundled_but_never_started_by_the_entrypoint(self):
         root = PATH.parents[1]
         dockerfile = (PATH.parents[1] / "Dockerfile").read_text()
-        entrypoint = (PATH.parents[1] / "devbox" / "entrypoint.sh").read_text()
-        herdr_config = (PATH.parents[1] / "devbox" / "herdr-config.toml").read_text()
-        git_metadata = (root / "devbox" / "herdr-git-metadata").read_text()
-        zsh_integration = (root / "devbox" / "herdr-zsh-integration.zsh").read_text()
+        entrypoint = (PATH.parents[1] / "box" / "entrypoint.sh").read_text()
+        herdr_config = (PATH.parents[1] / "box" / "herdr-config.toml").read_text()
+        git_metadata = (root / "box" / "herdr-git-metadata").read_text()
+        zsh_integration = (root / "box" / "herdr-zsh-integration.zsh").read_text()
         self.assertIn("ARG HERDR_VERSION=0.8.2", dockerfile)
         self.assertIn('herdr_asset="herdr-linux-x86_64"', dockerfile)
         self.assertIn('herdr_asset="herdr-linux-aarch64"', dockerfile)
@@ -527,11 +527,11 @@ class CliTests(unittest.TestCase):
         self.assertIn("install -m 0755 /tmp/herdr /usr/local/bin/herdr", dockerfile)
         self.assertIn("herdr --skill >/tmp/herdr-skill.actual",dockerfile)
         self.assertIn("cmp /tmp/herdr-skill.expected /tmp/herdr-skill.actual",dockerfile)
-        skill=(PATH.parents[1]/"devbox"/"agent-skills"/"herdr"/"SKILL.md").read_text()
+        skill=(PATH.parents[1]/"box"/"agent-skills"/"herdr"/"SKILL.md").read_text()
         self.assertIn("herdr agent prompt reviewer",skill)
         self.assertIn("--no-focus",skill)
         self.assertIn(
-            "COPY --chown=devbox:devbox --chmod=0600 devbox/herdr-config.toml "
+            "COPY --chown=devbox:devbox --chmod=0600 box/herdr-config.toml "
             "/home/devbox/.config/herdr/config.toml",
             dockerfile,
         )
@@ -544,7 +544,7 @@ class CliTests(unittest.TestCase):
             dockerfile.index(directory_seed),
             dockerfile.index(
                 "COPY --chown=devbox:devbox --chmod=0600 "
-                "devbox/herdr-config.toml /home/devbox/.config/herdr/config.toml"
+                "box/herdr-config.toml /home/devbox/.config/herdr/config.toml"
             ),
         )
         self.assertIn('[terminal]\ndefault_shell = "/usr/bin/zsh"', herdr_config)
@@ -554,10 +554,10 @@ class CliTests(unittest.TestCase):
         self.assertIn("/usr/local/libexec/devc2/configure-herdr", entrypoint)
         self.assertNotIn("herdr server", entrypoint.lower())
         self.assertNotIn("herdr-wrapper", dockerfile)
-        self.assertFalse((PATH.parents[1] / "devbox" / "herdr-wrapper.py").exists())
-        self.assertIn("devbox/herdr-git-metadata /usr/local/libexec/devc2/herdr-git-metadata", dockerfile)
-        self.assertIn("devbox/configure-herdr.sh /usr/local/libexec/devc2/configure-herdr", dockerfile)
-        self.assertIn("devbox/herdr-config.toml /usr/local/share/devc2-herdr-config.toml", dockerfile)
+        self.assertFalse((PATH.parents[1] / "box" / "herdr-wrapper.py").exists())
+        self.assertIn("box/herdr-git-metadata /usr/local/libexec/devc2/herdr-git-metadata", dockerfile)
+        self.assertIn("box/configure-herdr.sh /usr/local/libexec/devc2/configure-herdr", dockerfile)
+        self.assertIn("box/herdr-config.toml /usr/local/share/devc2-herdr-config.toml", dockerfile)
         self.assertIn("devc2-herdr-metadata.zsh", dockerfile)
         self.assertIn('rev-parse --absolute-git-dir', git_metadata)
         self.assertIn('${head#ref: refs/heads/}', git_metadata)
@@ -571,7 +571,7 @@ class CliTests(unittest.TestCase):
         self.assertIn(":/bin:/run/devc2/bin:/home/devbox/.local/bin",runtime_path)
 
     def test_herdr_git_metadata_retries_failed_reports_and_clears_on_exit(self):
-        reporter = PATH.parents[1] / "devbox" / "herdr-git-metadata"
+        reporter = PATH.parents[1] / "box" / "herdr-git-metadata"
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             checkout = root / "checkout"
@@ -678,8 +678,8 @@ class CliTests(unittest.TestCase):
 
     def test_herdr_config_adds_branch_layout_without_replacing_user_settings(self):
         root = PATH.parents[1]
-        configure = root / "devbox" / "configure-herdr.sh"
-        managed = root / "devbox" / "herdr-config.toml"
+        configure = root / "box" / "configure-herdr.sh"
+        managed = root / "box" / "herdr-config.toml"
         with tempfile.TemporaryDirectory() as td:
             temporary = Path(td)
             config = temporary / "config.toml"
@@ -710,8 +710,8 @@ class CliTests(unittest.TestCase):
 
     def test_herdr_config_repairs_legacy_untraversable_seed_directories(self):
         root = PATH.parents[1]
-        configure = root / "devbox" / "configure-herdr.sh"
-        managed = root / "devbox" / "herdr-config.toml"
+        configure = root / "box" / "configure-herdr.sh"
+        managed = root / "box" / "herdr-config.toml"
         with tempfile.TemporaryDirectory() as td:
             home = Path(td) / "home"
             herdr = home / ".config" / "herdr"
@@ -734,7 +734,7 @@ class CliTests(unittest.TestCase):
 
     def test_runtime_doctor_is_disposable_and_exercises_live_boundaries(self):
         source = PATH.read_text()
-        entrypoint = (PATH.parents[1] / "devbox" / "entrypoint.sh").read_text()
+        entrypoint = (PATH.parents[1] / "box" / "entrypoint.sh").read_text()
         self.assertIn("TemporaryDirectory(prefix='devc2-doctor-repo-')", source)
         self.assertIn("DEVC2_RUNTIME_DOCTOR=1", source)
         self.assertIn("down_args.append('--volumes')", source)
@@ -780,8 +780,8 @@ class CliTests(unittest.TestCase):
             self.assertEqual(D.doctor(), 1)
 
     def test_entrypoint_uses_optional_github_and_ssh_agent_spans_with_signing_readiness(self):
-        entrypoint = (PATH.parents[1] / "devbox" / "entrypoint.sh").read_text()
-        signing = (PATH.parents[1] / "devbox" / "configure-signing.sh").read_text()
+        entrypoint = (PATH.parents[1] / "box" / "entrypoint.sh").read_text()
+        signing = (PATH.parents[1] / "box" / "configure-signing.sh").read_text()
         self.assertIn("gh api user", entrypoint)
         self.assertNotIn("github run --", entrypoint)
         self.assertIn("/usr/local/libexec/devc2/configure-signing", entrypoint)
@@ -806,8 +806,8 @@ class CliTests(unittest.TestCase):
         self.assertIn('if [[ -n "${GH_TOKEN:-}" ]]', entrypoint)
         self.assertNotIn('$HOME/.zshenv', entrypoint)
         self.assertNotIn('$HOME/.bashrc', entrypoint)
-        self.assertFalse((PATH.parents[1] / "devbox" / "tact-wrapper.sh").exists())
-        self.assertFalse((PATH.parents[1] / "devbox" / "pi-wrapper.sh").exists())
+        self.assertFalse((PATH.parents[1] / "box" / "tact-wrapper.sh").exists())
+        self.assertFalse((PATH.parents[1] / "box" / "pi-wrapper.sh").exists())
         self.assertNotIn("openai run --", entrypoint)
         runtime_path=(PATH.parents[1]/"Dockerfile").read_text().split("ENV HOME=",1)[1]
         self.assertLess(runtime_path.index("/usr/local/bin"),runtime_path.index("/run/devc2/bin"))
@@ -1001,7 +1001,7 @@ class ComposeEnvironmentTests(unittest.TestCase):
         self.assertEqual(result["DEVC2_SPAN_RELAY_TLS_DIR"], "/tmp/span-tls")
         self.assertEqual(result["DEVC2_SPAN_CLIENT_DIR"], "/tmp/span-clients")
         self.assertEqual(result["DEVC2_IMAGE"],D.RUNTIME_IMAGE)
-        self.assertEqual(result["DEVC2_CREDENTIAL_IMAGE"],D.CREDENTIAL_IMAGE)
+        self.assertEqual(result["DEVC2_CREDENTIAL_IMAGE"],D.SPAN_GATEWAY_IMAGE)
         self.assertEqual(result["DEVC2_ASSET_DIGEST"],D.ASSET_DIGEST)
         self.assertRegex(result["DEVC2_SPAN_VOLUME"], r"^devc2-[0-9a-f]{16}-span-sockets-v2$")
         self.assertEqual(result["COMPOSE_PROFILES"], "spans")
@@ -1018,7 +1018,7 @@ class ImageIdentityTests(unittest.TestCase):
     def test_managed_image_names_and_inspection_are_digest_bound(self):
         self.assertTrue(D.RUNTIME_IMAGE.endswith(D.ASSET_DIGEST[:12]))
         self.assertTrue(D.AUTH_IMAGE.endswith(D.ASSET_DIGEST[:12]))
-        self.assertTrue(D.CREDENTIAL_IMAGE.endswith(D.ASSET_DIGEST[:12]))
+        self.assertTrue(D.SPAN_GATEWAY_IMAGE.endswith(D.ASSET_DIGEST[:12]))
         with mock.patch.object(D,"run",return_value=image_inspection()) as run:
             self.assertEqual(D.require_bound_image(D.RUNTIME_IMAGE),IMAGE_ID)
         self.assertEqual(run.call_args.args[0],["docker","image","inspect","--format","{{json .}}",D.RUNTIME_IMAGE])

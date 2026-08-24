@@ -1,4 +1,4 @@
-"""Shared validation and bounded config loading for credential projections."""
+"""Shared validation and bounded config loading for the Span gateway."""
 from __future__ import annotations
 
 import json

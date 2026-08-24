@@ -9,8 +9,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = ROOT / "Dockerfile"
-CONFIGURATOR = ROOT / "devbox" / "configure-gh-stack.sh"
-ENTRYPOINT = ROOT / "devbox" / "entrypoint.sh"
+CONFIGURATOR = ROOT / "box" / "configure-gh-stack.sh"
+ENTRYPOINT = ROOT / "box" / "entrypoint.sh"
 
 
 class GhStackTests(unittest.TestCase):

@@ -29,12 +29,12 @@ class UpdateTests(unittest.TestCase):
         for relative in D.REQUIRED_ASSETS:
             self.assertTrue((ROOT/relative).is_file(),relative)
         self.assertIn("launcher/asset_contract.py",D.REQUIRED_ASSETS)
-        self.assertIn("credential_proxy/config.py",D.REQUIRED_ASSETS)
-        self.assertIn("devbox/configure-gh-stack.sh",D.REQUIRED_ASSETS)
+        self.assertIn("span_gateway/config.py",D.REQUIRED_ASSETS)
+        self.assertIn("box/configure-gh-stack.sh",D.REQUIRED_ASSETS)
         for relative in (
-            "devbox/herdr-wrapper.py", "devbox/tact-wrapper.sh", "devbox/pi-wrapper.sh",
+            "box/herdr-wrapper.py", "box/tact-wrapper.sh", "box/pi-wrapper.sh",
             "launcher/scoped_exec_projection.py",
-            "credential_proxy/ssh_agent_proxy.py",
+            "span_gateway/ssh_agent_proxy.py",
             "spans/openai/provider", "spans/openai/client",
             "spans/github/provider", "spans/github/client",
             "spans/openai/world", "spans/github/world",
@@ -128,7 +128,7 @@ class UpdateTests(unittest.TestCase):
     def test_repo_lock_makes_reset_refuse_a_live_checkout(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); self.runtime(root); repo=root/"repo"; repo.mkdir()
-            with D.repository_lock(repo), mock.patch.object(D,"compose") as compose:
+            with D.checkout_lock(repo), mock.patch.object(D,"compose") as compose:
                 with self.assertRaisesRegex(RuntimeError,"already running"):
                     D._reset_unlocked(repo,True)
             compose.assert_not_called()
@@ -498,7 +498,7 @@ class UpdateTests(unittest.TestCase):
         package_spec=importlib.util.spec_from_file_location("devc2_package",ROOT/"package-release.py"); package=importlib.util.module_from_spec(package_spec); package_spec.loader.exec_module(package)
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); external=root/"external"; external.mkdir(); (external/"secret").write_text("must not package")
-            os.symlink(external,root/"devbox"); package.ROOT=root
+            os.symlink(external,root/"box"); package.ROOT=root
             with self.assertRaisesRegex(RuntimeError,"symlink"): package.files()
 
     def test_installer_never_uses_sudo_or_shell_startup_files(self):

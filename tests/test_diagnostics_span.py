@@ -15,7 +15,7 @@ from launcher import devc2, span_runtime
 
 ROOT = Path(__file__).parents[1]
 WORLD = ROOT / "spans" / "diagnostics" / "world"
-COMMAND_LINK = ROOT / "launcher" / "command_projection.py"
+COMMAND_ADAPTER = ROOT / "launcher" / "command_adapter.py"
 HEADER = struct.Struct("!I")
 
 
@@ -30,22 +30,22 @@ def receive(connection: socket.socket, size: int) -> bytes:
 
 
 class DiagnosticsWorldTests(unittest.TestCase):
-    def test_builtin_uses_the_generic_command_link(self):
+    def test_builtin_uses_the_generic_command_adapter(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             (root / "snapshot").mkdir()
-            item = span_runtime.load_catalog(
+            item = span_runtime.prepare_span_grants(
                 root / "missing.json",
                 ("diagnostics",),
                 root / "workspace",
                 root / "snapshot" / "links",
                 root / "snapshot" / "worlds",
                 ROOT / "spans",
-                command_projection=COMMAND_LINK,
+                command_adapter=COMMAND_ADAPTER,
             )[0]
-            self.assertEqual(item.provider.read_bytes(), WORLD.read_bytes())
-            self.assertEqual(item.client.read_bytes(), COMMAND_LINK.read_bytes())
-            self.assertNotIn(b"diagnostics", COMMAND_LINK.read_bytes().lower())
+            self.assertEqual(item.world_executable.read_bytes(), WORLD.read_bytes())
+            self.assertEqual(item.adapter_executable.read_bytes(), COMMAND_ADAPTER.read_bytes())
+            self.assertNotIn(b"diagnostics", COMMAND_ADAPTER.read_bytes().lower())
 
     def test_report_exposes_only_sanitized_launch_local_state(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -76,8 +76,8 @@ class DiagnosticsWorldTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             state = span_runtime.DiagnosticsState(root / "state.json", ["diagnostics"])
-            span = span_runtime.Span("diagnostics", COMMAND_LINK, WORLD)
-            provider = span_runtime.Provider(span, root, "island-one", state.path)
+            span = span_runtime.SpanGrant("diagnostics", COMMAND_ADAPTER, WORLD)
+            provider = span_runtime.WorldProcess(span, root, "box-one", state.path)
             try:
                 provider.check_started()
                 for argv, expected_status in ((["report"], 0), (["shell", "id"], 2)):
@@ -102,7 +102,7 @@ class DiagnosticsWorldTests(unittest.TestCase):
             finally:
                 provider.stop()
 
-    def test_state_write_failure_never_breaks_an_observed_link(self):
+    def test_state_write_failure_never_breaks_an_observed_span(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             state = span_runtime.DiagnosticsState(root / "state.json", ["ssh-agent"])
@@ -110,7 +110,7 @@ class DiagnosticsWorldTests(unittest.TestCase):
             state.accepted("ssh-agent")
             state.update("ssh-agent", last_stage="stream relay")
             state.finished("ssh-agent", "stream relay", None)
-            self.assertEqual(state.links["ssh-agent"]["completed"], 1)
+            self.assertEqual(state.span_states["ssh-agent"]["completed"], 1)
 
     def test_recovery_state_is_bounded_and_contains_no_error_details(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -119,7 +119,7 @@ class DiagnosticsWorldTests(unittest.TestCase):
             state.recovery_failed("openai")
             state.recovery_started("openai")
             state.recovery_succeeded("openai")
-            link = state.links["openai"]
+            link = state.span_states["openai"]
             self.assertEqual(link["recovery_state"], "healthy")
             self.assertEqual(link["recoveries"], 1)
             self.assertEqual(link["recovery_failures"], 1)
@@ -137,13 +137,13 @@ class DiagnosticsWorldTests(unittest.TestCase):
             delayed.chmod(0o755)
             server_tls, _client_tls = devc2.generate_relay_pki(root / "pki")
             runtime = span_runtime.SpanRuntime([
-                span_runtime.Span("diagnostics", COMMAND_LINK, WORLD),
-                span_runtime.Span("delayed", COMMAND_LINK, delayed),
-            ], root, "island-one", server_tls)
+                span_runtime.SpanGrant("diagnostics", COMMAND_ADAPTER, WORLD),
+                span_runtime.SpanGrant("delayed", COMMAND_ADAPTER, delayed),
+            ], root, "box-one", server_tls)
             try:
                 deadline = time.monotonic() + 2
                 while time.monotonic() < deadline:
-                    delayed_state = runtime.diagnostics.links["delayed"]
+                    delayed_state = runtime.diagnostics.span_states["delayed"]
                     if delayed_state["world_status"] == "exited":
                         break
                     time.sleep(0.05)

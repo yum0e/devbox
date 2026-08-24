@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 ARG TACT_VERSION=0.6.3
 FROM ghcr.io/clabby/tact:${TACT_VERSION}@sha256:ac02066f6c839c0741d894e02417609ac72f27b9729f1d3de736dfb4ed54fcf7 AS tact
-FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS island
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS box
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
@@ -46,14 +46,14 @@ RUN install -d -m 0755 "$PNPM_HOME" \
  && node --version \
  && pnpm store prune
 
-# Pi keeps its settings and sessions in the Island. When the OpenAI World is
+# Pi keeps its settings and sessions in the Box. When the OpenAI World is
 # granted, its standard provider environment is attached for the whole launch.
 RUN pnpm add --global --ignore-scripts --no-optional \
       @earendil-works/pi-coding-agent@0.84.2 \
  && pnpm store prune
 
-# Herdr is an ordinary Island tool. Nothing starts it until a user invokes it.
-COPY devbox/agent-skills/herdr/SKILL.md /tmp/herdr-skill.expected
+# Herdr is an ordinary Box tool. Nothing starts it until a user invokes it.
+COPY box/agent-skills/herdr/SKILL.md /tmp/herdr-skill.expected
 ARG TARGETARCH
 ARG HERDR_VERSION=0.8.2
 RUN set -eux; \
@@ -144,14 +144,14 @@ RUN set -eux; \
     rm /tmp/jj /tmp/jj.tar.gz; \
     jj --version
 
-COPY devbox/entrypoint.sh /usr/local/bin/devc2-entrypoint
-COPY devbox/configure-pi.sh /usr/local/libexec/devc2/configure-pi
-COPY devbox/configure-signing.sh /usr/local/libexec/devc2/configure-signing
-COPY devbox/configure-herdr.sh /usr/local/libexec/devc2/configure-herdr
-COPY devbox/configure-gh-stack.sh /usr/local/libexec/devc2/configure-gh-stack
-COPY devbox/herdr-git-metadata /usr/local/libexec/devc2/herdr-git-metadata
-COPY devbox/herdr-zsh-integration.zsh /etc/zsh/zshrc.d/devc2-herdr-metadata.zsh
-COPY devbox/github-known-hosts /etc/ssh/ssh_known_hosts
+COPY box/entrypoint.sh /usr/local/bin/devc2-entrypoint
+COPY box/configure-pi.sh /usr/local/libexec/devc2/configure-pi
+COPY box/configure-signing.sh /usr/local/libexec/devc2/configure-signing
+COPY box/configure-herdr.sh /usr/local/libexec/devc2/configure-herdr
+COPY box/configure-gh-stack.sh /usr/local/libexec/devc2/configure-gh-stack
+COPY box/herdr-git-metadata /usr/local/libexec/devc2/herdr-git-metadata
+COPY box/herdr-zsh-integration.zsh /etc/zsh/zshrc.d/devc2-herdr-metadata.zsh
+COPY box/github-known-hosts /etc/ssh/ssh_known_hosts
 RUN chmod 0755 /usr/local/bin/devc2-entrypoint /usr/local/bin/tact \
       /usr/local/libexec/devc2/configure-pi \
       /usr/local/libexec/devc2/configure-signing \
@@ -175,8 +175,8 @@ RUN chmod 0755 /usr/local/bin/devc2-entrypoint /usr/local/bin/tact \
 # A fresh persistent home volume is initialized from the image. Seed Herdr so
 # its initial pane, new tabs, and splits open zsh by default. The entrypoint
 # upgrades the prior untouched default while preserving user-managed configs.
-COPY --chmod=0644 devbox/herdr-config.toml /usr/local/share/devc2-herdr-config.toml
-COPY --chown=devbox:devbox --chmod=0600 devbox/herdr-config.toml /home/devbox/.config/herdr/config.toml
+COPY --chmod=0644 box/herdr-config.toml /usr/local/share/devc2-herdr-config.toml
+COPY --chown=devbox:devbox --chmod=0600 box/herdr-config.toml /home/devbox/.config/herdr/config.toml
 
 ENV HOME=/home/devbox \
     TACT_HOME=/home/devbox/.local/share/tact \
@@ -190,13 +190,13 @@ USER devbox
 WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/devc2-entrypoint"]
 
-# Authentication is deliberately outside the Island image. Codex currently
+# Authentication is deliberately outside the Box image. Codex currently
 # supplies the headless device flow; this target is built only by `devc2 auth`.
-FROM island AS auth
+FROM box AS auth
 USER root
 RUN pnpm add --global @openai/codex@0.147.0 \
  && pnpm store prune
 USER devbox
 
-# Keep the lean Island as the default build result.
-FROM island AS runtime
+# Keep the lean Box as the default build result.
+FROM box AS runtime

@@ -63,7 +63,7 @@ if [[ -e /run/devc2-public/spans.json ]]; then
     sleep 0.1
   done
   if ! cmp -s /run/devc2-public/span-ready /run/devc2/spans/.ready; then
-    echo "devc2: Span projection did not become ready" >&2
+    echo "devc2: Span gateway did not become ready" >&2
     exit 1
   fi
 fi
@@ -105,8 +105,8 @@ rm -f -- \
   "$HOME/.config/devc2/allowed-signers" \
   "$HOME/.config/devc2/ssh-keygen-with-agent"
 
-# The SSH World is already a selected-key-only agent. The generic stream Link
-# projects it directly. Git and Jujutsu need one narrow ssh-keygen launcher
+# The SSH World is already a selected-key-only agent. The Span gateway
+# exposes it directly. Git and Jujutsu need one narrow ssh-keygen launcher
 # because agent runtimes may intentionally remove SSH_AUTH_SOCK from children.
 if [[ -S /run/devc2/spans/ssh-agent.sock ]]; then
   export SSH_AUTH_SOCK=/run/devc2/spans/ssh-agent.sock
@@ -118,7 +118,7 @@ else
   unset SSH_AUTH_SOCK
 fi
 
-# GitHub identity is useful but not required to open an Island. It is learned
+# GitHub identity is useful but not required to open a Box. It is learned
 # only through the explicitly granted GitHub Span and never from a raw token.
 if [[ -n "${GH_TOKEN:-}" ]]; then
   if github_identity="$(gh api user 2>/dev/null)"; then

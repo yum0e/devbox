@@ -1,12 +1,12 @@
-# Diagnostics World
+# Diagnostics Span
 
 `diagnostics` is an optional, read-only command World for one devc2 launch. It
 reports sanitized transport state for the Spans explicitly granted to that
-Island:
+Box:
 
 ```sh
 devc2 run . --span diagnostics --span ssh-agent
-# inside the Island
+# inside the Box
 diagnostics report
 ```
 

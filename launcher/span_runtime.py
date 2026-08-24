@@ -22,8 +22,8 @@ from pathlib import Path
 
 NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 MAX_CATALOG_BYTES = 64 * 1024
-MAX_CLIENT_BYTES = 64 * 1024 * 1024
-MAX_PROVIDER_BYTES = 64 * 1024 * 1024
+MAX_ADAPTER_BYTES = 64 * 1024 * 1024
+MAX_WORLD_BYTES = 64 * 1024 * 1024
 MAX_CONNECTIONS = 256
 LISTEN_BACKLOG = 1024
 MIN_OPEN_FILES = 4096
@@ -34,15 +34,15 @@ STREAM_BUILTINS = {"ssh-agent"}
 COMMAND_BUILTINS = {"diagnostics"}
 SUPERVISOR = Path(__file__).with_name("span_supervisor.py")
 
-from credential_proxy.stream_relay import duplex_stream, enable_tcp_keepalive
-from launcher import world_attachment
+from span_gateway.stream_relay import duplex_stream, enable_tcp_keepalive
+from launcher import http_attachment
 
 
 @dataclass(frozen=True)
-class Span:
+class SpanGrant:
     name: str
-    client: Path | None
-    provider: Path
+    adapter_executable: Path | None
+    world_executable: Path
     http_attachment: bool = False
 
 
@@ -94,13 +94,13 @@ def _snapshot_executable(raw: object, label: str, target: Path, maximum: int, fo
         if descriptor is not None: os.close(descriptor)
 
 
-def load_catalog(path: Path, names: tuple[str, ...], forbidden_root: Path, client_destination: Path, provider_destination: Path, builtin_root: Path | None = None, command_projection: Path | None = None) -> list[Span]:
+def prepare_span_grants(path: Path, names: tuple[str, ...], forbidden_root: Path, adapter_destination: Path, world_destination: Path, builtin_root: Path | None = None, command_adapter: Path | None = None) -> list[SpanGrant]:
     if len(names)>MAX_SPANS:
-        raise RuntimeError(f"an Island may grant at most {MAX_SPANS} Spans")
-    client_destination.mkdir(mode=0o700)
-    provider_destination.mkdir(mode=0o700)
+        raise RuntimeError(f"a Box may grant at most {MAX_SPANS} Spans")
+    adapter_destination.mkdir(mode=0o700)
+    world_destination.mkdir(mode=0o700)
     if not names:
-        client_destination.chmod(0o555)
+        adapter_destination.chmod(0o555)
         return []
     for name in names:
         if not valid_name(name):
@@ -114,9 +114,9 @@ def load_catalog(path: Path, names: tuple[str, ...], forbidden_root: Path, clien
             elif world.is_file() and name in STREAM_BUILTINS:
                 builtin_entries[name]=(world,None,False)
             elif world.is_file() and name in COMMAND_BUILTINS:
-                if command_projection is None:
+                if command_adapter is None:
                     raise RuntimeError(f"Span {name!r} cannot be projected")
-                builtin_entries[name]=(world,command_projection,False)
+                builtin_entries[name]=(world,command_adapter,False)
     external_names=[name for name in names if name not in builtin_entries]
     forbidden_root=forbidden_root.resolve()
     if not external_names:
@@ -130,19 +130,19 @@ def load_catalog(path: Path, names: tuple[str, ...], forbidden_root: Path, clien
         if entry is None:
             raise RuntimeError(f"Span {name!r} is unavailable")
         if isinstance(entry,tuple):
-            world,link,http_attachment=entry
-            provider=_snapshot_executable(str(world),f"{name!r} World",provider_destination/name,MAX_PROVIDER_BYTES,forbidden_root)
-            client=None if link is None else _snapshot_executable(str(link),f"{name!r} Link",client_destination/name,MAX_CLIENT_BYTES,None)
+            world,adapter,http_attachment=entry
+            world_executable=_snapshot_executable(str(world),f"{name!r} World",world_destination/name,MAX_WORLD_BYTES,forbidden_root)
+            adapter_executable=None if adapter is None else _snapshot_executable(str(adapter),f"{name!r} adapter",adapter_destination/name,MAX_ADAPTER_BYTES,None)
         elif isinstance(entry,str):
-            if command_projection is None:
+            if command_adapter is None:
                 raise RuntimeError(f"Span {name!r} cannot be projected")
-            provider=_snapshot_executable(entry,f"{name!r} World",provider_destination/name,MAX_PROVIDER_BYTES,forbidden_root)
-            client=_snapshot_executable(str(command_projection),f"{name!r} command projection",client_destination/name,MAX_CLIENT_BYTES,None)
+            world_executable=_snapshot_executable(entry,f"{name!r} World",world_destination/name,MAX_WORLD_BYTES,forbidden_root)
+            adapter_executable=_snapshot_executable(str(command_adapter),f"{name!r} command adapter",adapter_destination/name,MAX_ADAPTER_BYTES,None)
             http_attachment=False
         else:
             raise RuntimeError(f"Span {name!r} has an invalid World path")
-        result.append(Span(name,client,provider,http_attachment))
-    client_destination.chmod(0o555)
+        result.append(SpanGrant(name,adapter_executable,world_executable,http_attachment))
+    adapter_destination.chmod(0o555)
     return result
 
 
@@ -182,8 +182,8 @@ def _read_catalog(path: Path, forbidden_root: Path) -> dict:
     return entries
 
 
-class Provider:
-    def __init__(self, span: Span, workspace: Path, instance_id: str, diagnostics_path: Path | None = None):
+class WorldProcess:
+    def __init__(self, span: SpanGrant, workspace: Path, instance_id: str, diagnostics_path: Path | None = None):
         self.span = span
         self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -208,7 +208,7 @@ class Provider:
             environment["DEVC2_RECOVERY_FD"] = str(recovery_write)
         arguments = [
             sys.executable, os.fspath(SUPERVISOR),
-            "--provider", os.fspath(span.provider),
+            "--world", os.fspath(span.world_executable),
             "--listener-fd", str(self.listener.fileno()),
             "--lifetime-fd", str(lifetime_read),
             "--started-fd", str(started_write),
@@ -260,8 +260,8 @@ class Provider:
         try:
             status = self.process.wait(timeout=2)
         except subprocess.TimeoutExpired as error:
-            raise RuntimeError(f"Span {self.span.name!r} provider did not stay running through startup") from error
-        raise RuntimeError(f"Span {self.span.name!r} provider exited with status {status}")
+            raise RuntimeError(f"Span {self.span.name!r} World did not stay running through startup") from error
+        raise RuntimeError(f"Span {self.span.name!r} World exited with status {status}")
 
     def stop(self) -> None:
         if self.started_read is not None:
@@ -299,7 +299,7 @@ class DiagnosticsState:
         self.path = path
         self.lock = threading.Lock()
         self.sequence = 0
-        self.links = {
+        self.span_states = {
             name: {
                 "startup": "pending",
                 "world_status": "starting",
@@ -324,14 +324,15 @@ class DiagnosticsState:
         try:
             self._write()
         except OSError:
-            # Observation must never become a dependency of the observed Link.
+            # Observation must never become a dependency of the observed Span.
             pass
 
     def _write(self) -> None:
         document = {
             "v": 1,
             "sequence": self.sequence,
-            "links": [dict(name=name, **state) for name, state in self.links.items()],
+            # Wire key retained for diagnostics protocol compatibility.
+            "links": [dict(name=name, **state) for name, state in self.span_states.items()],
         }
         payload = json.dumps(document, separators=(",", ":"), sort_keys=True).encode()
         descriptor, raw = tempfile.mkstemp(prefix=".diagnostics.", dir=self.path.parent)
@@ -346,13 +347,13 @@ class DiagnosticsState:
 
     def update(self, name: str, **changes: object) -> None:
         with self.lock:
-            self.links[name].update(changes)
+            self.span_states[name].update(changes)
             self.sequence += 1
             self._persist()
 
     def accepted(self, name: str) -> None:
         with self.lock:
-            state = self.links[name]
+            state = self.span_states[name]
             state.update(
                 accepted=state["accepted"] + 1,
                 active=state["active"] + 1,
@@ -365,7 +366,7 @@ class DiagnosticsState:
 
     def rejected(self, name: str) -> None:
         with self.lock:
-            state = self.links[name]
+            state = self.span_states[name]
             state.update(
                 rejected=state["rejected"] + 1,
                 last_stage="accept",
@@ -380,7 +381,7 @@ class DiagnosticsState:
 
     def recovery_succeeded(self, name: str) -> None:
         with self.lock:
-            state = self.links[name]
+            state = self.span_states[name]
             state.update(
                 recovery_state="healthy",
                 recoveries=state["recoveries"] + 1,
@@ -390,7 +391,7 @@ class DiagnosticsState:
 
     def recovery_failed(self, name: str) -> None:
         with self.lock:
-            state = self.links[name]
+            state = self.span_states[name]
             state.update(
                 recovery_state="degraded",
                 recovery_failures=state["recovery_failures"] + 1,
@@ -400,7 +401,7 @@ class DiagnosticsState:
 
     def finished(self, name: str, stage: str, error: Exception | None) -> None:
         with self.lock:
-            state = self.links[name]
+            state = self.span_states[name]
             changes = {
                 "active": max(0, state["active"] - 1),
                 "last_stage": stage,
@@ -560,9 +561,9 @@ class OpaqueRelay:
 
 
 class SpanRuntime:
-    def __init__(self, spans: list[Span], workspace: Path, instance_id: str, tls_directory: Path):
+    def __init__(self, spans: list[SpanGrant], workspace: Path, instance_id: str, tls_directory: Path):
         ensure_open_file_capacity()
-        self.providers: list[Provider] = []
+        self.worlds: list[WorldProcess] = []
         self.relays: list[OpaqueRelay] = []
         self.ports: dict[str, int] = {}
         self.diagnostics = None
@@ -572,12 +573,12 @@ class SpanRuntime:
             if any(span.name == "diagnostics" for span in spans):
                 self.diagnostics = DiagnosticsState(tls_directory.parent / "diagnostics.json", [span.name for span in spans])
             for span in spans:
-                provider = Provider(
+                world = WorldProcess(
                     span, workspace, instance_id,
                     self.diagnostics.path if self.diagnostics is not None else None,
                 )
-                self.providers.append(provider)
-                provider.check_started()
+                self.worlds.append(world)
+                world.check_started()
                 if self.diagnostics is not None:
                     self.diagnostics.update(
                         span.name,
@@ -585,18 +586,18 @@ class SpanRuntime:
                         world_status="running",
                     )
                     monitor = threading.Thread(
-                        target=self._monitor_provider,
-                        args=(provider,),
+                        target=self._monitor_world,
+                        args=(world,),
                         daemon=True,
                     )
-                    provider.recovery_monitored = True
+                    world.recovery_monitored = True
                     try:
                         monitor.start()
                     except RuntimeError:
-                        provider.recovery_monitored = False
+                        world.recovery_monitored = False
                         raise
                     self.monitors.append(monitor)
-                relay = OpaqueRelay(provider.address, tls_directory, span.name, self.diagnostics)
+                relay = OpaqueRelay(world.address, tls_directory, span.name, self.diagnostics)
                 self.relays.append(relay)
                 self.ports[span.name] = relay.port
         except Exception:
@@ -605,14 +606,14 @@ class SpanRuntime:
 
     def materialize_http_attachments(self, public: Path) -> dict[str, str]:
         worlds = [
-            (provider.span.name, provider.address)
-            for provider in self.providers
-            if provider.span.http_attachment
+            (world.span.name, world.address)
+            for world in self.worlds
+            if world.span.http_attachment
         ]
-        return world_attachment.materialize(public, worlds)
+        return http_attachment.materialize(public, worlds)
 
-    def _monitor_provider(self, provider: Provider) -> None:
-        recovery = provider.recovery_read
+    def _monitor_world(self, world: WorldProcess) -> None:
+        recovery = world.recovery_read
         try:
             while not self.stopping.is_set():
                 if recovery is not None:
@@ -626,18 +627,18 @@ class SpanRuntime:
                             recovery = None
                         for event in events:
                             if event == ord("S"):
-                                self.diagnostics.recovery_started(provider.span.name)
+                                self.diagnostics.recovery_started(world.span.name)
                             elif event == ord("R"):
-                                self.diagnostics.recovery_succeeded(provider.span.name)
+                                self.diagnostics.recovery_succeeded(world.span.name)
                             elif event == ord("F"):
-                                self.diagnostics.recovery_failed(provider.span.name)
+                                self.diagnostics.recovery_failed(world.span.name)
                 else:
                     self.stopping.wait(0.1)
-                status = provider.process.poll()
+                status = world.process.poll()
                 if status is not None:
                     if self.diagnostics is not None:
                         self.diagnostics.update(
-                            provider.span.name,
+                            world.span.name,
                             world_status="exited",
                             world_exit=status,
                         )
@@ -645,17 +646,17 @@ class SpanRuntime:
         finally:
             if recovery is not None:
                 os.close(recovery)
-            provider.recovery_read = None
-            provider.recovery_monitored = False
+            world.recovery_read = None
+            world.recovery_monitored = False
 
     def stop(self) -> None:
         self.stopping.set()
         for relay in reversed(self.relays):
             relay.stop()
         self.relays.clear()
-        for provider in reversed(self.providers):
-            provider.stop()
-        self.providers.clear()
+        for world in reversed(self.worlds):
+            world.stop()
+        self.worlds.clear()
         for monitor in self.monitors:
             monitor.join(timeout=1)
         self.monitors.clear()
