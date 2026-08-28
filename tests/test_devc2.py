@@ -991,6 +991,11 @@ class SpanTransportPKITests(unittest.TestCase):
             self.assertIn("DNS:host.docker.internal",server_text)
             self.assertIn("TLS Web Server Authentication",server_text)
             self.assertIn("TLS Web Client Authentication",client_text)
+            for certificate in (server/"ca.crt", server/"server.crt", client/"client.crt"):
+                D.run([
+                    "openssl", "x509", "-in", str(certificate), "-noout",
+                    "-checkend", str((D.LAUNCH_CERTIFICATE_DAYS - 1) * 86400),
+                ])
 
 class ComposeEnvironmentTests(unittest.TestCase):
     def test_compose_env_projects_only_explicit_span_paths_without_ambient_auth(self):

@@ -1248,6 +1248,9 @@ def select_key(interactive=True):
     private_write(selected_path,(selected+"\n").encode()); os.chmod(selected_path,0o600)
     return selected
 
+LAUNCH_CERTIFICATE_DAYS = 10 * 365
+
+
 def generate_relay_pki(root):
     openssl='/usr/bin/openssl'
     if not Path(openssl).is_file() or not os.access(openssl,os.X_OK):
@@ -1257,14 +1260,14 @@ def generate_relay_pki(root):
     private_write(ca_config,"[req]\nprompt=no\ndistinguished_name=dn\nx509_extensions=v3\n[dn]\nCN=devc2 ephemeral Span CA\n[v3]\nbasicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\n")
     private_write(server_ext,"[v3]\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:host.docker.internal\n")
     private_write(client_ext,"[v3]\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n")
-    run([openssl,'req','-x509','-newkey','rsa:2048','-nodes','-sha256','-days','30','-config',str(ca_config),'-keyout',str(server/'ca.key'),'-out',str(server/'ca.crt')],timeout=60)
+    run([openssl,'req','-x509','-newkey','rsa:2048','-nodes','-sha256','-days',str(LAUNCH_CERTIFICATE_DAYS),'-config',str(ca_config),'-keyout',str(server/'ca.key'),'-out',str(server/'ca.crt')],timeout=60)
     for name,common_name,extensions,serial in (
         ('server','host.docker.internal',server_ext,str(secrets.randbits(128) or 1)),
         ('client','devc2 Span gateway',client_ext,str(secrets.randbits(128) or 1)),
     ):
         key=server/f'{name}.key'; csr=server/f'{name}.csr'; cert=server/f'{name}.crt'
         run([openssl,'req','-new','-newkey','rsa:2048','-nodes','-sha256','-subj',f'/CN={common_name}','-keyout',str(key),'-out',str(csr)],timeout=60)
-        run([openssl,'x509','-req','-sha256','-days','30','-in',str(csr),'-CA',str(server/'ca.crt'),'-CAkey',str(server/'ca.key'),'-set_serial',serial,'-extfile',str(extensions),'-extensions','v3','-out',str(cert)],timeout=60)
+        run([openssl,'x509','-req','-sha256','-days',str(LAUNCH_CERTIFICATE_DAYS),'-in',str(csr),'-CA',str(server/'ca.crt'),'-CAkey',str(server/'ca.key'),'-set_serial',serial,'-extfile',str(extensions),'-extensions','v3','-out',str(cert)],timeout=60)
     for name in ('ca.crt','server.crt','server.key','client.crt','client.key'):
         path=server/name; metadata=path.lstat()
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode) or metadata.st_size>1024*1024:

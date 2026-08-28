@@ -240,6 +240,11 @@ class WorldTests(unittest.TestCase):
             self.assertEqual(proxy.port, 43123)
             launches = [call for call in calls if call[:3] == ["run", "--pull", "never"]]
             self.assertEqual(len(launches), 2)
+            ca_helper = next(call for call in launches if "generate-ca" in call)
+            self.assertEqual(
+                ca_helper[ca_helper.index("-expiry-hours") + 1],
+                str(P.IRON_CA_EXPIRY_HOURS),
+            )
             helper = next(call for call in launches if "--detach" in call)
             for option in ("--read-only", "--cap-drop", "--security-opt", "--log-driver"):
                 self.assertIn(option, helper)
@@ -325,6 +330,68 @@ class WorldTests(unittest.TestCase):
             resolved = list(workers.map(lambda _index: manager.get(), range(128)))
         self.assertTrue(all(candidate is proxy for candidate in resolved))
         state.assert_not_called()
+
+    def test_clock_discontinuity_restarts_helper_before_it_is_returned(self):
+        manager = P.ProxyManager()
+        proxy = P.Proxy(Path("/private"), "a" * 64, 1111, b"certificate")
+        manager.proxy = proxy
+        manager.last_suspend_offset = 10.0
+
+        with mock.patch.object(
+            P, "suspend_offset", return_value=26.0,
+        ), mock.patch.object(
+            manager, "_restart_locked", return_value=proxy,
+        ) as restart:
+            self.assertIs(manager.get(), proxy)
+
+        restart.assert_called_once_with(
+            proxy, proxy.container, enforce_cooldown=False,
+        )
+        self.assertEqual(manager.last_suspend_offset, 26.0)
+
+    def test_resume_refreshes_the_running_helper_and_bypasses_recovery_cooldown(self):
+        manager = P.ProxyManager()
+        proxy = P.Proxy(Path("/private"), "a" * 64, 1111, b"certificate")
+        manager.proxy = proxy
+        manager.last_suspend_offset = 10.0
+        manager.recovery_not_before = float("inf")
+
+        with mock.patch.object(P, "suspend_offset", return_value=26.0), \
+             mock.patch.object(P, "remove_container", return_value=True) as remove, \
+             mock.patch.object(manager, "_launch", return_value=("b" * 64, 2222)) as launch, \
+             mock.patch.object(manager, "workspace_tag", return_value="tag"), \
+             mock.patch.object(manager, "_state") as state, \
+             mock.patch.object(P, "recovery_event") as event:
+            self.assertIs(manager.get(), proxy)
+
+        remove.assert_called_once_with("a" * 64)
+        launch.assert_called_once_with(Path("/private"), "tag")
+        state.assert_not_called()
+        self.assertEqual((proxy.container, proxy.port), ("b" * 64, 2222))
+        self.assertEqual([call.args[0] for call in event.call_args_list], [b"S", b"R"])
+
+    def test_sparse_requests_do_not_look_like_a_clock_discontinuity(self):
+        self.assertFalse(P.resumed(10.0, 10.01))
+        self.assertFalse(P.resumed(None, 100.0))
+        self.assertFalse(P.resumed(100.0, None))
+        self.assertFalse(P.resumed(100.0, 10.0))
+        self.assertTrue(P.resumed(
+            10.0, 10.0 + P.CLOCK_DISCONTINUITY_SECONDS + 0.1,
+        ))
+
+    def test_unsupported_boot_clock_disables_resume_detection(self):
+        with mock.patch.object(P.time, "monotonic", return_value=10.0), \
+             mock.patch.object(P, "continuous_time", side_effect=OSError):
+            self.assertIsNone(P.suspend_offset())
+
+    def test_macos_uses_the_sleep_inclusive_continuous_clock(self):
+        continuous = mock.Mock(return_value=26_000_000_000)
+        with mock.patch.object(P.sys, "platform", "darwin"), \
+             mock.patch.object(P, "mach_continuous_clock", return_value=(mock.sentinel.library, continuous, 1e-9)), \
+             mock.patch.object(P.time, "clock_gettime") as linux_clock:
+            self.assertEqual(P.continuous_time(), 26.0)
+        continuous.assert_called_once_with()
+        linux_clock.assert_not_called()
 
     def test_exited_helper_restarts_with_refreshed_auth_and_same_identity(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -424,6 +491,47 @@ class WorldTests(unittest.TestCase):
             manager.recover(proxy, proxy.container)
         remove.assert_not_called()
 
+    def test_failed_replacement_never_returns_the_removed_helper(self):
+        manager = P.ProxyManager()
+        proxy = P.Proxy(Path("/private"), "a" * 64, 1111, b"certificate")
+        manager.proxy = proxy
+        manager.last_suspend_offset = 10.0
+
+        with mock.patch.object(P, "suspend_offset", return_value=26.0), \
+             mock.patch.object(P.time, "monotonic", return_value=100.0), \
+             mock.patch.object(P, "remove_container", return_value=True), \
+             mock.patch.object(manager, "_launch", side_effect=RuntimeError("failed")), \
+             mock.patch.object(manager, "workspace_tag", return_value="tag"), \
+             self.assertRaisesRegex(RuntimeError, "failed"):
+            manager.get()
+
+        self.assertEqual((proxy.container, proxy.port), ("", 0))
+        self.assertEqual(manager.last_suspend_offset, 10.0)
+        with mock.patch.object(P, "suspend_offset", return_value=26.0), \
+             mock.patch.object(P.time, "monotonic", return_value=101.0), \
+             mock.patch.object(manager, "_launch") as launch, \
+             self.assertRaisesRegex(P.WorldError, "cooling down"):
+            manager.get()
+        launch.assert_not_called()
+
+        with mock.patch.object(P, "suspend_offset", return_value=26.0), \
+             mock.patch.object(P.time, "monotonic", return_value=106.0), \
+             mock.patch.object(manager, "_launch", return_value=("b" * 64, 2222)), \
+             mock.patch.object(manager, "workspace_tag", return_value="tag"):
+            self.assertIs(manager.get(), proxy)
+        self.assertEqual((proxy.container, proxy.port), ("b" * 64, 2222))
+        self.assertEqual(manager.last_suspend_offset, 26.0)
+
+    def test_stale_recovery_never_returns_an_unavailable_helper(self):
+        manager = P.ProxyManager()
+        proxy = P.Proxy(Path("/private"), "", 0, b"certificate")
+        manager.proxy = proxy
+        manager.recovery_not_before = 105.0
+        with mock.patch.object(P.time, "monotonic", return_value=101.0), \
+             mock.patch.object(P, "suspend_offset", return_value=10.0), \
+             self.assertRaisesRegex(P.WorldError, "cooling down"):
+            manager.recover(proxy, "a" * 64)
+
     def test_stopping_manager_cannot_resurrect_a_helper(self):
         manager = P.ProxyManager()
         proxy = P.Proxy(Path("/private"), "a" * 64, 1111, b"certificate")
@@ -454,7 +562,7 @@ class WorldTests(unittest.TestCase):
              self.assertRaisesRegex(P.WorldError, "stopping"):
             manager.recover(proxy, original)
         self.assertEqual(remove.call_args_list, [mock.call(original), mock.call(replacement)])
-        self.assertEqual((proxy.container, proxy.port), (original, 1111))
+        self.assertEqual((proxy.container, proxy.port), ("", 0))
 
     def test_upstream_proxy_failure_never_recycles_the_helper(self):
         request = b"CONNECT chatgpt.com:443 HTTP/1.1\r\n\r\n"
